@@ -14,11 +14,11 @@ cargo test --workspace
 |---|---|
 | `kaleid-kernel` | 29 |
 | `kaleid-api` | 20 |
-| `kaleid-core-plugins` | 256（243 单元 + 13 集成；另有 5 个手动真机用例和 3 个联网用例标了 `#[ignore]`） |
+| `kaleid-core-plugins` | 258（245 单元 + 13 集成；另有 6 个手动真机用例和 3 个联网用例标了 `#[ignore]`） |
 | `kaleid-host` | 21 |
 | `kaleid-cli`（`tests/flow.rs` 集成） | 6 |
 
-> `kaleid-core-plugins` 的 243 个单元里，几块值得单独记一笔：4 个 NBT、7 个 Java 运行时、
+> `kaleid-core-plugins` 的 245 个单元里，几块值得单独记一笔：4 个 NBT、7 个 Java 运行时、
 > 21 个本地内容、19 个微软登录（响应解析、XErr 翻译、DPAPI 令牌存储）、
 > 6 个下载重试/分段/阶段，以及两个「校验只看 `.minecraft` 根目录」的回归用例。
 >
@@ -58,6 +58,13 @@ cargo test --workspace
 > 进过游戏再崩不退化成"启动失败"、"本次日志"按字符边界截断）。另外 `crates/kaleid-host` 的
 > `launch_progress_commands_are_wired` 钉住三个新命令的 camelCase 参数与"没有会话时"
 > 的人话错误。
+>
+> Forge / NeoForge 安装器不再自己去 `maven.neoforged.net` / `maven.minecraftforge.net`
+> 下库（国内超时后只甩一串坐标，界面上是「非法输入：安装器失败」）。现在先读安装器
+> 里的 `install_profile.json` + `version.json`，经 BMCLAPI `/maven/` 补进
+> `staging/libraries`，安装器看到校验通过的文件就跳过联网。Fabric 的加载器库同样带
+> BMCLAPI 镜像。真机回归：`KALEID_NEOFORGE_STAGING=<失败留下的 staging> cargo test -p kaleid-core-plugins --lib install::tests::real_neoforge_installer_succeeds_after_bmclapi_prefetch -- --ignored`，
+> 期望日志末尾是 `Successfully installed client into launcher.`。
 >
 > 「退出 ≠ 崩溃」那 8 条（见 6.8）：`crash.rs` 5 条（正常开局日志里的 OpenGL 行不能
 > 算崩溃、关窗退出不算、只有关键词命中不算、非零退出且没关服日志才算、`Stopping!`

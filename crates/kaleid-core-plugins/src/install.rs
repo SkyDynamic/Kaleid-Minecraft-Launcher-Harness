@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
+use sha1::{Digest, Sha1};
 use walkdir::WalkDir;
 
 use kaleid_api::{
@@ -240,6 +241,7 @@ impl InstallService {
                         job_for_thread
                             .set_current(format!("运行 {} 官方安装器…", loader.label_zh()));
                         this.finish_modded_installer(
+                            &job_for_thread,
                             &root,
                             &version_for_thread,
                             &game,
@@ -393,6 +395,7 @@ impl InstallService {
                 .join("staging")
                 .join(format!("{slug}-{}", job.id));
             self.finish_modded_installer(
+                job,
                 root,
                 &req.version_name,
                 &req.game_version,
@@ -639,10 +642,12 @@ impl InstallService {
                     label: format!("Fabric {coordinate}"),
                     phase: "loader".into(),
                     official_url: Some(url),
-                    mirror_url: None,
+                    // Fabric 的库在 `maven.fabricmc.net`，和 NeoForge 一样国内经常超时。
+                    // BMCLAPI 的 `/maven/` 按同一条相对路径镜像这份文件。
+                    mirror_url: Some(loaders::bmclapi_maven_url(&path)),
                     fallback_url: None,
                     // 加载器库也进版本目录：整个 `versions/<版本名>/` 可以直接拷走。
-                    dest: dir.join("libraries").join(path),
+                    dest: dir.join("libraries").join(&path),
                     size,
                     sha1,
                 });
@@ -674,7 +679,7 @@ impl InstallService {
             label: format!("Forge {version} 安装器"),
             phase: "installer".into(),
             official_url: Some(url),
-            mirror_url: None,
+            mirror_url: Some(loaders::forge_installer_mirror_url(game, version)),
             fallback_url: None,
             dest: installer,
             size: 0,
@@ -716,6 +721,7 @@ impl InstallService {
 
     fn finish_modded_installer(
         &self,
+        job: &Arc<Job>,
         root: &Root,
         name: &str,
         game: &str,
@@ -740,6 +746,10 @@ impl InstallService {
             staging.join("launcher_profiles.json"),
             br#"{"profiles":{}}"#,
         )?;
+        // PCL2 的做法：先按 install_profile.json / version.json 把库从 BMCLAPI
+        // 下进 staging/libraries，再跑官方安装器。安装器看到校验通过的文件就
+        // 不再去 maven.neoforged.net / maven.minecraftforge.net（国内经常超时）。
+        self.prefetch_installer_libraries(job, staging, label)?;
         let java = resolve_java(&self.settings.global()?);
         let log = staging.join("installer.log");
         let out = std::fs::File::create(&log)?;
@@ -759,8 +769,8 @@ impl InstallService {
             if let Some(status) = child.try_wait().map_err(ApiError::io)? {
                 if !status.success() {
                     let tail = tail_lines(&log, 20);
-                    return Err(ApiError::invalid(format!(
-                        "{label} 安装器失败（{status}）\n{tail}"
+                    return Err(ApiError::Network(format!(
+                        "{label} 安装器失败（{status}）。依赖已尽量从 BMCLAPI 补过，下面是安装器自己的输出：\n{tail}"
                     )));
                 }
                 break;
@@ -847,6 +857,44 @@ impl InstallService {
         let _ = std::fs::remove_dir_all(staging);
         Ok(())
     }
+
+    /// 把安装器自己要下的库先经下载器（含 BMCLAPI 镜像）放进 `staging/libraries`。
+    ///
+    /// 官方安装器写死了 `maven.neoforged.net` / `maven.minecraftforge.net`，
+    /// 连不上就整次失败（日志里是一串坐标 + `There was an error during installation`）。
+    /// 它自己会跳过「文件已在且 SHA-1 对得上」的库，所以先补齐就行，不必改安装器。
+    fn prefetch_installer_libraries(
+        &self,
+        job: &Arc<Job>,
+        staging: &Path,
+        label: &str,
+    ) -> ApiResult<()> {
+        let installer = staging.join("installer.jar");
+        let profile_bytes = crate::jar::read_entry_bytes(&installer, "install_profile.json", 2 * 1024 * 1024)
+            .ok_or_else(|| {
+                ApiError::Format(format!(
+                    "{label} 安装器里没有 install_profile.json，无法按镜像补库"
+                ))
+            })?;
+        let profile: Value = serde_json::from_slice(&profile_bytes)?;
+        let version = crate::jar::read_entry_bytes(&installer, "version.json", 2 * 1024 * 1024)
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or(Value::Null);
+        let libs_dir = staging.join("libraries");
+        let mut items = installer_library_items(&profile, &version, &libs_dir);
+        items.retain(|item| !file_already_good(&item.dest, item.sha1.as_deref(), item.size));
+        if items.is_empty() {
+            return Ok(());
+        }
+        job.set_current(format!(
+            "从镜像补全 {label} 安装器依赖（{} 个）…",
+            items.len()
+        ));
+        for item in &items {
+            job.add_total("installer", item.size, 1);
+        }
+        self.downloads.run_batch(job.clone(), items)
+    }
 }
 
 /// 写标记目录时用的加载器英文标识（`.fabric` / `.forge` / `.neoforge`）。
@@ -893,6 +941,83 @@ pub(crate) fn library_path_from_name(name: &str) -> Option<String> {
         "{}/{artifact}/{version}/{file}",
         group.replace('.', "/")
     ))
+}
+
+/// 从安装器的 `install_profile.json` 和 `version.json` 抽出要预下载的库。
+///
+/// 两份都要：profile 里有安装器自己用的（`installertools`、`*-universal`），
+/// version.json 里有运行时库。按目标路径去重。
+fn installer_library_items(profile: &Value, version: &Value, libraries_dir: &Path) -> Vec<DownloadItem> {
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    for doc in [profile, version] {
+        let Some(libs) = doc.get("libraries").and_then(|v| v.as_array()) else {
+            continue;
+        };
+        for lib in libs {
+            let Some(item) = installer_library_item(lib, libraries_dir) else {
+                continue;
+            };
+            if seen.insert(item.dest.clone()) {
+                items.push(item);
+            }
+        }
+    }
+    items
+}
+
+fn installer_library_item(lib: &Value, libraries_dir: &Path) -> Option<DownloadItem> {
+    let path = library_relative_path(lib)?;
+    let artifact = lib.get("downloads").and_then(|d| d.get("artifact"));
+    let official = artifact
+        .and_then(|a| a.get("url"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            let base = lib.get("url").and_then(|v| v.as_str())?;
+            Some(format!(
+                "{}/{}",
+                base.trim_end_matches('/'),
+                path.trim_start_matches('/')
+            ))
+        });
+    let name = lib
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or(path.as_str());
+    Some(DownloadItem {
+        label: format!("安装器依赖 {name}"),
+        phase: "installer".into(),
+        official_url: official,
+        mirror_url: Some(loaders::bmclapi_maven_url(&path)),
+        fallback_url: None,
+        dest: libraries_dir.join(&path),
+        size: artifact
+            .and_then(|a| a.get("size"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        sha1: artifact
+            .and_then(|a| a.get("sha1"))
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string()),
+    })
+}
+
+/// 文件已在且 SHA-1（或至少大小）对得上，安装器会直接跳过，不必再下。
+fn file_already_good(path: &Path, sha1: Option<&str>, size: u64) -> bool {
+    let Ok(bytes) = std::fs::read(path) else {
+        return false;
+    };
+    if bytes.is_empty() {
+        return false;
+    }
+    if size > 0 && bytes.len() as u64 != size {
+        return false;
+    }
+    match sha1 {
+        Some(expected) => hex::encode(Sha1::digest(&bytes)).eq_ignore_ascii_case(expected),
+        None => true,
+    }
 }
 
 /// 一个库在 `libraries/` 下的相对路径：优先 JSON 给好的，退回到 Maven 坐标推导。
@@ -1178,5 +1303,151 @@ mod tests {
         assert!(validate_version_name("a/b").is_err());
         assert!(validate_version_name("CON").is_err());
         assert!(validate_version_name(" ").is_err());
+    }
+
+    /// 安装器依赖必须带 BMCLAPI 镜像，并且落到 staging/libraries 的 Maven 路径上。
+    ///
+    /// 这是「正常退出被当成崩溃」同类的安装失败：官方安装器自己去
+    /// maven.neoforged.net，超时后只甩一串坐标。预下载清单要对得上那串坐标。
+    #[test]
+    fn installer_libraries_are_mirrored_onto_the_staging_libraries_dir() {
+        let profile = json!({
+            "libraries": [{
+                "name": "org.jspecify:jspecify:1.0.1",
+                "downloads": {"artifact": {
+                    "path": "org/jspecify/jspecify/1.0.1/jspecify-1.0.1.jar",
+                    "url": "https://maven.neoforged.net/releases/org/jspecify/jspecify/1.0.1/jspecify-1.0.1.jar",
+                    "sha1": "abc",
+                    "size": 12
+                }}
+            }, {
+                "name": "net.neoforged:neoforge:26.3.0.99:universal",
+                "downloads": {"artifact": {
+                    "path": "net/neoforged/neoforge/26.3.0.99/neoforge-26.3.0.99-universal.jar",
+                    "url": "https://maven.neoforged.net/releases/net/neoforged/neoforge/26.3.0.99/neoforge-26.3.0.99-universal.jar"
+                }}
+            }]
+        });
+        // version.json 里再列一次 jspecify：只能留一条，不能下两遍。
+        let version = json!({
+            "libraries": [{
+                "name": "org.jspecify:jspecify:1.0.1",
+                "downloads": {"artifact": {
+                    "path": "org/jspecify/jspecify/1.0.1/jspecify-1.0.1.jar",
+                    "url": "https://maven.neoforged.net/releases/org/jspecify/jspecify/1.0.1/jspecify-1.0.1.jar"
+                }}
+            }, {
+                "name": "net.fabricmc:sponge-mixin:0.17.4+mixin.0.8.7"
+            }]
+        });
+        let items = installer_library_items(&profile, &version, Path::new("staging/libraries"));
+        assert_eq!(items.len(), 3, "去重后应是 3 个：{:?}", items.iter().map(|i| &i.label).collect::<Vec<_>>());
+        let jspecify = items.iter().find(|i| i.label.contains("jspecify")).unwrap();
+        assert_eq!(
+            jspecify.mirror_url.as_deref(),
+            Some("https://bmclapi2.bangbang93.com/maven/org/jspecify/jspecify/1.0.1/jspecify-1.0.1.jar")
+        );
+        assert!(jspecify
+            .official_url
+            .as_deref()
+            .unwrap()
+            .contains("maven.neoforged.net"));
+        assert!(jspecify.dest.ends_with("jspecify-1.0.1.jar"));
+        let mixin = items.iter().find(|i| i.label.contains("sponge-mixin")).unwrap();
+        assert!(mixin.mirror_url.as_deref().unwrap().contains("bmclapi2.bangbang93.com/maven/"));
+        assert!(mixin.mirror_url.as_deref().unwrap().contains("sponge-mixin"));
+    }
+
+    #[test]
+    fn forge_and_fabric_install_artifacts_have_bmclapi_mirrors() {
+        let forge = loaders::forge_installer_mirror_url("1.21.1", "52.0.0");
+        assert_eq!(
+            forge,
+            "https://bmclapi2.bangbang93.com/maven/net/minecraftforge/forge/1.21.1-52.0.0/forge-1.21.1-52.0.0-installer.jar"
+        );
+        let fabric = loaders::bmclapi_maven_url("net/fabricmc/fabric-loader/0.16.9/fabric-loader-0.16.9.jar");
+        assert!(fabric.starts_with("https://bmclapi2.bangbang93.com/maven/net/fabricmc/"));
+    }
+
+    /// 真机：用已经下好的 NeoForge 安装器，经 BMCLAPI 补库后再跑 `--installClient`。
+    ///
+    /// `KALEID_NEOFORGE_STAGING` 指向一次失败安装留下的 staging（里面要有 installer.jar
+    /// 和 `versions/<游戏版本>/<游戏版本>.jar`）。
+    #[test]
+    #[ignore = "联网，并用本机已有的 NeoForge 安装器验证补库后能装完"]
+    fn real_neoforge_installer_succeeds_after_bmclapi_prefetch() {
+        let Ok(staging_src) = std::env::var("KALEID_NEOFORGE_STAGING") else {
+            eprintln!("没设 KALEID_NEOFORGE_STAGING，跳过");
+            return;
+        };
+        let src = PathBuf::from(staging_src);
+        assert!(src.join("installer.jar").is_file(), "staging 里没有 installer.jar");
+
+        let work = tempfile::tempdir().unwrap();
+        let staging = work.path().join("staging");
+        copy_dir(&src, &staging);
+        let installer = staging.join("installer.jar");
+        let profile: Value = serde_json::from_slice(
+            &crate::jar::read_entry_bytes(&installer, "install_profile.json", 2 * 1024 * 1024)
+                .expect("读 install_profile.json"),
+        )
+        .unwrap();
+        let version: Value = serde_json::from_slice(
+            &crate::jar::read_entry_bytes(&installer, "version.json", 2 * 1024 * 1024)
+                .expect("读 version.json"),
+        )
+        .unwrap();
+        let mut items = installer_library_items(&profile, &version, &staging.join("libraries"));
+        let total = items.len();
+        items.retain(|item| !file_already_good(&item.dest, item.sha1.as_deref(), item.size));
+        eprintln!("安装器依赖 {total} 个，还缺 {} 个，走 BMCLAPI", items.len());
+
+        let settings = Arc::new(crate::settings::Settings::open(work.path()));
+        let downloads = DownloadManager::new(settings);
+        let job = Job::new(
+            "neoforge-prefetch".into(),
+            "补全 NeoForge 安装器依赖".into(),
+            "neoforge".into(),
+            "root".into(),
+            "26.3".into(),
+            kaleid_api::LoaderKind::NeoForge,
+            None,
+            kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST.into(),
+        );
+        downloads.run_batch(job, items).expect("BMCLAPI 补库失败");
+
+        let java = std::env::var("KALEID_JAVA").unwrap_or_else(|_| "java".into());
+        let log = staging.join("installer-retry.log");
+        let out = std::fs::File::create(&log).unwrap();
+        let err = out.try_clone().unwrap();
+        let status = std::process::Command::new(java)
+            .arg("-jar")
+            .arg(&installer)
+            .arg("--installClient")
+            .arg(&staging)
+            .current_dir(&staging)
+            .stdout(std::process::Stdio::from(out))
+            .stderr(std::process::Stdio::from(err))
+            .status()
+            .expect("启动 Java 失败");
+        let tail = tail_lines(&log, 30);
+        assert!(
+            status.success(),
+            "安装器仍失败（{}）\n{tail}",
+            status
+        );
+        eprintln!("{tail}");
+    }
+
+    fn copy_dir(src: &Path, dst: &Path) {
+        std::fs::create_dir_all(dst).unwrap();
+        for entry in std::fs::read_dir(src).unwrap().flatten() {
+            let to = dst.join(entry.file_name());
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                copy_dir(&entry.path(), &to);
+            } else {
+                std::fs::copy(entry.path(), &to).unwrap();
+            }
+        }
     }
 }

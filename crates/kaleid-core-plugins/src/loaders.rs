@@ -290,6 +290,24 @@ pub fn forge_installer_sha1_url(game: &str, version: &str) -> String {
     format!("{}.sha1", forge_installer_url(game, version))
 }
 
+/// Forge 安装器的 BMCLAPI 镜像。官方 `maven.minecraftforge.net` 在国内经常连不上。
+pub fn forge_installer_mirror_url(game: &str, version: &str) -> String {
+    let full = format!("{game}-{version}");
+    format!("{BMCLAPI_MAVEN}/net/minecraftforge/forge/{full}/forge-{full}-installer.jar")
+}
+
+/// `libraries/` 相对路径 → BMCLAPI Maven 镜像地址。
+///
+/// BMCLAPI 把 `maven.neoforged.net/releases`、`maven.minecraftforge.net`、
+/// `maven.fabricmc.net`、`libraries.minecraft.net` 收在同一个 `/maven/` 下，
+/// 路径就是 Maven 相对路径，不带 `releases/` 前缀。
+pub fn bmclapi_maven_url(path: &str) -> String {
+    format!(
+        "{BMCLAPI_MAVEN}/{}",
+        path.trim_start_matches('/').replace('\\', "/")
+    )
+}
+
 pub fn fabric_api_latest(client: &RemoteClient, game: &str) -> ApiResult<Option<FabricApiInfo>> {
     let query = format!(
         "{MODRINTH}/project/fabric-api/version?game_versions=%5B%22{}%22%5D&loaders=%5B%22fabric%22%5D",
