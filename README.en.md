@@ -47,10 +47,12 @@ How to read the tests, and which cases need a real machine, is in [docs/testing.
 | `plugins` | Example declarative manifests. Not part of the build |
 | `docs/brand` | The mark. The README uses the transparent file; the white plate is `kaleid-mark-white.png` |
 
-The design spec is [docs/superpowers/specs/2026-10-29-kaleid-launcher-design.md](docs/superpowers/specs/2026-10-29-kaleid-launcher-design.md). Manifest shape is in [plugins/README.md](plugins/README.md).
+Manifest shape is in [plugins/README.md](plugins/README.md).
 
 ## License
 
 [Apache License 2.0](LICENSE). Copyright and third-party components are in [NOTICE](NOTICE).
+
+The name comes from Kaleid x Scope, a mode in SEGA's arcade rhythm game *maimai DX PRiSM* (maimai でらっくす PRiSM). The character(RIZ - PRISM) in the icon and the mark at the top is copyright SEGA. This project does not claim any rights to that artwork.
 
 The Minecraft name and content belong to Mojang Studios / Microsoft. This project does not distribute the game.

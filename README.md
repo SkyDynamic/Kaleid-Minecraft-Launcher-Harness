@@ -48,10 +48,12 @@ pnpm --dir ui dev
 | `plugins` | 声明式清单的例子，不参与构建 |
 | `docs/brand` | 标。README 用透明底；白底是 `kaleid-mark-white.png` |
 
-设计规格在 [docs/superpowers/specs/2026-10-29-kaleid-launcher-design.md](docs/superpowers/specs/2026-10-29-kaleid-launcher-design.md)。清单的形状见 [plugins/README.md](plugins/README.md)。
+清单的形状见 [plugins/README.md](plugins/README.md)。
 
 ## 许可
 
 [Apache License 2.0](LICENSE)。版权与第三方组件见 [NOTICE](NOTICE)。
+
+名称灵感取自 SEGA 街机音乐节奏游戏《maimai でらっくす PRiSM》的 Kaleid x Scope 模式。README头图里的角色形象（RIS - PRISM）版权归 SEGA 所有，本项目不主张该形象的权利。
 
 Minecraft 的名称与内容归 Mojang Studios / Microsoft 所有。本项目不分发游戏本体。
