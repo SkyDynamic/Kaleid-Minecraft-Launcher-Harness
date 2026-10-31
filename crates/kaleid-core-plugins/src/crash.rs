@@ -84,7 +84,8 @@ const KEYWORD_RULES: &[Rule] = &[
     Rule {
         id: "registry_freeze",
         label: "注册表被冻结后仍被修改",
-        needles: &["registry is already frozen", "registryaccess", "registries are frozen"],
+        // `registryaccess` 是类名，正常日志和堆栈里都常见，不能当线索。
+        needles: &["registry is already frozen", "registries are frozen"],
     },
     Rule {
         id: "jvm_crash",
@@ -114,19 +115,33 @@ const KEYWORD_RULES: &[Rule] = &[
     Rule {
         id: "graphics",
         label: "显卡/OpenGL 问题",
+        // 注意：绝不能收 `opengl` 这个词本身。正常开局会打
+        // `OpenGL Vendor/Renderer/Version` 好几行，那样每局都"崩溃"。
+        // 这里只收真正的失败措辞。
         needles: &[
-            "opengl",
             "glfw error",
             "pixel format",
             "wglmakectx",
             "failed to create window",
+            "opengl error",
+            "opengl exception",
+            "glcaps",
         ],
     },
 ];
 
+/// 日志里出现这些就说明游戏已经在正常关服了（不是崩溃）。
+///
+/// `Stopping!` 是 Minecraft 客户端退出时必打的一行（1.13+ 起一直存在，
+/// 关窗退出、菜单里退出都会打）；后两条是 1.20+ 存档刷盘的收尾日志。
+const SHUTDOWN_MARKERS: &[&str] = &[
+    "stopping!",
+    "saving all world maps",
+    "save queue flushed",
+];
+
 /// 判定顺序：命中越具体的规则，置信度越高。
-fn confidence_for(rule_id: &str) -> SuspectConfidence {
-    match rule_id {
+fn confidence_for(rule_id: &str) -> SuspectConfidence {    match rule_id {
         "mod_dependency" | "mixin_apply_failed" | "duplicate_mods" | "mod_conflict" => {
             SuspectConfidence::High
         }
@@ -164,7 +179,15 @@ pub fn analyze(
         }
     }
 
-    // 崩溃判定：非零退出码，或者日志里出现崩溃报告落盘的提示。
+    // 崩溃判定只看证据，**不看关键词**：关键词是"哪一类问题"的线索，
+    // 正常日志里也会出现（OpenGL、模组列表里的 conflicting 之类），
+    // 拿它当结论就等于每局都崩。
+    //
+    // 证据只有三种：
+    // 1. 这次会话真的落下了一份崩溃报告（调用方已按会话起始时间过滤过）；
+    // 2. 日志里有致命错误标记；
+    // 3. 非零退出码，**且**没有走正常关服流程（打出 Stopping! 之类）。
+    //    已经关服了却拿到非零码，那是退出码本身的怪癖，不是崩溃。
     let fatal_markers = [
         "crash report saved to",
         "a fatal error has been detected",
@@ -172,9 +195,10 @@ pub fn analyze(
         "uncaught exception",
         "---- minecraft crash report ----",
     ];
-    let suspect_signal = fatal_markers.iter().any(|m| lower.contains(m))
-        || !keywords.is_empty();
-    let detected = exit_code.map(|c| c != 0).unwrap_or(false) || suspect_signal;
+    let fatal = fatal_markers.iter().any(|m| lower.contains(m));
+    let shutdown_seen = SHUTDOWN_MARKERS.iter().any(|m| lower.contains(m));
+    let bad_exit = matches!(exit_code, Some(code) if code != 0) && !shutdown_seen;
+    let detected = fatal || crash_file.is_some() || bad_exit;
 
     let suspects = find_suspects(log, mod_files, &keywords);
     CrashReport {
@@ -331,11 +355,102 @@ Failed to load mod sodium-0.5.8.jar";
         );
     }
 
+    /// 真机上报的问题：正常退出游戏也被当成崩溃。
+    ///
+    /// 这段日志就是一次正常的开局 + 正常退出（退出码 0）。它里面必然有
+    /// `OpenGL Vendor/Renderer/Version` 这几行——关键词规则只该把它们当线索，
+    /// 绝不能当成崩溃结论。
+    #[test]
+    fn a_normal_session_with_opengl_lines_is_not_a_crash() {
+        let log = "\
+[Render thread/INFO]: Backend library: LWJGL version 3.3.3+5
+[Render thread/INFO]: OpenGL Vendor: NVIDIA Corporation
+[Render thread/INFO]: OpenGL Renderer: NVIDIA GeForce RTX 4060 Laptop GPU/PCIe/SSE2
+[Render thread/INFO]: OpenGL Version: 3.3.0 NVIDIA 560.94
+[Render thread/INFO]: Narrator library for x64 successfully loaded
+[Render thread/INFO]: Sound engine started
+[Render thread/INFO]: Stopping!
+[Render thread/INFO]: Saving all world maps
+[Render thread/INFO]: Save queue flushed!";
+        let report = analyze(log, Some(0), &[], None);
+        assert!(
+            !report.detected,
+            "正常退出不是崩溃，命中的关键词：{:?}",
+            report.keywords
+        );
+        assert!(
+            report.keywords.is_empty(),
+            "日常日志不该报出崩溃线索：{:?}",
+            report.keywords
+        );
+    }
+
+    /// 关窗退出（退出码 0，日志里没有崩溃报告、没有致命错误）同样不是崩溃。
+    #[test]
+    fn closing_the_window_normally_is_not_a_crash() {
+        let log = "[Render thread/INFO]: OpenGL Version: 3.3.0\n\
+                   [Render thread/INFO]: Stopping!";
+        assert!(!analyze(log, Some(0), &[], None).detected);
+    }
+
+    /// 关键词只是线索：模组列表里出现 `conflicting` 这种词不代表游戏崩了。
+    #[test]
+    fn keyword_hits_alone_are_not_proof_of_a_crash() {
+        let log = "[main/INFO]: Conflicting mod ids were resolved at load time\n\
+                   [Render thread/INFO]: Stopping!";
+        let report = analyze(log, Some(0), &[], None);
+        assert!(!report.detected, "命中了关键词不等于崩溃：{:?}", report.keywords);
+    }
+
+    /// 反过来：非零退出码加上没有正常关服日志，就是崩溃。
+    #[test]
+    fn non_zero_exit_without_a_shutdown_line_is_a_crash() {
+        let log = "[Render thread/INFO]: Sound engine started\n\
+                   Exception in thread \"main\" java.lang.RuntimeException: boom";
+        let report = analyze(log, Some(1), &[], None);
+        assert!(report.detected);
+    }
+
+    /// 已经走到关服流程了（打出了 Stopping!）却拿到非零退出码：
+    /// 那是退出码本身的怪癖，不是崩溃。
+    #[test]
+    fn shutdown_line_wins_over_a_non_zero_exit_code() {
+        let log = "[Render thread/INFO]: Stopping!\n[Render thread/INFO]: Save queue flushed!";
+        assert!(!analyze(log, Some(1), &[], None).detected);
+    }
+
     #[test]
     fn crash_report_file_marks_detected_even_with_zero_exit() {
         let log = "---- Minecraft Crash Report ----\nCrash report saved to crash-reports/crash-1.txt";
         let report = analyze(log, Some(0), &[], Some("crash-reports/crash-1.txt".into()));
         assert!(report.detected);
         assert_eq!(report.crash_file.as_deref(), Some("crash-reports/crash-1.txt"));
+    }
+
+    /// 真机日志回归：拿这台机器上一次真实启动的 `console.log` 走一遍判定。
+    ///
+    /// 用法（正常退出时应当 `detected == false`）：
+    /// `KALEID_REAL_LOG=<日志路径> cargo test -p kaleid-core-plugins --lib \
+    ///   crash::tests::real_log_is_judged_by_evidence -- --ignored --nocapture`
+    #[test]
+    #[ignore = "读这台机器上的真实启动日志，手动跑"]
+    fn real_log_is_judged_by_evidence() {
+        let Ok(path) = std::env::var("KALEID_REAL_LOG") else {
+            eprintln!("没设 KALEID_REAL_LOG，跳过");
+            return;
+        };
+        let log = std::fs::read_to_string(&path).expect("读不到日志");
+        let report = analyze(&log, Some(0), &[], None);
+        eprintln!(
+            "日志 {} 字节，命中的关键词：{:?}，detected = {}",
+            log.len(),
+            report
+                .keywords
+                .iter()
+                .map(|k| format!("{}({})", k.id, k.count))
+                .collect::<Vec<_>>(),
+            report.detected
+        );
+        assert!(!report.detected, "真机正常退出的日志不该判成崩溃");
     }
 }

@@ -64,6 +64,11 @@ struct Runtime {
     plan: Option<LaunchPlan>,
     /// 「取消启动」的旗子。准备线程与下载任务都盯着它。
     cancel: Arc<AtomicBool>,
+    /// 进程是被我们自己结束的（实例面板的「结束进程」）。
+    ///
+    /// 主动结束拿到的退出码必然非零，但那不是崩溃——不看这个标记，
+    /// 用户点一次「结束进程」就会收到一份崩溃报告。
+    killed: bool,
 }
 
 /// 一个会话 = 一次「点启动」。多开就是这里有多份。
@@ -244,6 +249,7 @@ impl GameProcessManager {
                     run_dir: Some(run_dir.clone()),
                     plan: Some(plan.clone()),
                     cancel: cancel.clone(),
+                    killed: false,
                 },
             });
         }
@@ -312,6 +318,8 @@ impl GameProcessManager {
                 continue;
             };
             let pid = child.id();
+            // 先打标记再动手：watcher 是另一个线程，晚一步写就会被它读到"非零退出"。
+            session.runtime.killed = true;
             #[cfg(windows)]
             {
                 // 直接 kill 只杀 java.exe，Minecraft 有时会拉起子进程（如外置的模组加载器）。
@@ -962,13 +970,16 @@ fn spawn_watcher(
                 if let Some(code) = exited {
                     let log_text = runtime.log.lock().unwrap().clone();
                     let crash_file = latest_crash_report(runtime);
-                    let report = crash::analyze(
+                    let mut report = crash::analyze(
                         &log_text,
                         code,
                         &mods,
                         crash_file.map(|p| p.to_string_lossy().to_string()),
                     );
-                    let crashed = report.detected;
+                    // 我们自己结束的进程一定拿到非零退出码，但那不是崩溃。
+                    let killed = runtime.killed;
+                    let crashed = report.detected && !killed;
+                    report.detected = crashed;
                     // 窗口出现过没有，决定了这次到底是"没启动起来"还是"玩着玩着挂了"。
                     // 前者要报错给用户看，后者该走崩溃报告那条路。
                     let reached_running = runtime.state.phase == LaunchPhase::Running
@@ -1000,7 +1011,9 @@ fn spawn_watcher(
                         // 崩没崩由 `crashed` 决定——界面据此弹崩溃报告或提示"已退出"。
                         if let Some(step) = step_mut(&mut runtime.state, "window") {
                             step.status = PhaseStatus::Completed;
-                            step.detail = if crashed {
+                            step.detail = if killed {
+                                format!("已按你的要求结束进程（{exit_text}）")
+                            } else if crashed {
                                 format!("游戏异常退出（{exit_text}）")
                             } else {
                                 format!("游戏已退出（{exit_text}）")
@@ -1310,6 +1323,17 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
 fn latest_crash_report(runtime: &Runtime) -> Option<PathBuf> {
     let game_dir = runtime.plan.as_ref().map(|p| p.game_dir.clone())?;
     let dir = PathBuf::from(game_dir).join("crash-reports");
+    // 只认**这一次启动之后**写下的报告：`crash-reports/` 里往往躺着上个月的，
+    // 拿它当"本次崩溃"会让每次正常退出都显示一份旧报告。
+    latest_crash_report_since(&dir, runtime.state.started_at)
+}
+
+/// 取 `crash-reports/` 目录里不早于 `since_ms` 的最新 `.txt`。
+///
+/// 留 2 秒余量：文件系统时间戳与我们的 `started_at` 不是同一个来源，
+/// 刚写下就判断时可能差几个 tick。
+fn latest_crash_report_since(dir: &Path, since_ms: Option<u64>) -> Option<PathBuf> {
+    let since = since_ms.map(|ms| ms.saturating_sub(2000));
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in std::fs::read_dir(dir).ok()?.flatten() {
         let path = entry.path();
@@ -1318,6 +1342,15 @@ fn latest_crash_report(runtime: &Runtime) -> Option<PathBuf> {
         }
         let Ok(meta) = entry.metadata() else { continue };
         let modified = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
+        if let Some(since) = since {
+            let modified_ms = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            if modified_ms < since {
+                continue;
+            }
+        }
         if best.as_ref().map(|(t, _)| modified > *t).unwrap_or(true) {
             best = Some((modified, path));
         }
@@ -1590,11 +1623,13 @@ mod tests {
 
     /// 玩着玩着挂了：窗口那一步保持"完成"，`crashed` 交给崩溃弹窗，`error` 留空。
     ///
-    /// 这是真机验证里发现的问题：直接 kill 进程会被当成"等窗口失败"，
-    /// 覆盖层于是显示"启动失败"而游戏其实已经起来过了。
+    /// 从实例面板点「结束进程」不是崩溃：那是用户要求的，不该弹崩溃报告。
+    ///
+    /// 真机上踩到的：结束进程后退出码非零 → 被判成崩溃。这里钉住
+    /// 「主动结束 ≠ 崩溃」，而且要留一句人话说明是主动结束的。
     #[cfg(windows)]
     #[test]
-    fn crash_after_window_keeps_the_window_step_completed() {
+    fn stopping_from_the_launcher_is_not_a_crash() {
         let dir = tempfile::tempdir().unwrap();
         let manager = GameProcessManager::new(dir.path());
         let mut p = plan();
@@ -1610,32 +1645,68 @@ mod tests {
         p.main_class = String::new();
         manager.start(p, None, Vec::new()).unwrap();
 
-        // 先等日志佐证让会话进入 Running
         let deadline = Instant::now() + Duration::from_secs(20);
-        loop {
-            let running = manager
-                .states()
-                .into_iter()
-                .any(|s| s.phase == LaunchPhase::Running);
-            if running {
-                break;
-            }
+        while !manager
+            .states()
+            .iter()
+            .any(|s| s.phase == LaunchPhase::Running)
+        {
             assert!(Instant::now() < deadline, "等不到 Running");
             std::thread::sleep(Duration::from_millis(100));
         }
-        let window = manager
-            .states()
-            .into_iter()
-            .find_map(|s| s.steps.into_iter().find(|step| step.id == "window"))
-            .unwrap();
-        assert_eq!(window.status, PhaseStatus::Completed);
 
-        // kill 掉：退出码非零 → crashed，但窗口那一步不该退回失败
         manager.stop(None).unwrap();
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
             let state = manager.state();
+            if state.phase != LaunchPhase::Running && state.phase != LaunchPhase::Launching {
+                assert!(
+                    !state.crashed,
+                    "主动结束进程不是崩溃（退出码 {:?}）",
+                    state.exit_code
+                );
+                assert_eq!(state.phase, LaunchPhase::Exited);
+                let window = state.steps.iter().find(|s| s.id == "window").unwrap();
+                assert_eq!(window.status, PhaseStatus::Completed);
+                assert!(
+                    window.detail.contains("结束"),
+                    "要说明是用户结束的，实际：{:?}",
+                    window.detail
+                );
+                assert!(state.error.is_none(), "不该有错误提示：{:?}", state.error);
+                return;
+            }
+            assert!(Instant::now() < deadline, "进程杀了之后状态没落地");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// 但真崩了还是要认：进过游戏之后非零退出且没有关服日志 = 崩溃，
+    /// 窗口那一步保持"完成"，`error` 留空交给崩溃弹窗。
+    #[cfg(windows)]
+    #[test]
+    fn a_real_crash_after_the_window_still_counts_as_crashed() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = GameProcessManager::new(dir.path());
+        let mut p = plan();
+        p.java_path = "cmd".into();
+        p.classpath.clear();
+        p.jvm_args.clear();
+        p.extra_jvm_args.clear();
+        // 先当作窗口出来了，然后直接非零退出（没有 Stopping!）。
+        p.game_args = vec![
+            "/c".into(),
+            "echo Backend library: LWJGL & ping -n 3 127.0.0.1 >nul & exit 3".into(),
+        ];
+        p.main_class = String::new();
+        manager.start(p, None, Vec::new()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = manager.state();
             if state.phase == LaunchPhase::Failed || state.phase == LaunchPhase::Exited {
+                assert!(state.crashed, "非零退出且没关服日志，应当算崩溃");
+                assert_eq!(state.exit_code, Some(3));
                 let window = state.steps.iter().find(|s| s.id == "window").unwrap();
                 assert_eq!(
                     window.status,
@@ -1650,7 +1721,54 @@ mod tests {
                 );
                 return;
             }
-            assert!(Instant::now() < deadline, "进程杀了之后状态没落地");
+            assert!(Instant::now() < deadline, "等不到退出");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+
+    /// 上一次运行留下的 crash-reports 文件不能挂到这一次上。
+    #[cfg(windows)]
+    #[test]
+    fn an_old_crash_report_is_not_attached_to_a_new_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = GameProcessManager::new(dir.path());
+        // 预埋一份"上次崩的"报告，时间戳改到 1 小时前。
+        let crash_dir = dir.path().join("crash-reports");
+        std::fs::create_dir_all(&crash_dir).unwrap();
+        let old = crash_dir.join("crash-2026-10-31_10.00.00-client.txt");
+        std::fs::write(&old, "---- Minecraft Crash Report ----\nold").unwrap();
+        let an_hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(an_hour_ago)
+            .unwrap();
+
+        let mut p = plan();
+        p.java_path = "cmd".into();
+        p.game_dir = dir.path().to_string_lossy().to_string();
+        p.classpath.clear();
+        p.jvm_args.clear();
+        p.extra_jvm_args.clear();
+        p.game_args = vec!["/c".into(), "echo done".into()];
+        p.main_class = String::new();
+        manager.start(p, None, Vec::new()).unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            let state = manager.state();
+            if state.phase != LaunchPhase::Preparing && state.phase != LaunchPhase::Launching {
+                let report = manager.report(None);
+                assert!(
+                    report.crash_file.is_none(),
+                    "旧报告不能算这一次的：{:?}",
+                    report.crash_file
+                );
+                assert!(!report.detected, "旧报告不能让这一次被判成崩溃");
+                return;
+            }
+            assert!(Instant::now() < deadline, "等不到退出");
             std::thread::sleep(Duration::from_millis(100));
         }
     }

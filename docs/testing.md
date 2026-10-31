@@ -14,11 +14,11 @@ cargo test --workspace
 |---|---|
 | `kaleid-kernel` | 29 |
 | `kaleid-api` | 20 |
-| `kaleid-core-plugins` | 249（236 单元 + 13 集成；另有 4 个手动真机用例和 3 个联网用例标了 `#[ignore]`） |
+| `kaleid-core-plugins` | 256（243 单元 + 13 集成；另有 5 个手动真机用例和 3 个联网用例标了 `#[ignore]`） |
 | `kaleid-host` | 21 |
 | `kaleid-cli`（`tests/flow.rs` 集成） | 6 |
 
-> `kaleid-core-plugins` 的 236 个单元里，几块值得单独记一笔：4 个 NBT、7 个 Java 运行时、
+> `kaleid-core-plugins` 的 243 个单元里，几块值得单独记一笔：4 个 NBT、7 个 Java 运行时、
 > 21 个本地内容、19 个微软登录（响应解析、XErr 翻译、DPAPI 令牌存储）、
 > 6 个下载重试/分段/阶段，以及两个「校验只看 `.minecraft` 根目录」的回归用例。
 >
@@ -58,6 +58,11 @@ cargo test --workspace
 > 进过游戏再崩不退化成"启动失败"、"本次日志"按字符边界截断）。另外 `crates/kaleid-host` 的
 > `launch_progress_commands_are_wired` 钉住三个新命令的 camelCase 参数与"没有会话时"
 > 的人话错误。
+>
+> 「退出 ≠ 崩溃」那 8 条（见 6.8）：`crash.rs` 5 条（正常开局日志里的 OpenGL 行不能
+> 算崩溃、关窗退出不算、只有关键词命中不算、非零退出且没关服日志才算、`Stopping!`
+> 之后拿到非零码也不算），`game.rs` 3 条（「结束进程」不算崩溃、真崩了窗口那步仍保持
+> 完成、上一次留下的 crash-reports 不挂到这一次上）。
 >
 > 8 个集成用例在 `tests/download_retry.rs`：进程内起一个最小 HTTP/1.1 服务，验证
 > 「连接被掐断后重试」「连续 5xx 后重试」「服务器忽略 `Range` 时退回单流」
@@ -421,6 +426,38 @@ $idx.objects.PSObject.Properties | Select-Object -First 2 | ForEach-Object {
 沿用 6.4 的做法（装一个必定让游戏崩的模组），确认：进过游戏之后崩溃，弹的是
 **崩溃报告弹窗**，覆盖层不会说「启动失败」；而窗口都没出现就退出的情况（比如
 Java 路径被改坏）才会显示启动失败 + 具体原因。
+
+### 6.8 退出和崩溃怎么区分
+
+真机上踩到过：正常点「退出游戏」、或者直接点窗口右上角的 X，启动器却弹崩溃报告。
+根因是判定把「关键词命中」当成了崩溃证据，而 `graphics` 规则的 needle 里有 `opengl`
+这个词——每局启动都要打 `OpenGL Vendor / Renderer / Version` 好几行，于是**每一局
+都是"崩溃"**（实测一次正常退出的日志里 `opengl` 出现 7 次）。
+
+现在的判定只看证据，**关键词只用来提示"哪一类问题"**：
+
+| 判为崩溃的条件 | 说明 |
+|---|---|
+| 这次会话真的落下 `crash-reports/*.txt` | 按会话开始时间过滤，上一次的旧报告不算 |
+| 日志里有致命标记 | `---- Minecraft Crash Report ----`、`A fatal error has been detected`、`Exception in thread "main"` 等 |
+| 非零退出码 **且** 没走关服流程 | 打出 `Stopping!` / `Save queue flushed!` 就说明是正常退出 |
+| 例外：用户点「结束进程」 | 主动结束必然非零退出码，但那是用户要求的，不算崩溃 |
+
+对应地，关键词规则里那些"日常噪音"也收紧了：`opengl`、`registryaccess` 这类词
+（正常日志、堆栈里到处都有）不再作为线索。
+
+验收（都做过）：
+
+```powershell
+# 1) 拿这台机器上一次真实启动日志回放判定，应当 detected = false
+$env:KALEID_REAL_LOG = "$env:LOCALAPPDATA\Kaleid\logs\<某个会话>\console.log"
+cargo test -p kaleid-core-plugins --lib crash::tests::real_log_is_judged_by_evidence -- --ignored --nocapture
+
+# 2) 真机：启动游戏，等 ✅ 已启动，然后优雅关窗（不带 /F 的 taskkill 等于点 X）
+.\target\debug\kaleid.exe --data-dir "$env:LOCALAPPDATA\Kaleid" launch "FriendServer-1.21.10-All-online"
+taskkill /PID <上面打印的 pid>     # 期望输出：游戏已退出（退出码 Some(0)），不是崩溃
+```
+
 
 ## 7. 可能会撞到的问题
 
