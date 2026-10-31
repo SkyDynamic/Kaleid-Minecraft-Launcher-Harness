@@ -1,0 +1,491 @@
+{
+  "version": 1,
+  "source": "mcmod.cn",
+  "note": "中文名对照种子词表。只存名称对照，不含任何正文；数据来源为 MC 百科条目名（BY-NC-SA 3.0）。可用数据目录下的 mod-names-zh.json 覆盖或扩充。",
+  "entries": [
+    {
+      "zh": "Alex的生物",
+      "en": "Alex's Mobs",
+      "slug": "alexs-mobs"
+    },
+    {
+      "zh": "苹果皮",
+      "en": "AppleSkin",
+      "slug": "appleskin",
+      "mcmodId": 744
+    },
+    {
+      "zh": "应用能源 2",
+      "en": "Applied Energistics 2",
+      "slug": "ae2",
+      "mcmodId": 260
+    },
+    {
+      "zh": "新生魔艺",
+      "en": "Ars Nouveau",
+      "slug": "ars-nouveau"
+    },
+    {
+      "zh": "属性修复",
+      "en": "AttributeFix",
+      "slug": "attributefix",
+      "mcmodId": 2264
+    },
+    {
+      "zh": "更好的进度",
+      "en": "Better Advancements",
+      "slug": "better-advancements",
+      "mcmodId": 1530
+    },
+    {
+      "zh": "更好的战斗",
+      "en": "Better Combat",
+      "slug": "better-combat"
+    },
+    {
+      "zh": "超多生物群系",
+      "en": "Biomes O' Plenty",
+      "mcmodId": 108,
+      "slug": "biomes-o-plenty"
+    },
+    {
+      "zh": "血魔法",
+      "en": "Blood Magic",
+      "slug": "blood-magic"
+    },
+    {
+      "zh": "植物魔法",
+      "en": "Botania",
+      "slug": "botania"
+    },
+    {
+      "zh": "搬运",
+      "en": "Carry On",
+      "slug": "carry-on",
+      "mcmodId": 1081
+    },
+    {
+      "zh": "聊天头像",
+      "en": "Chat Heads",
+      "slug": "chat-heads",
+      "mcmodId": 4523
+    },
+    {
+      "zh": "凿子",
+      "en": "Chisel",
+      "slug": "chisel"
+    },
+    {
+      "zh": "城堡",
+      "en": "Citadel",
+      "slug": "citadel"
+    },
+    {
+      "zh": "经验机制改革",
+      "en": "Clumps",
+      "slug": "clumps",
+      "mcmodId": 1499
+    },
+    {
+      "zh": "舒适用品",
+      "en": "Comforts",
+      "slug": "comforts",
+      "mcmodId": 2107
+    },
+    {
+      "zh": "连接纹理",
+      "en": "ConnectedTexturesMod",
+      "mcmodId": 837,
+      "slug": "ctm"
+    },
+    {
+      "zh": "傻瓜烹饪/懒人厨房",
+      "en": "Cooking for Blockheads",
+      "slug": "cooking-for-blockheads",
+      "mcmodId": 468
+    },
+    {
+      "zh": "时装盔甲重置版",
+      "en": "Cosmetic Armor Reworked",
+      "slug": "cosmetic-armor-reworked",
+      "mcmodId": 2497
+    },
+    {
+      "zh": "机械动力",
+      "en": "Create",
+      "slug": "create",
+      "mcmodId": 2021
+    },
+    {
+      "zh": "作物盛景",
+      "en": "Croptopia",
+      "slug": "croptopia"
+    },
+    {
+      "zh": "饰品栏",
+      "en": "Curios API",
+      "slug": "curios"
+    },
+    {
+      "zh": "龙之进化",
+      "en": "Draconic Evolution",
+      "slug": "draconic-evolution"
+    },
+    {
+      "zh": "动态 FPS",
+      "en": "Dynamic FPS",
+      "slug": "dynamic-fps",
+      "mcmodId": 3074
+    },
+    {
+      "zh": "附魔描述",
+      "en": "Enchantment Descriptions",
+      "slug": "enchantment-descriptions",
+      "mcmodId": 1945
+    },
+    {
+      "zh": "末影接口",
+      "en": "Ender IO",
+      "slug": "ender-io"
+    },
+    {
+      "zh": "实体渲染机制优化",
+      "en": "Entity Culling",
+      "slug": "entityculling",
+      "mcmodId": 3629
+    },
+    {
+      "zh": "史诗战斗",
+      "en": "Epic Fight",
+      "slug": "epic-fight-mod"
+    },
+    {
+      "zh": "农夫乐事",
+      "en": "Farmer's Delight",
+      "slug": "farmers-delight",
+      "mcmodId": 2820
+    },
+    {
+      "zh": "铁氧体磁芯",
+      "en": "FerriteCore",
+      "slug": "ferrite-core",
+      "mcmodId": 3888
+    },
+    {
+      "zh": "第一人称模型",
+      "en": "First-person Model",
+      "slug": "first-person-model"
+    },
+    {
+      "zh": "林业",
+      "en": "Forestry",
+      "slug": "forestry"
+    },
+    {
+      "zh": "FTB 任务",
+      "en": "FTB Quests (NeoForge)",
+      "slug": "ftb-quests-forge",
+      "mcmodId": 1423
+    },
+    {
+      "zh": "FTB 团队",
+      "en": "FTB Teams (NeoForge)",
+      "slug": "ftb-teams-forge",
+      "mcmodId": 3179
+    },
+    {
+      "zh": "星系",
+      "en": "Galacticraft",
+      "slug": "galacticraft-legacy"
+    },
+    {
+      "zh": "冰与火之歌",
+      "en": "Ice and Fire",
+      "slug": "ice-and-fire-dragons"
+    },
+    {
+      "zh": "沉浸工程",
+      "en": "Immersive Engineering",
+      "slug": "immersive-engineering"
+    },
+    {
+      "zh": "铟",
+      "en": "Indium",
+      "slug": "indium",
+      "mcmodId": 3413
+    },
+    {
+      "zh": "工业时代2",
+      "en": "Industrial Craft",
+      "slug": "industrial-craft"
+    },
+    {
+      "zh": "更多箱子",
+      "en": "Iron Chests",
+      "slug": "iron-chests",
+      "mcmodId": 20
+    },
+    {
+      "zh": "玉",
+      "en": "Jade 🔍",
+      "slug": "jade"
+    },
+    {
+      "zh": "旅行地图",
+      "en": "JourneyMap",
+      "slug": "journeymap",
+      "mcmodId": 198
+    },
+    {
+      "zh": "JEI物品管理器",
+      "en": "Just Enough Items (JEI)",
+      "slug": "jei",
+      "mcmodId": 459
+    },
+    {
+      "zh": "氪",
+      "en": "Krypton",
+      "slug": "krypton",
+      "mcmodId": 3399
+    },
+    {
+      "zh": "锂",
+      "en": "Lithium",
+      "slug": "lithium",
+      "mcmodId": 2292
+    },
+    {
+      "zh": "地幔",
+      "en": "Mantle",
+      "slug": "mantle",
+      "mcmodId": 329
+    },
+    {
+      "zh": "通用机械",
+      "en": "Mekanism",
+      "slug": "mekanism"
+    },
+    {
+      "zh": "内存泄漏修复",
+      "en": "Memory Leak Fix",
+      "slug": "memoryleakfix"
+    },
+    {
+      "zh": "模组菜单",
+      "en": "Mod Menu",
+      "slug": "modmenu",
+      "mcmodId": 1675
+    },
+    {
+      "zh": "现代化修复",
+      "en": "ModernFix",
+      "slug": "modernfix",
+      "mcmodId": 8714
+    },
+    {
+      "zh": "鼠标手势",
+      "en": "Mouse Tweaks",
+      "slug": "mouse-tweaks",
+      "mcmodId": 1162
+    },
+    {
+      "zh": "神秘农业",
+      "en": "Mystical Agriculture",
+      "slug": "mystical-agriculture"
+    },
+    {
+      "zh": "自然罗盘/生物群系指南针",
+      "en": "Nature's Compass",
+      "slug": "natures-compass",
+      "mcmodId": 754
+    },
+    {
+      "zh": "禁用聊天举报",
+      "en": "No Chat Reports",
+      "slug": "no-chat-reports",
+      "mcmodId": 6756
+    },
+    {
+      "zh": "更多动画",
+      "en": "Not Enough Animations",
+      "slug": "not-enough-animations",
+      "mcmodId": 4378
+    },
+    {
+      "zh": "你将去的生物群系",
+      "en": "Oh The Biomes You'll Go",
+      "slug": "oh-the-biomes-youll-go"
+    },
+    {
+      "zh": "高清修复",
+      "en": "OptiFine"
+    },
+    {
+      "zh": "跑酷",
+      "en": "ParCool!",
+      "slug": "parcool"
+    },
+    {
+      "zh": "帕秋莉手册",
+      "en": "Patchouli",
+      "slug": "patchouli",
+      "mcmodId": 1388
+    },
+    {
+      "zh": "磷",
+      "en": "Phosphor",
+      "slug": "phosphor"
+    },
+    {
+      "zh": "安慰剂",
+      "en": "Placebo",
+      "slug": "placebo"
+    },
+    {
+      "zh": "多态合成",
+      "en": "Polymorph",
+      "slug": "polymorph",
+      "mcmodId": 2895
+    },
+    {
+      "zh": "夸克",
+      "en": "Quark",
+      "slug": "quark",
+      "mcmodId": 527
+    },
+    {
+      "zh": "铁路",
+      "en": "Railcraft",
+      "slug": "railcraft"
+    },
+    {
+      "zh": "Reese的钠视频界面",
+      "en": "Reese's Sodium Options",
+      "slug": "reeses-sodium-options"
+    },
+    {
+      "zh": "精致存储",
+      "en": "Refined Storage",
+      "slug": "refined-storage"
+    },
+    {
+      "zh": "铷",
+      "en": "Rubidium",
+      "slug": "rubidium"
+    },
+    {
+      "zh": "简单的语音聊天",
+      "en": "Simple Voice Chat",
+      "slug": "simple-voice-chat",
+      "mcmodId": 3693
+    },
+    {
+      "zh": "钠",
+      "en": "Sodium",
+      "slug": "sodium",
+      "mcmodId": 2785
+    },
+    {
+      "zh": "钠 · 扩展",
+      "en": "Sodium Extra",
+      "slug": "sodium-extra",
+      "mcmodId": 3701
+    },
+    {
+      "zh": "精妙背包",
+      "en": "Sophisticated Backpacks",
+      "slug": "sophisticated-backpacks",
+      "mcmodId": 3739
+    },
+    {
+      "zh": "精妙核心",
+      "en": "Sophisticated Core",
+      "slug": "sophisticated-core",
+      "mcmodId": 6324
+    },
+    {
+      "zh": "物理声效重制版",
+      "en": "Sound Physics Remastered",
+      "slug": "sound-physics-remastered",
+      "mcmodId": 8197
+    },
+    {
+      "zh": "火花",
+      "en": "spark",
+      "slug": "spark",
+      "mcmodId": 4073
+    },
+    {
+      "zh": "星光",
+      "en": "Starlight (Fabric)",
+      "slug": "starlight"
+    },
+    {
+      "zh": "储物抽屉",
+      "en": "Storage Drawers",
+      "slug": "storage-drawers",
+      "mcmodId": 408
+    },
+    {
+      "zh": "锦致装饰",
+      "en": "Supplementaries",
+      "slug": "supplementaries",
+      "mcmodId": 3555
+    },
+    {
+      "zh": "文本占位符 API",
+      "en": "Text Placeholder API",
+      "slug": "placeholder-api",
+      "mcmodId": 15527
+    },
+    {
+      "zh": "天境",
+      "en": "The Aether",
+      "slug": "aether"
+    },
+    {
+      "zh": "暮色森林",
+      "en": "The Twilight Forest",
+      "slug": "the-twilight-forest",
+      "mcmodId": 61
+    },
+    {
+      "zh": "暮色森林",
+      "en": "The Twilight Forest",
+      "slug": "the-twilight-forest"
+    },
+    {
+      "zh": "热力膨胀",
+      "en": "Thermal Expansion",
+      "slug": "thermal-expansion"
+    },
+    {
+      "zh": "匠魂",
+      "en": "Tinkers' Construct",
+      "slug": "tinkers-construct"
+    },
+    {
+      "zh": "连锁采矿/矿脉矿工",
+      "en": "VeinMiner",
+      "slug": "veinminer",
+      "mcmodId": 589
+    },
+    {
+      "zh": "传送石碑/指路石",
+      "en": "Waystones",
+      "slug": "waystones",
+      "mcmodId": 1339
+    },
+    {
+      "zh": "Xaero 的小地图",
+      "en": "Xaero's Minimap",
+      "slug": "xaeros-minimap",
+      "mcmodId": 1701
+    },
+    {
+      "zh": "Xaero的世界地图",
+      "en": "Xaero's World Map",
+      "slug": "xaeros-world-map"
+    }
+  ]
+}

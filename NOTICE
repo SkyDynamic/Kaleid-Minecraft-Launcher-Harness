@@ -1,0 +1,22 @@
+Kaleid
+Copyright 2026 Sky_Dynamic
+
+本项目以 Apache License 2.0 授权发布，完整许可文本见同目录下的 LICENSE。
+分发本项目的修改版时，请保留本文件与本项目的版权声明。
+
+第三方组件（各自遵循其自身许可，许可文本随依赖一并分发）：
+
+  Rust 标准库与生态依赖         MIT / Apache-2.0
+  Tauri 2                       MIT 或 Apache-2.0
+  React / React DOM             MIT
+  Vite / Tailwind CSS           MIT
+  zustand                       MIT
+  lucide-react                  ISC
+  rfd / fontdb                  MIT
+  ureq / sha1 / crossbeam       MIT 或 Apache-2.0
+  base64 / hex                  MIT 或 Apache-2.0
+
+Minecraft 的名称、贴图与新闻内容归 Mojang Studios / Microsoft 所有。
+版本图标取自 Minecraft Wiki（zh.minecraft.wiki，页面内容按 CC BY-NC-SA 3.0 授权），
+默认 Steve / Alex 皮肤纹理由 Mojang 官方皮肤服务提供；这些资源仅用于界面展示，
+本项目不分发任何游戏本体资源。

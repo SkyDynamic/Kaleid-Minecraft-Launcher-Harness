@@ -1,0 +1,32 @@
+{
+  "id": "example-mirror",
+  "name": "校园镜像源",
+  "version": "1.0.0",
+  "api": "1",
+  "author": "example",
+  "steps": [
+    {
+      "op": "provide-source",
+      "id": "campus-mirror",
+      "label": "校园网镜像",
+      "priority": 20,
+      "manifestUrl": "https://mirror.example.edu/minecraft/version_manifest_v2.json",
+      "baseUrl": "https://mirror.example.edu/minecraft"
+    },
+    {
+      "op": "update-config",
+      "target": "version-manager",
+      "patch": {
+        "enableMojang": true,
+        "enableBmclapi": true,
+        "autoSpeedTest": true
+      }
+    },
+    {
+      "op": "bind-slot",
+      "slot": "settings.sidebar",
+      "title": "镜像说明",
+      "view": "readonly-text:校园网内优先走本地镜像，出境线路拥堵时也能正常下载。"
+    }
+  ]
+}

@@ -1,0 +1,16 @@
+[package]
+name = "kaleid-host"
+description = "Kaleid 宿主命令层：把界面发来的命令翻译成插件服务调用（不依赖 Tauri，可单测）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+kaleid-kernel = { workspace = true }
+kaleid-api = { workspace = true }
+kaleid-core-plugins = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

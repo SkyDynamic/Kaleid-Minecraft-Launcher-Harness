@@ -1,0 +1,40 @@
+[package]
+name = "kaleid-desktop"
+description = "Kaleid 桌面外壳：Tauri 2 + 系统 WebView2"
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Sky_Dynamic"]
+
+# 独立 workspace：不拖慢核心 crate 的 `cargo test --workspace`。
+[workspace]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+kaleid-host = { path = "../crates/kaleid-host" }
+kaleid-core-plugins = { path = "../crates/kaleid-core-plugins" }
+rfd = "0.15"
+fontdb = "0.23"
+base64 = "0.22"
+sha1 = "0.10"
+hex = "0.4"
+
+[features]
+# 官方 CLI（`tauri build`）会显式传 `--features tauri/custom-protocol`。
+# 这里把它设成默认，否则直接 `cargo build --release` 会产出一个
+# **指向 dev server 的二进制**：dev server 没开就是白屏，开着就更糟——
+# 你以为在验收打包产物，其实跑的是开发页。
+default = ["tauri/custom-protocol"]
+
+# 安装包体积优先（见 docs/superpowers/specs）。
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

@@ -1,0 +1,20 @@
+[package]
+name = "kaleid-cli"
+description = "Kaleid 无头命令行：不启动界面即可收录文件夹、扫描版本、打印启动参数"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kaleid"
+path = "src/main.rs"
+
+[dependencies]
+kaleid-kernel = { workspace = true }
+kaleid-api = { workspace = true }
+kaleid-core-plugins = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }

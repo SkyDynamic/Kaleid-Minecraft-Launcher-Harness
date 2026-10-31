@@ -1,0 +1,35 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Kaleid",
+  "version": "0.1.0",
+  "identifier": "app.kaleid.launcher",
+  "build": {
+    "beforeDevCommand": "pnpm --dir ui dev",
+    "devUrl": "http://localhost:5373",
+    "beforeBuildCommand": "pnpm --dir ui build",
+    "frontendDist": "../ui/dist"
+  },
+  "app": {
+    "withGlobalTauri": false,
+    "windows": [],
+    "security": {
+      "csp": "default-src 'self'; script-src 'self' kaleid:; style-src 'self' 'unsafe-inline' kaleid:; img-src 'self' data: kaleid: https://textures.minecraft.net https://launchercontent.mojang.com https://*.namemc.com https://*.mcskins.top https://mc-heads.net https://*.mc-heads.net https://cdn.modrinth.com https://*.forgecdn.net https://mod.mcimirror.top; connect-src 'self' ipc: http://ipc.localhost kaleid: https://*.mojang.com https://*.minecraft.net https://bmclapi2.bangbang93.com https://piston-meta.mojang.com"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": ["nsis"],
+    "icon": ["icons/icon.ico"],
+    "publisher": "Sky_Dynamic",
+    "copyright": "Copyright © 2026 Sky_Dynamic",
+    "shortDescription": "Kaleid Minecraft 启动器",
+    "longDescription": "Kaleid：插件化的 Minecraft 启动器。以 Apache License 2.0 授权发布。",
+    "licenseFile": "../LICENSE",
+    "windows": {
+      "nsis": {
+        "installMode": "currentUser",
+        "compression": "lzma"
+      }
+    }
+  }
+}

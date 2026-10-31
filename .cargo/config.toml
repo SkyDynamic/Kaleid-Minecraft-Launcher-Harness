@@ -1,0 +1,9 @@
+# 网络受限时走国内稀疏镜像，保证本地与 CI 可复现构建。
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true

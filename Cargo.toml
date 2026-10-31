@@ -1,0 +1,52 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kaleid-kernel",
+    "crates/kaleid-api",
+    "crates/kaleid-core-plugins",
+    "crates/kaleid-host",
+    "crates/kaleid-cli",
+]
+# Tauri 外壳独立成 crate 并且**不在** workspace 里：它需要下载整套 Tauri 依赖，
+# 让核心（内核/契约/插件/命令层）始终保持 `cargo test --workspace` 秒级可跑。
+exclude = ["src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+authors = ["Sky_Dynamic"]
+
+[workspace.dependencies]
+kaleid-kernel = { path = "crates/kaleid-kernel" }
+kaleid-api = { path = "crates/kaleid-api" }
+kaleid-core-plugins = { path = "crates/kaleid-core-plugins" }
+kaleid-host = { path = "crates/kaleid-host" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+md-5 = "0.10"
+thiserror = "2"
+sha1 = "0.10"
+sha2 = "0.10"
+hex = "0.4"
+walkdir = "2"
+notify = "7"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
+ureq = { version = "2.12", features = ["json"] }
+crossbeam-channel = "0.5"
+base64 = "0.22"
+# 读 `level.dat`（gzip 后的 NBT）与旧日志（`.log.gz`）；ureq 的 gzip 已经把它拉进来了。
+flate2 = "1.1"
+# Java 发现要读注册表里的 JDK 登记项（Win32_System_Registry）；0.52 已在锁文件里。
+windows-sys = { version = "0.52", default-features = false }
+
+# Size / speed oriented release profile (see docs/superpowers/specs).
+[profile.release]
+opt-level = "s"
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

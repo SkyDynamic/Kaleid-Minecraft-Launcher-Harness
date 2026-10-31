@@ -1,0 +1,440 @@
+@import "tailwindcss";
+
+/* ------------------------------------------------------------------ *
+ * Kaleid design tokens (Tailwind v4 CSS-first @theme)
+ * ------------------------------------------------------------------ */
+@theme {
+  --font-sans: "Segoe UI Variable Text", "Segoe UI", system-ui, -apple-system, "Microsoft YaHei UI", sans-serif;
+  --font-mono: "Cascadia Mono", Consolas, ui-monospace, monospace;
+
+  --color-bg: #151517;
+  --color-rail: #1b1b1c;
+  --color-layer1: #232324;
+  --color-layer2: #2c2c2e;
+  --color-layer3: #353638;
+
+  --color-ink: #f9fafb;
+  --color-ink2: #cfd3d6;
+  --color-ink3: #adb2b8;
+  --color-ink4: #81858c;
+
+  --color-accent: #5686fe;
+  --color-accent-strong: #4176e6;
+  /* 悬停色：暗色主题往**亮**走、浅色主题往**深**走，方向不能共用一套值。 */
+  --color-accent-hover: #7ba1ff;
+  --color-green: #41c977;
+  --color-amber: #e0a52e;
+  --color-red: #f25a5a;
+  --color-violet: #c586c0;
+  --color-cyan: #56b6c2;
+
+  --color-line: rgba(255, 255, 255, 0.08);
+  --color-line-strong: rgba(255, 255, 255, 0.14);
+  --color-hover: rgba(255, 255, 255, 0.06);
+  --color-hover-strong: rgba(255, 255, 255, 0.095);
+
+  /* 半成品表面：输入框、代码块、分段控件的凹槽、进度条底色。
+   * 这些以前是写死的深色 hex，浅色主题下会脏成一块一块。 */
+  --color-field: #1c1c1e;
+  --color-code: #121213;
+  --color-sunken: rgba(0, 0, 0, 0.22);
+  --color-track: rgba(255, 255, 255, 0.12);
+  --color-thumb: #f9fafb;
+  --color-scroll-thumb: #3b3c3f;
+  --color-scroll-thumb-hover: #4a4b4f;
+  --color-scrim: rgba(0, 0, 0, 0.55);
+  /** 分段控件里"被选中那一格"的底色。 */
+  --color-raised: #353638;
+
+  --shadow-pop: 0 10px 28px rgba(0, 0, 0, 0.55);
+  --shadow-overlay: 0 24px 64px rgba(0, 0, 0, 0.62);
+  --shadow-seg: 0 1px 2px rgba(0, 0, 0, 0.35);
+
+  --radius-xs: 6px;
+  --radius-sm: 7px;
+  --radius-md: 8px;
+  --radius-lg: 10px;
+  --radius-xl: 12px;
+
+  --text-base: 13px;
+  --text-base--line-height: 1.45;
+  /* 界面默认字重比旧版略重：13px 正文在 WebView2 里 400 会发虚。 */
+  --font-weight-normal: 500;
+  --font-weight-medium: 560;
+  --font-weight-semibold: 600;
+
+  /* 动效 token：所有过渡从这几个值取，组件里不写裸数字。 */
+  --ease-standard: cubic-bezier(0.2, 0.8, 0.25, 1);
+  --ease-emphasized: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast: 120ms;
+  --dur-base: 170ms;
+  --dur-slow: 220ms;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  /*
+   * 界面字号（设置 → APP 设置 → 界面字号）。
+   *
+   * `--ui-zoom` 由 store/prefs.ts 写在 <html> 上，值是 px / 13px 的比例；默认 1。
+   * 用根元素 zoom 而不是改 font-size：整个界面等比缩放，间距和控件跟着一起变，
+   * 观感等同浏览器缩放，也不会出现"字号变大、行高没变"的错位。
+   * 刻意不加 transition——字号渐变看着像界面在抖。
+   */
+  html {
+    zoom: var(--ui-zoom, 1);
+  }
+
+  body {
+    margin: 0;
+    background: var(--color-bg);
+    color: var(--color-ink);
+    font-family: var(--font-sans);
+    font-size: 13px;
+    font-weight: 500;
+    overflow: hidden;
+  }
+
+  *,
+  *::before,
+  *::after {
+    box-sizing: border-box;
+  }
+
+  button {
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+  }
+
+  input,
+  textarea {
+    font: inherit;
+    color: inherit;
+  }
+
+  :focus-visible {
+    outline: 1px solid color-mix(in srgb, var(--color-accent) 70%, transparent);
+    outline-offset: 1px;
+  }
+
+  ::selection {
+    background: color-mix(in srgb, var(--color-accent) 42%, transparent);
+  }
+
+  ::-webkit-scrollbar {
+    width: 10px;
+    height: 10px;
+  }
+  ::-webkit-scrollbar-track {
+    background: transparent;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: var(--color-scroll-thumb);
+    border: 3px solid transparent;
+    border-radius: 8px;
+    background-clip: padding-box;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--color-scroll-thumb-hover);
+    background-clip: padding-box;
+    border: 3px solid transparent;
+  }
+
+  input[type="range"] {
+    accent-color: var(--color-accent);
+  }
+}
+
+@layer components {
+  .card {
+    background: var(--color-layer1);
+    border: 1px solid var(--color-line);
+    border-radius: var(--radius-lg);
+  }
+
+  .hairline {
+    background: var(--color-line);
+    height: 1px;
+  }
+
+  .kbd {
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    line-height: 1;
+    padding: 3px 5px;
+    border-radius: 4px;
+    border: 1px solid var(--color-line-strong);
+    color: var(--color-ink4);
+    background: var(--color-layer2);
+    white-space: nowrap;
+  }
+
+  .row-flash {
+    animation: row-flash 1.5s ease-out;
+  }
+
+  .slider {
+    -webkit-appearance: none;
+    appearance: none;
+    width: 100%;
+    height: 18px;
+    background: transparent;
+    cursor: pointer;
+  }
+
+  .slider::-webkit-slider-runnable-track {
+    height: 4px;
+    border-radius: 999px;
+    background: linear-gradient(
+      to right,
+      var(--color-accent) 0%,
+      var(--color-accent) var(--fill, 0%),
+      var(--color-track) var(--fill, 0%),
+      var(--color-track) 100%
+    );
+  }
+
+  .slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 13px;
+    height: 13px;
+    margin-top: -4.5px;
+    border-radius: 50%;
+    background: var(--color-thumb);
+    border: 1px solid var(--color-line-strong);
+    box-shadow: 0 1px 3px rgba(0, 0, 0, 0.35);
+  }
+
+  .slider::-moz-range-track {
+    height: 4px;
+    border-radius: 999px;
+    background: var(--color-track);
+  }
+
+  .slider::-moz-range-progress {
+    height: 4px;
+    border-radius: 999px;
+    background: var(--color-accent);
+  }
+
+  .slider::-moz-range-thumb {
+    width: 13px;
+    height: 13px;
+    border-radius: 50%;
+    background: var(--color-thumb);
+    border: 1px solid var(--color-line-strong);
+  }
+
+  /* ---- 动效类 ----
+   * 显式类名而不是依赖 Tailwind 的 animate-* 工具类：多一个类名不多一 KB，
+   * 但少一个"构建产物里没有这个 utility"的静默失效。 */
+  .anim-fade-in {
+    animation: fade-in var(--dur-base) var(--ease-standard) both;
+  }
+
+  .anim-fade-up {
+    animation: fade-up var(--dur-slow) var(--ease-emphasized) both;
+  }
+
+  .anim-scale-in {
+    animation: scale-in var(--dur-base) var(--ease-emphasized) both;
+  }
+
+  .anim-scale-out {
+    animation: scale-out var(--dur-fast) var(--ease-standard) both;
+  }
+
+  .anim-toast-in {
+    animation: toast-in 180ms var(--ease-emphasized) both;
+  }
+
+  .anim-overlay-in {
+    animation: fade-in var(--dur-base) var(--ease-standard) both;
+  }
+
+  .anim-overlay-out {
+    animation: fade-out var(--dur-fast) var(--ease-standard) both;
+  }
+
+  .anim-shimmer {
+    animation: shimmer 1.4s linear infinite;
+  }
+}
+
+@keyframes row-flash {
+  0% {
+    background: color-mix(in srgb, var(--color-accent) 20%, transparent);
+  }
+  100% {
+    background: transparent;
+  }
+}
+
+@keyframes fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes fade-out {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0;
+  }
+}
+
+@keyframes fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes scale-in {
+  from {
+    opacity: 0;
+    transform: scale(0.97);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes scale-out {
+  from {
+    opacity: 1;
+    transform: none;
+  }
+  to {
+    opacity: 0;
+    transform: scale(0.98);
+  }
+}
+
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+@keyframes shimmer {
+  from {
+    background-position: -120% 0;
+  }
+  to {
+    background-position: 220% 0;
+  }
+}
+
+/* ------------------------------------------------------------------ *
+ * 动效开关
+ *
+ * 两条独立的闸门：
+ * 1. 系统"减少动态效果"（无障碍，永远优先）；
+ * 2. 应用内偏好「动效：关闭」，由 App 写到 <html data-motion="off">。
+ * ------------------------------------------------------------------ */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-delay: 0ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+
+html[data-motion="off"] *,
+html[data-motion="off"] *::before,
+html[data-motion="off"] *::after {
+  animation-duration: 0.01ms !important;
+  animation-delay: 0ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+  scroll-behavior: auto !important;
+}
+
+/* ------------------------------------------------------------------ *
+ * 主题
+ *
+ * `@theme` 里那套是默认（暗色）。浅色只覆盖同一批 token——组件里没有任何
+ * `if (theme === 'light')`，换主题纯粹是换变量。
+ *
+ * `data-theme` 由 store/prefs.ts 写在 <html> 上，"跟随系统"在**运行时**解析成
+ * dark / light 再写死，所以这里不需要再写一遍 prefers-color-scheme 媒体查询，
+ * 也就不会出现"两套浅色值"要手动同步的问题。
+ *
+ * color-scheme 一并切换，让滚动条、range、表单这些原生控件跟着变。
+ * ------------------------------------------------------------------ */
+html[data-theme="dark"] {
+  color-scheme: dark;
+}
+
+html[data-theme="light"] {
+  color-scheme: light;
+
+  --color-bg: #f2f3f5;
+  --color-rail: #e9eaee;
+  --color-layer1: #ffffff;
+  --color-layer2: #f3f4f6;
+  --color-layer3: #e3e5ea;
+
+  --color-ink: #14161a;
+  --color-ink2: #3c424a;
+  --color-ink3: #525963;
+  --color-ink4: #666c75;
+
+  /* 浅色下这几个色要压深一点：白底上的 10–11px 小字最容易读不清，
+   * 这组值都实测过对比度 ≥ 4.5:1（白底）。 */
+  --color-accent: #2f63e8;
+  --color-accent-strong: #2755c9;
+  --color-accent-hover: #1e49b0;
+  --color-green: #14803f;
+  --color-amber: #8f5c10;
+  --color-red: #c22d2d;
+  --color-violet: #a06bd8;
+  --color-cyan: #3f9a9d;
+
+  --color-line: rgba(18, 20, 25, 0.13);
+  --color-line-strong: rgba(18, 20, 25, 0.22);
+  --color-hover: rgba(18, 20, 25, 0.055);
+  --color-hover-strong: rgba(18, 20, 25, 0.1);
+
+  --color-field: #ffffff;
+  --color-code: #f7f8fa;
+  --color-sunken: rgba(18, 20, 25, 0.07);
+  --color-track: rgba(18, 20, 25, 0.2);
+  --color-thumb: #ffffff;
+  --color-scroll-thumb: #c4c8cf;
+  --color-scroll-thumb-hover: #a9aeb7;
+  --color-scrim: rgba(18, 20, 25, 0.32);
+  /* 白底上"选中的那一格"用纯白 + 阴影，比灰底更像被按下去。
+   * 暗色主题里反过来：亮一点的格子才看得见。 */
+  --color-raised: #ffffff;
+
+  --shadow-pop: 0 10px 28px rgba(18, 20, 25, 0.16);
+  --shadow-overlay: 0 24px 64px rgba(18, 20, 25, 0.22);
+  --shadow-seg: 0 1px 2px rgba(18, 20, 25, 0.18), 0 0 0 1px rgba(18, 20, 25, 0.05);
+}

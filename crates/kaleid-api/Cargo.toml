@@ -1,0 +1,15 @@
+[package]
+name = "kaleid-api"
+description = "Kaleid 服务契约与数据传输对象：内核与插件、插件与界面之间的唯一公共语言"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+md-5 = { workspace = true }
+
+[dev-dependencies]
+uuid = { workspace = true }

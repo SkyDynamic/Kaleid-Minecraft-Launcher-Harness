@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"Kaleid 只需要最基本的窗口能力；所有业务都走自己的命令表。","local":true,"windows":["main"],"permissions":["core:default"]}}

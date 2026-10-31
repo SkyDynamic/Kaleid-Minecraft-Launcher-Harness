@@ -1,0 +1,17 @@
+# 标准组合：在基线之上打开版本管理，并调一下它的配置。
+#
+# 基线（core-lists / version-store / settings / accounts / launch）由
+# `kaleid_core_plugins::standard_preset()` 给出；这里只写差异。
+- update:
+    id: version-manager
+    enabled: true
+    config:
+      enableMojang: true
+      enableBmclapi: true
+      autoSpeedTest: true
+      verifyAfterInstall: true
+
+- update:
+    id: settings
+    config:
+      defaultMemoryMb: 4096

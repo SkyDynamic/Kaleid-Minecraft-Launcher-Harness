@@ -1,0 +1,12 @@
+[package]
+name = "kaleid-kernel"
+description = "Kaleid 插件内核：服务注入、可回收副作用、事件总线、补丁化组合（Cordis 语义的 Rust 移植）"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+thiserror = { workspace = true }
