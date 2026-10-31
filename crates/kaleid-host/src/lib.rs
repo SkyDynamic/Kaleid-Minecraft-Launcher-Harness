@@ -27,6 +27,7 @@ use kaleid_kernel::Kernel;
 pub struct Host {
     kernel: Kernel,
     minimal: bool,
+    data_root: std::path::PathBuf,
 }
 
 impl Host {
@@ -34,13 +35,32 @@ impl Host {
     pub fn boot(data_root: &Path, minimal: bool) -> Result<Self, String> {
         let kernel = Kernel::new();
         register_all(&kernel, data_root);
-        let specs = if minimal {
+        // 第三方清单：配置类动作先改规格，服务类动作等内核就绪后再注册。
+        let manifests = kaleid_core_plugins::load_ready_manifests(data_root);
+        let mut specs = if minimal {
             minimal_preset()
         } else {
             standard_preset()
         };
+        if let Err(error) = kaleid_core_plugins::apply_to_specs(&manifests, &mut specs) {
+            eprintln!("清单未生效：{error}");
+        }
         kernel.load(&specs).map_err(|e| e.to_string())?;
-        Ok(Host { kernel, minimal })
+        for manifest in &manifests {
+            if let Some((owner, sources)) = kaleid_core_plugins::manifest_source_table(manifest) {
+                kernel.context().provide(
+                    "install-sources",
+                    kaleid_core_plugins::InstallSourceTable { owner, sources },
+                    0,
+                );
+            }
+        }
+        apply_manifest_defaults(data_root, &kernel, &manifests);
+        Ok(Host {
+            kernel,
+            minimal,
+            data_root: data_root.to_path_buf(),
+        })
     }
 
     pub fn kernel(&self) -> &Kernel {
@@ -53,7 +73,48 @@ impl Host {
 
     /// 执行一条命令。
     pub fn dispatch(&self, cmd: &str, args: Value) -> Result<Value, String> {
+        // 清单相关的两条命令要读数据目录，所以留在宿主层，不进无状态命令表。
+        match cmd {
+            "plugins_slots" => {
+                let manifests = kaleid_core_plugins::load_ready_manifests(&self.data_root);
+                return to_value(kaleid_core_plugins::manifest_slots(&manifests));
+            }
+            "plugins_manifests" => {
+                return to_value(kaleid_core_plugins::list_manifests(&self.data_root));
+            }
+            _ => {}
+        }
         dispatch(&self.kernel, cmd, args)
+    }
+}
+
+/// 清单声明的默认值只在用户没有显式设置时生效。
+///
+/// 「显式设置」看的是 `settings.json` 里的**原始键**：把 GlobalSettings 序列化一遍
+/// 会让所有字段都出现（结构体是满的），那样默认值永远不会生效。
+fn apply_manifest_defaults(
+    data_root: &Path,
+    kernel: &Kernel,
+    manifests: &[kaleid_core_plugins::Manifest],
+) {
+    let Some(settings) = kernel.context().service::<Settings>() else {
+        return;
+    };
+    let stored: serde_json::Map<String, Value> =
+        std::fs::read_to_string(kaleid_core_plugins::paths::settings_file(data_root))
+            .ok()
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|value| value.as_object().cloned())
+            .unwrap_or_default();
+    for (key, value) in kaleid_core_plugins::default_settings(manifests) {
+        if stored.contains_key(&key) {
+            continue;
+        }
+        let mut patch = serde_json::Map::new();
+        patch.insert(key.clone(), value);
+        if let Err(error) = settings.patch_global(&Value::Object(patch)) {
+            eprintln!("清单默认值 {key} 未生效：{error}");
+        }
     }
 }
 
@@ -1602,6 +1663,101 @@ mod tests {
             )
             .unwrap();
         assert_eq!(good["ok"], json!(true));
+    }
+
+    #[test]
+    fn manifests_add_sources_slots_and_defaults() {
+        let (_dir, data, _mc) = env();
+        let plugin_dir = data.join("plugins/example-mirror");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string(&json!({
+                "id": "example-mirror",
+                "name": "校园镜像源",
+                "version": "1.0.0",
+                "api": "1",
+                "steps": [
+                    {
+                        "op": "provide-source",
+                        "id": "campus-mirror",
+                        "label": "校园网镜像",
+                        "priority": 20,
+                        "manifestUrl": "https://mirror.example.edu/minecraft/version_manifest_v2.json",
+                        "baseUrl": "https://mirror.example.edu/minecraft"
+                    },
+                    {
+                        "op": "bind-slot",
+                        "slot": "overview.notices",
+                        "title": "镜像说明",
+                        "view": "readonly-text:校园网内优先走本地镜像。"
+                    },
+                    { "op": "set-default-setting", "key": "checkBeforeLaunch", "value": true }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let host = Host::boot(&data, false).unwrap();
+
+        // 下载源：清单挂的那条在，内置两条也还在。
+        let sources = host.dispatch("sources_list", json!({})).unwrap();
+        let ids: Vec<String> = sources
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|s| s["id"].as_str().unwrap().to_string())
+            .collect();
+        assert!(ids.contains(&"campus-mirror".to_string()), "{ids:?}");
+        assert!(ids.contains(&"mojang".to_string()), "{ids:?}");
+        assert!(ids.contains(&"bmclapi".to_string()), "{ids:?}");
+
+        // 面板：只读文本，插槽名是追加型的 overview.notices。
+        let slots = host.dispatch("plugins_slots", json!({})).unwrap();
+        let first = &slots.as_array().unwrap()[0];
+        assert_eq!(first["slot"], json!("overview.notices"));
+        assert_eq!(first["text"], json!("校园网内优先走本地镜像。"));
+
+        // 安装状态可见。
+        let manifests = host.dispatch("plugins_manifests", json!({})).unwrap();
+        assert_eq!(manifests.as_array().unwrap()[0]["state"], json!("ready"));
+    }
+
+    #[test]
+    fn manifest_default_does_not_override_an_existing_setting() {
+        let (_dir, data, _mc) = env();
+        std::fs::create_dir_all(&data).unwrap();
+        // 用户已经显式把 checkBeforeLaunch 设成 false。
+        std::fs::write(
+            data.join("settings.json"),
+            serde_json::to_string(&json!({ "checkBeforeLaunch": false })).unwrap(),
+        )
+        .unwrap();
+        let plugin_dir = data.join("plugins/example-settings");
+        std::fs::create_dir_all(&plugin_dir).unwrap();
+        std::fs::write(
+            plugin_dir.join("manifest.json"),
+            serde_json::to_string(&json!({
+                "id": "example-settings",
+                "name": "默认启动行为",
+                "version": "1.0.0",
+                "api": "1",
+                "steps": [
+                    { "op": "set-default-setting", "key": "checkBeforeLaunch", "value": true }
+                ]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let host = Host::boot(&data, false).unwrap();
+        let global = host.dispatch("settings_global", json!({})).unwrap();
+        assert_eq!(
+            global["checkBeforeLaunch"],
+            json!(false),
+            "用户显式设置的值不能被清单默认值覆盖"
+        );
     }
 
     #[test]

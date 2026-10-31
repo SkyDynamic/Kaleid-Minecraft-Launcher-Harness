@@ -1,6 +1,6 @@
 //! 共享下载线程池与下载任务。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -645,79 +645,620 @@ impl DownloadManager {
         if job.cancelled() {
             return Err(ApiError::invalid("任务已取消"));
         }
-        let count = items.len();
-        if count == 0 {
+        if items.is_empty() {
             return Ok(());
         }
-        let (tx, rx) = bounded::<Result<(), String>>(count);
-        job.reset_speed_window();
-        let monitor_stop = Arc::new(AtomicBool::new(false));
-        let monitor = {
-            let stop = monitor_stop.clone();
-            let watched = job.clone();
-            thread::Builder::new()
-                .name("kaleid-download-monitor".into())
-                .spawn(move || {
-                    while !stop.load(Ordering::SeqCst) {
-                        thread::sleep(Duration::from_millis(500));
-                        if stop.load(Ordering::SeqCst) {
-                            break;
-                        }
-                        watched.tick();
-                    }
-                })
-                .ok()
-        };
+        let session = self.begin_session(job);
         for item in items {
-            if job.cancelled() {
+            session.push(item)?;
+        }
+        session.close_and_wait()
+    }
+
+    /// 可追加的下载会话。安装流程先推客户端和库，资源索引解析完再追加，不必等全部清单。
+    pub fn begin_session(&self, job: Arc<Job>) -> DownloadSession {
+        let (cmd_tx, cmd_rx) = unbounded::<SessionCmd>();
+        let (result_tx, result_rx) = bounded::<Result<(), String>>(1);
+        let executor = self.executor.clone();
+        let agent = self.agent.clone();
+        let connections = self.connections.clone();
+        thread::Builder::new()
+            .name("kaleid-download-sched".into())
+            .spawn(move || {
+                let result = drive_session(job, executor, agent, connections, cmd_rx);
+                let _ = result_tx.send(result);
+            })
+            .expect("无法创建下载调度线程");
+        DownloadSession { cmd_tx, result_rx }
+    }
+}
+
+/// 安装线程把文件推进去，调度线程负责把空闲连接分出去。
+pub struct DownloadSession {
+    cmd_tx: Sender<SessionCmd>,
+    result_rx: Receiver<Result<(), String>>,
+}
+
+impl DownloadSession {
+    pub fn push(&self, item: DownloadItem) -> ApiResult<()> {
+        self.cmd_tx
+            .send(SessionCmd::Push(item))
+            .map_err(|_| ApiError::io("下载调度已结束"))
+    }
+
+    pub fn close_and_wait(self) -> ApiResult<()> {
+        let _ = self.cmd_tx.send(SessionCmd::Close);
+        match self.result_rx.recv() {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(message)) => {
+                if message == "任务已取消" {
+                    Err(ApiError::invalid(message))
+                } else {
+                    Err(ApiError::Network(message))
+                }
+            }
+            Err(_) => Err(ApiError::io("下载调度线程意外退出")),
+        }
+    }
+}
+
+enum SessionCmd {
+    Push(DownloadItem),
+    Close,
+}
+
+enum WorkReport {
+    SingleOk(u64),
+    SingleErr(u64, String),
+    DiscoveredSize(u64, u64),
+    RangeOk(u64, u64, u64),
+    RangeUnsupported(u64),
+    RangeErr(u64, (u64, u64), String),
+}
+
+struct LiveFile {
+    id: u64,
+    item: DownloadItem,
+    urls: Vec<String>,
+    url_index: usize,
+    unassigned: VecDeque<(u64, u64)>,
+    inflight: usize,
+    size: u64,
+    multi: bool,
+    probed: bool,
+    unsupported: bool,
+    segments: Vec<(u64, u64)>,
+    finished: bool,
+    failed: Option<String>,
+    single_started: bool,
+}
+
+fn drive_session(
+    job: Arc<Job>,
+    executor: Arc<Executor>,
+    agent: Arc<ureq::Agent>,
+    connections: Arc<AtomicUsize>,
+    cmd_rx: Receiver<SessionCmd>,
+) -> Result<(), String> {
+    job.reset_speed_window();
+    let monitor_stop = Arc::new(AtomicBool::new(false));
+    let monitor = {
+        let stop = monitor_stop.clone();
+        let watched = job.clone();
+        thread::Builder::new()
+            .name("kaleid-download-monitor".into())
+            .spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    thread::sleep(Duration::from_millis(500));
+                    if stop.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    watched.tick();
+                }
+            })
+            .ok()
+    };
+    let (done_tx, done_rx) = unbounded::<WorkReport>();
+    let mut files: Vec<LiveFile> = Vec::new();
+    let mut next_id = 1u64;
+    let mut closed = false;
+    let mut first_error: Option<String> = None;
+    let result = (|| -> Result<(), String> {
+        loop {
+            while let Ok(cmd) = cmd_rx.try_recv() {
+                match cmd {
+                    SessionCmd::Push(item) => {
+                        files.push(accept_file(&job, item, next_id, executor.concurrency()));
+                        next_id += 1;
+                    }
+                    SessionCmd::Close => closed = true,
+                }
+            }
+            assign_work(
+                &job,
+                &executor,
+                &agent,
+                &connections,
+                &done_tx,
+                &mut files,
+            );
+            if job.cancelled() && files.iter().all(|f| f.inflight == 0) {
+                return Err("任务已取消".into());
+            }
+            if closed
+                && files.iter().all(|f| f.finished || f.failed.is_some())
+                && files.iter().all(|f| f.inflight == 0)
+            {
                 break;
             }
-            let job = job.clone();
-            let tx = tx.clone();
-            let agent = self.agent.clone();
-            let connections = self.connections.clone();
-            let executor = self.executor.clone();
-            self.executor.submit(Box::new(move || {
-                // 并发数在真正开跑时再读：用户在下载途中调大也会立刻生效。
-                let result = download_one(
-                    &agent,
-                    &job,
-                    &item,
-                    &connections,
-                    executor.concurrency(),
-                );
-                let _ = tx.send(result);
-            }));
-        }
-        drop(tx);
-        let mut first_error: Option<String> = None;
-        for _ in 0..count {
-            match rx.recv() {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    if first_error.is_none() {
-                        first_error = Some(e);
-                        job.fail(first_error.clone().unwrap());
+            let cmd_wait = cmd_rx.clone();
+            let done_wait = done_rx.clone();
+            crossbeam_channel::select! {
+                recv(done_wait) -> report => {
+                    if let Ok(report) = report {
+                        connections.fetch_sub(1, Ordering::SeqCst);
+                        on_report(&job, &mut files, report, &mut first_error);
                     }
                 }
-                Err(_) => break,
+                recv(cmd_wait) -> cmd => {
+                    if let Ok(cmd) = cmd {
+                        match cmd {
+                            SessionCmd::Push(item) => {
+                                files.push(accept_file(&job, item, next_id, executor.concurrency()));
+                                next_id += 1;
+                            }
+                            SessionCmd::Close => closed = true,
+                        }
+                    } else {
+                        closed = true;
+                    }
+                }
+                default(Duration::from_millis(40)) => {}
             }
         }
-        monitor_stop.store(true, Ordering::SeqCst);
-        if let Some(handle) = monitor {
-            let _ = handle.join();
-        }
         if job.cancelled() {
-            return Err(ApiError::invalid("任务已取消"));
+            return Err("任务已取消".into());
         }
-        if let Some(e) = first_error {
-            return Err(ApiError::Network(e));
+        if first_error.is_none() {
+            if let Some(message) = files.iter().find_map(|file| file.failed.clone()) {
+                first_error = Some(message.clone());
+                job.fail(message);
+            }
         }
-        // 这一批跑完后，"一个文件都没轮到"的阶段不该继续挂着「等待」——
-        // 安装已经到 99.8% 了，界面上还写着「加载器 等待」，看着像卡住。
+        if let Some(error) = first_error {
+            return Err(error);
+        }
         job.skip_untouched_phases();
         Ok(())
+    })();
+    monitor_stop.store(true, Ordering::SeqCst);
+    if let Some(handle) = monitor {
+        let _ = handle.join();
     }
+    result
+}
+
+fn accept_file(job: &Arc<Job>, item: DownloadItem, id: u64, desired: usize) -> LiveFile {
+    if let Some(parent) = item.dest.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let mut finished = false;
+    if item.dest.is_file() {
+        let size_ok = item.size == 0
+            || std::fs::metadata(&item.dest)
+                .map(|m| m.len() == item.size)
+                .unwrap_or(false);
+        if size_ok {
+            job.add_bytes(&item.phase, item.size);
+            job.item_done(&item.phase);
+            finished = true;
+        }
+    }
+    let urls = ordered_urls(
+        item.official_url.as_deref(),
+        item.mirror_url.as_deref(),
+        item.fallback_url.as_deref(),
+        &job.source(),
+        job.policy(),
+    );
+    let size = item.size;
+    let multi = !finished && size >= SEGMENT_THRESHOLD_BYTES && desired >= 2;
+    let mut unassigned = VecDeque::new();
+    if multi && size > 0 {
+        unassigned.push_back((0, size - 1));
+    }
+    LiveFile {
+        id,
+        item,
+        urls,
+        url_index: 0,
+        unassigned,
+        inflight: 0,
+        size,
+        multi,
+        probed: !multi,
+        unsupported: false,
+        segments: Vec::new(),
+        finished,
+        failed: None,
+        single_started: false,
+    }
+}
+
+fn assign_work(
+    job: &Arc<Job>,
+    executor: &Arc<Executor>,
+    agent: &Arc<ureq::Agent>,
+    connections: &Arc<AtomicUsize>,
+    done_tx: &Sender<WorkReport>,
+    files: &mut [LiveFile],
+) {
+    if job.cancelled() {
+        return;
+    }
+    let desired = executor.concurrency().max(1);
+    let consumers: Vec<ShareConsumer> = files
+        .iter()
+        .map(|file| ShareConsumer {
+            remaining_bytes: if file.finished || file.failed.is_some() {
+                0
+            } else if file.multi && !file.unsupported {
+                file.unassigned.iter().map(|(s, e)| e - s + 1).sum()
+            } else if !file.single_started && !file.finished {
+                file.size.max(1)
+            } else {
+                0
+            },
+            inflight: file.inflight,
+            multi: file.multi && !file.unsupported && file.probed,
+        })
+        .collect();
+    // 还没探测 Range 的大文件先只占 1 条，避免服务器不支持分段时把整文件下八遍。
+    let mut targets = fair_targets(&consumers, desired);
+    for (index, file) in files.iter().enumerate() {
+        if file.multi && !file.probed && !file.unsupported {
+            targets[index] = targets[index].min(file.inflight + 1);
+        }
+    }
+    let mut deficits: Vec<(usize, usize)> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| file.failed.is_none() && !file.finished)
+        .map(|(index, file)| (index, targets[index].saturating_sub(file.inflight)))
+        .filter(|(_, deficit)| *deficit > 0)
+        .collect();
+    deficits.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+    let want: usize = deficits.iter().map(|(_, deficit)| *deficit).sum();
+    let mut slots = reserve_slots(connections, desired, want);
+    for (index, deficit) in deficits {
+        if slots == 0 {
+            break;
+        }
+        let take = deficit.min(slots);
+        let started = start_file_work(job, executor, agent, done_tx, &mut files[index], take, desired);
+        if started < take {
+            connections.fetch_sub(take - started, Ordering::SeqCst);
+        }
+        slots -= take;
+    }
+}
+
+fn start_file_work(
+    job: &Arc<Job>,
+    executor: &Arc<Executor>,
+    agent: &Arc<ureq::Agent>,
+    done_tx: &Sender<WorkReport>,
+    file: &mut LiveFile,
+    take: usize,
+    budget: usize,
+) -> usize {
+    if file.urls.is_empty() {
+        file.failed = Some(format!("{}：没有可用的下载地址", file.item.label));
+        file.finished = true;
+        return 0;
+    }
+    let url = file.urls[file.url_index.min(file.urls.len() - 1)].clone();
+    if file.url_index > 0 {
+        job.switch_to_mirror("官方源下载失败，已尝试镜像");
+    }
+    if file.multi && !file.unsupported {
+        let ranges = claim_ranges(&mut file.unassigned, take, budget.max(2));
+        let mut started = 0usize;
+        for range in ranges {
+            let agent = agent.clone();
+            let job = job.clone();
+            let item = file.item.clone();
+            let done_tx = done_tx.clone();
+            let url = url.clone();
+            let id = file.id;
+            let task_job = job.clone();
+            executor.submit(Box::new(move || {
+                let report = run_range(&agent, &task_job, &item, &url, range, id);
+                let _ = done_tx.send(report);
+            }));
+            file.inflight += 1;
+            started += 1;
+            job.set_current(format!(
+                "{}：分段下载（{} 个连接）",
+                file.item.label,
+                file.inflight.max(started)
+            ));
+        }
+        return started;
+    }
+    if file.single_started || file.inflight > 0 {
+        return 0;
+    }
+    let agent = agent.clone();
+    let job = job.clone();
+    let item = file.item.clone();
+    let done_tx = done_tx.clone();
+    let id = file.id;
+    let discover = item.size == 0;
+    let task_job = job.clone();
+    executor.submit(Box::new(move || {
+        let report = if discover {
+            match discover_size(&agent, &task_job, &url) {
+                Ok(Some(size)) if size >= SEGMENT_THRESHOLD_BYTES => {
+                    WorkReport::DiscoveredSize(id, size)
+                }
+                Ok(_) => run_single(&agent, &task_job, &item, &url, id),
+                Err(error) => WorkReport::SingleErr(id, error),
+            }
+        } else {
+            run_single(&agent, &task_job, &item, &url, id)
+        };
+        let _ = done_tx.send(report);
+    }));
+    file.inflight = 1;
+    file.single_started = true;
+    job.begin_item(&file.item.phase, &file.item.label);
+    1
+}
+
+fn discover_size(
+    agent: &ureq::Agent,
+    job: &Arc<Job>,
+    url: &str,
+) -> Result<Option<u64>, String> {
+    if job.cancelled() {
+        return Err("任务已取消".into());
+    }
+    match agent.get(url).call() {
+        Ok(response) => {
+            let len = response
+                .header("Content-Length")
+                .and_then(|value| value.parse().ok());
+            drop(response);
+            Ok(len)
+        }
+        Err(error) => Err(explain_net_error(&format!("{url}: {error}"))),
+    }
+}
+
+fn run_single(
+    agent: &Arc<ureq::Agent>,
+    job: &Arc<Job>,
+    item: &DownloadItem,
+    url: &str,
+    id: u64,
+) -> WorkReport {
+    match fetch_one(agent, job, item, url) {
+        Ok(()) => WorkReport::SingleOk(id),
+        Err(error) => WorkReport::SingleErr(id, error),
+    }
+}
+
+fn run_range(
+    agent: &Arc<ureq::Agent>,
+    job: &Arc<Job>,
+    item: &DownloadItem,
+    url: &str,
+    range: (u64, u64),
+    id: u64,
+) -> WorkReport {
+    job.begin_item(&item.phase, &item.label);
+    let path = span_path(&item.dest, range.0, range.1);
+    let counted = Arc::new(AtomicU64::new(0));
+    let stop = Arc::new(AtomicBool::new(false));
+    match fetch_segment(agent, job, item, url, range, &path, &counted, &stop) {
+        Ok(()) => WorkReport::RangeOk(id, range.0, range.1),
+        Err(SegmentFail::Unsupported) => {
+            let _ = std::fs::remove_file(&path);
+            WorkReport::RangeUnsupported(id)
+        }
+        Err(SegmentFail::Attempt(error)) => {
+            let _ = std::fs::remove_file(&path);
+            WorkReport::RangeErr(id, range, explain_net_error(&error.raw))
+        }
+    }
+}
+
+fn on_report(
+    job: &Arc<Job>,
+    files: &mut [LiveFile],
+    report: WorkReport,
+    first_error: &mut Option<String>,
+) {
+    let id = match &report {
+        WorkReport::SingleOk(id)
+        | WorkReport::SingleErr(id, _)
+        | WorkReport::DiscoveredSize(id, _)
+        | WorkReport::RangeOk(id, _, _)
+        | WorkReport::RangeUnsupported(id)
+        | WorkReport::RangeErr(id, _, _) => *id,
+    };
+    let Some(file) = files.iter_mut().find(|file| file.id == id) else {
+        return;
+    };
+    file.inflight = file.inflight.saturating_sub(1);
+    match report {
+        WorkReport::SingleOk(_) => {
+            file.finished = true;
+            job.item_done(&file.item.phase);
+        }
+        WorkReport::DiscoveredSize(_, size) => {
+            file.size = size;
+            file.item.size = size;
+            file.single_started = false;
+            file.multi = true;
+            file.probed = false;
+            file.unassigned.clear();
+            file.unassigned.push_back((0, size - 1));
+        }
+        WorkReport::RangeOk(_, start, end) => {
+            file.probed = true;
+            file.segments.push((start, end));
+            let covered = file.unassigned.is_empty() && file.inflight == 0;
+            let span = if file.size == 0 {
+                0
+            } else {
+                file.segments
+                    .iter()
+                    .map(|(s, e)| e - s + 1)
+                    .sum::<u64>()
+            };
+            if covered && span == file.size {
+                match join_spans(&file.item, &file.segments) {
+                    Ok(()) => {
+                        file.finished = true;
+                        job.item_done(&file.item.phase);
+                    }
+                    Err(error) => fail_file(job, file, first_error, error),
+                }
+            }
+        }
+        WorkReport::RangeUnsupported(_) => {
+            file.probed = true;
+            file.unsupported = true;
+            file.multi = false;
+            file.unassigned.clear();
+            if file.inflight == 0 {
+                discard_segments(job, file);
+                file.single_started = false;
+            }
+        }
+        WorkReport::RangeErr(_, range, error) => {
+            file.unassigned.push_front(range);
+            note_transfer_failure(job, file, first_error, error);
+        }
+        WorkReport::SingleErr(_, error) => {
+            file.single_started = false;
+            note_transfer_failure(job, file, first_error, error);
+        }
+    }
+    if file.unsupported && file.inflight == 0 && !file.finished && file.failed.is_none() {
+        discard_segments(job, file);
+        file.single_started = false;
+    }
+    if file.failed.is_some() && file.inflight == 0 {
+        file.finished = true;
+        file.unassigned.clear();
+    }
+}
+
+fn note_transfer_failure(
+    job: &Arc<Job>,
+    file: &mut LiveFile,
+    first_error: &mut Option<String>,
+    error: String,
+) {
+    if error == "任务已取消" || job.cancelled() {
+        file.failed = Some(error);
+        return;
+    }
+    if file.url_index + 1 < file.urls.len() {
+        file.url_index += 1;
+        file.single_started = false;
+        return;
+    }
+    if file.inflight == 0 {
+        fail_file(job, file, first_error, error);
+    } else if file.failed.is_none() {
+        file.failed = Some(error);
+    }
+}
+
+fn fail_file(
+    job: &Arc<Job>,
+    file: &mut LiveFile,
+    first_error: &mut Option<String>,
+    error: String,
+) {
+    let message = format!("{}：{error}", file.item.label);
+    file.failed = Some(message.clone());
+    file.finished = true;
+    file.unassigned.clear();
+    if first_error.is_none() {
+        *first_error = Some(message.clone());
+        job.fail(message);
+    }
+}
+
+fn discard_segments(job: &Arc<Job>, file: &mut LiveFile) {
+    let mut bytes = 0u64;
+    for (start, end) in file.segments.drain(..) {
+        bytes = bytes.saturating_add(end - start + 1);
+        let _ = std::fs::remove_file(span_path(&file.item.dest, start, end));
+    }
+    if bytes > 0 {
+        job.sub_bytes(&file.item.phase, bytes);
+    }
+}
+
+fn span_path(dest: &Path, start: u64, end: u64) -> PathBuf {
+    let mut name = dest.as_os_str().to_os_string();
+    name.push(format!(".part.{start}-{end}"));
+    PathBuf::from(name)
+}
+
+fn join_spans(item: &DownloadItem, spans: &[(u64, u64)]) -> Result<(), String> {
+    let mut ordered = spans.to_vec();
+    ordered.sort_by_key(|(start, _)| *start);
+    let part = part_path(&item.dest);
+    let result = (|| -> Result<(), String> {
+        let mut out = std::fs::File::create(&part).map_err(|e| format!("{}: {e}", part.display()))?;
+        let mut hasher = Sha1::new();
+        let mut total = 0u64;
+        let mut buf = vec![0u8; 64 * 1024];
+        for (start, end) in &ordered {
+            let path = span_path(&item.dest, *start, *end);
+            let mut input = std::fs::File::open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
+            loop {
+                let n = input.read(&mut buf).map_err(|e| format!("{}: {e}", path.display()))?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
+                out.write_all(&buf[..n]).map_err(|e| format!("{}: {e}", part.display()))?;
+                total += n as u64;
+            }
+        }
+        out.flush().map_err(|e| format!("{}: {e}", part.display()))?;
+        drop(out);
+        if item.size > 0 && total != item.size {
+            return Err(format!("大小不符（期望 {}，实际 {} 字节）", item.size, total));
+        }
+        if let Some(expected) = &item.sha1 {
+            let actual = hex::encode(hasher.finalize());
+            if !actual.eq_ignore_ascii_case(expected) {
+                return Err(format!("SHA-1 校验失败（期望 {expected}，实际 {actual}）"));
+            }
+        }
+        if item.dest.exists() {
+            let _ = std::fs::remove_file(&item.dest);
+        }
+        std::fs::rename(&part, &item.dest).map_err(|e| format!("{}: {e}", item.dest.display()))?;
+        Ok(())
+    })();
+    for (start, end) in &ordered {
+        let _ = std::fs::remove_file(span_path(&item.dest, *start, *end));
+    }
+    if result.is_err() {
+        let _ = std::fs::remove_file(&part);
+        let _ = std::fs::remove_file(&item.dest);
+    }
+    result
 }
 
 /// 一条任务里该按什么顺序试 URL。
@@ -789,12 +1330,8 @@ fn ordered_urls(
 
 /// 超过这个大小才切段：版本 JSON / 资源索引这类小文件切段只多几次握手。
 const SEGMENT_THRESHOLD_BYTES: u64 = 1024 * 1024;
-/// 单文件最多几段。再往上收益递减：瓶颈通常是服务器侧限速。
-///
-/// 取 8 而不是 4：只剩一个文件时（典型就是装 Fabric 的最后一步「Fabric API」），
-/// 并发设多大都只有 4 条连接在跑，剩下几十条线程干看着——用户看到的正是"1/64 线程"。
-/// 上限提高到 8 后，单文件能把空闲线程用掉一部分，同时不至于对镜像站开太多连接。
-const SEGMENT_MAX: usize = 8;
+/// 单段最小长度。最后一段可以更短；不够切满并发时用得上的连接全部用上，不再另设 8 段上限。
+const MIN_SEGMENT_BYTES: u64 = 64 * 1024;
 /// 连不上（10060 / DNS / 握手超时）时同一地址只再试 1 次就换源——
 /// 真正耗时的是"等一个连不上的地址"，重试次数多只会让用户干等。
 const RETRY_CONNECT_ATTEMPTS: usize = 1;
@@ -925,13 +1462,180 @@ fn sleep_backoff(class: RetryClass, attempt: usize) {
     thread::sleep(Duration::from_millis(ms));
 }
 
-/// 切段计划：首尾相接、互不重叠、总和等于 `size`；`slots` 是这一项能拿到的连接条数，
-/// 小文件（不值得为省几次往返就拆开）和只有 1 条连接时返回空，表示走单流。
+/// 参与公平分配的一个在途文件。`remaining_bytes` 只算还没派出去的字节。
+#[derive(Clone, Debug)]
+struct ShareConsumer {
+    remaining_bytes: u64,
+    inflight: usize,
+    /// 大文件且服务器还没被判定为不支持 Range。小文件永远 false。
+    multi: bool,
+}
+
+fn new_segments_possible(bytes: u64) -> usize {
+    if bytes == 0 {
+        0
+    } else {
+        bytes.div_ceil(MIN_SEGMENT_BYTES).max(1) as usize
+    }
+}
+
+fn useful_connections(consumer: &ShareConsumer) -> usize {
+    if consumer.remaining_bytes == 0 && consumer.inflight == 0 {
+        return 0;
+    }
+    if !consumer.multi {
+        return 1;
+    }
+    consumer.inflight + new_segments_possible(consumer.remaining_bytes)
+}
+
+/// 把 `budget` 条连接分给在途文件。
+///
+/// 先每人至多 1 条（大文件优先，避免被一长串小文件挡住），多出来的只给大文件，
+/// 余数给剩余字节更多的那个。小文件封顶 1 条。分完后若有人吃不满，空位再转给还能加段的大文件。
+fn fair_targets(consumers: &[ShareConsumer], budget: usize) -> Vec<usize> {
+    let mut targets = vec![0usize; consumers.len()];
+    if budget == 0 || consumers.is_empty() {
+        return targets;
+    }
+    let mut active: Vec<usize> = consumers
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.remaining_bytes > 0 || c.inflight > 0)
+        .map(|(i, _)| i)
+        .collect();
+    if active.is_empty() {
+        return targets;
+    }
+    active.sort_by(|&a, &b| {
+        consumers[b]
+            .multi
+            .cmp(&consumers[a].multi)
+            .then(consumers[b].remaining_bytes.cmp(&consumers[a].remaining_bytes))
+            .then(a.cmp(&b))
+    });
+    let mut slots = budget;
+    for &index in &active {
+        if slots == 0 {
+            break;
+        }
+        targets[index] = 1;
+        slots -= 1;
+    }
+    let mut large: Vec<usize> = active
+        .into_iter()
+        .filter(|&index| consumers[index].multi && targets[index] >= 1)
+        .collect();
+    if !large.is_empty() && slots > 0 {
+        let share = slots / large.len();
+        let rem = slots % large.len();
+        large.sort_by(|&a, &b| {
+            consumers[b]
+                .remaining_bytes
+                .cmp(&consumers[a].remaining_bytes)
+                .then(a.cmp(&b))
+        });
+        for (rank, index) in large.into_iter().enumerate() {
+            targets[index] += share + usize::from(rank < rem);
+        }
+    }
+    for (index, consumer) in consumers.iter().enumerate() {
+        targets[index] = targets[index].min(useful_connections(consumer));
+        if !consumer.multi {
+            targets[index] = targets[index].min(1);
+        }
+    }
+    // 有人被 64 KiB 下限卡住时，把吃不满的额度转给还能加段的大文件。
+    loop {
+        let used: usize = targets.iter().sum();
+        if used >= budget {
+            break;
+        }
+        let mut best: Option<usize> = None;
+        for (index, consumer) in consumers.iter().enumerate() {
+            if !consumer.multi || targets[index] >= useful_connections(consumer) {
+                continue;
+            }
+            best = Some(match best {
+                None => index,
+                Some(prev) => {
+                    if consumer.remaining_bytes > consumers[prev].remaining_bytes
+                        || (consumer.remaining_bytes == consumers[prev].remaining_bytes
+                            && index < prev)
+                    {
+                        index
+                    } else {
+                        prev
+                    }
+                }
+            });
+        }
+        let Some(index) = best else {
+            break;
+        };
+        targets[index] += 1;
+    }
+    targets
+}
+
+/// 从尚未分配的区间前端切出 `need` 段。段长约为「剩余字节 / 总预算」，但不小于 64 KiB，
+/// 这样当前份额不会把整个文件一次切完，同伴结束后还能把尾巴加派出去。
+fn claim_ranges(
+    unassigned: &mut VecDeque<(u64, u64)>,
+    need: usize,
+    budget: usize,
+) -> Vec<(u64, u64)> {
+    let mut out = Vec::new();
+    if need == 0 || budget == 0 {
+        return out;
+    }
+    while out.len() < need {
+        let Some((start, end)) = unassigned.pop_front() else {
+            break;
+        };
+        if end < start {
+            continue;
+        }
+        let len = end - start + 1;
+        let tail: u64 = unassigned.iter().map(|(s, e)| e - s + 1).sum();
+        let remaining = len + tail;
+        let chunk = (remaining / budget.max(1) as u64).max(MIN_SEGMENT_BYTES);
+        if len <= chunk {
+            out.push((start, end));
+            continue;
+        }
+        let piece_end = start + chunk - 1;
+        out.push((start, piece_end));
+        unassigned.push_front((piece_end + 1, end));
+    }
+    out
+}
+
+fn reserve_slots(counter: &AtomicUsize, desired: usize, want: usize) -> usize {
+    if want == 0 || desired == 0 {
+        return 0;
+    }
+    let mut cur = counter.load(Ordering::SeqCst);
+    loop {
+        let spare = desired.saturating_sub(cur);
+        let got = spare.min(want);
+        if got == 0 {
+            return 0;
+        }
+        match counter.compare_exchange(cur, cur + got, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return got,
+            Err(now) => cur = now,
+        }
+    }
+}
+
+/// 切段计划：首尾相接、互不重叠、总和等于 `size`。只留给测试核对旧的覆盖不变量。
+#[cfg_attr(not(test), allow(dead_code))]
 fn plan_segments(size: u64, slots: usize) -> Vec<(u64, u64)> {
     if size < SEGMENT_THRESHOLD_BYTES || slots < 2 {
         return Vec::new();
     }
-    let count = slots.clamp(1, SEGMENT_MAX);
+    let count = slots.max(1);
     let chunk = size.div_ceil(count as u64);
     let mut out = Vec::new();
     let mut start = 0u64;
@@ -943,51 +1647,11 @@ fn plan_segments(size: u64, slots: usize) -> Vec<(u64, u64)> {
     out
 }
 
-/// 连接额度租约：先把自己要用的连接条数记到全局计数上，用完自动还回去。
-///
-/// 必须"先占后开"：一批文件几乎同时起跑，如果各自去读一眼"池子里还剩多少"再开连接，
-/// 64 个分区文件会各自以为空闲很多，一瞬间开出几百条连接。抢额度用 CAS，谁抢到算谁的。
-struct ConnLease {
-    counter: Arc<AtomicUsize>,
-    slots: usize,
-}
-
-impl ConnLease {
-    /// 最多抢 `want` 条额度（至少 1 条：worker 自己那一条）。池子已经满了就只给 1 条，
-    /// 这与旧行为一致——并发设成 1 时仍然是纯单流。
-    fn claim(counter: &Arc<AtomicUsize>, desired: usize, want: usize) -> ConnLease {
-        let mut cur = counter.load(Ordering::SeqCst);
-        loop {
-            let spare = desired.saturating_sub(cur);
-            let slots = spare.min(want).max(1);
-            match counter.compare_exchange(cur, cur + slots, Ordering::SeqCst, Ordering::SeqCst) {
-                Ok(_) => {
-                    return ConnLease {
-                        counter: counter.clone(),
-                        slots,
-                    }
-                }
-                Err(now) => cur = now,
-            }
-        }
-    }
-}
-
-impl Drop for ConnLease {
-    fn drop(&mut self) {
-        self.counter.fetch_sub(self.slots, Ordering::SeqCst);
-    }
-}
+// ---- 区间/单流底层：调度器每个 worker 只调一次 ----
 
 fn part_path(dest: &Path) -> PathBuf {
     let mut s = dest.as_os_str().to_os_string();
     s.push(".part");
-    PathBuf::from(s)
-}
-
-fn segment_path(dest: &Path, index: usize) -> PathBuf {
-    let mut s = dest.as_os_str().to_os_string();
-    s.push(format!(".part.{index}"));
     PathBuf::from(s)
 }
 
@@ -1021,88 +1685,6 @@ fn content_range_matches(header: Option<&str>, total_size: u64, range: (u64, u64
     start == range.0 && end == range.1
 }
 
-fn download_one(
-    agent: &Arc<ureq::Agent>,
-    job: &Arc<Job>,
-    item: &DownloadItem,
-    connections: &Arc<AtomicUsize>,
-    desired: usize,
-) -> Result<(), String> {
-    if job.cancelled() {
-        return Err("任务已取消".into());
-    }
-    if let Some(parent) = item.dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("{}: {e}", parent.display()))?;
-    }
-    if item.dest.is_file() {
-        let size_ok = item.size == 0
-            || std::fs::metadata(&item.dest)
-                .map(|m| m.len() == item.size)
-                .unwrap_or(false);
-        if size_ok {
-            job.add_bytes(&item.phase, item.size);
-            job.item_done(&item.phase);
-            return Ok(());
-        }
-    }
-    let source = job.source();
-    let policy = job.policy();
-    let urls = ordered_urls(
-        item.official_url.as_deref(),
-        item.mirror_url.as_deref(),
-        item.fallback_url.as_deref(),
-        &source,
-        &policy,
-    );
-    if urls.is_empty() {
-        return Err(format!("{}：没有可用的下载地址", item.label));
-    }
-    // 只有大文件值得抢多条连接；小文件抢了也只是几次多余握手。
-    let want = if item.size >= SEGMENT_THRESHOLD_BYTES {
-        SEGMENT_MAX
-    } else {
-        1
-    };
-    // 租约只用来占住额度：句柄一 drop 就把连接数还回去，不需要读它。
-    let mut _lease = ConnLease::claim(connections, desired, want);
-    let mut ranges = plan_segments(item.size, _lease.slots);
-    let mut last_err = String::new();
-    for (idx, url) in urls.iter().enumerate() {
-        if job.cancelled() {
-            return Err("任务已取消".into());
-        }
-        if idx > 0 {
-            // 只有「官方优先」的任务会被切标签，其余策略里这是空操作。
-            job.switch_to_mirror("官方源下载失败，已尝试镜像");
-        }
-        if ranges.len() >= 2 {
-            match segmented_download(agent, job, item, url, &ranges) {
-                SegmentOutcome::Ok => {
-                    job.item_done(&item.phase);
-                    return Ok(());
-                }
-                SegmentOutcome::Unsupported => {
-                    // 服务器不认 Range：把多占的额度还回去，剩下的地址都按单流走。
-                    _lease = ConnLease::claim(connections, desired, 1);
-                    ranges.clear();
-                    job.set_current(format!("{}：服务器不支持分段，改用单线程", item.label));
-                }
-                SegmentOutcome::Failed(e) => {
-                    last_err = e;
-                    continue;
-                }
-            }
-        }
-        match fetch_one(agent, job, item, url) {
-            Ok(()) => {
-                job.item_done(&item.phase);
-                return Ok(());
-            }
-            Err(e) => last_err = e,
-        }
-    }
-    Err(format!("{}：{last_err}", item.label))
-}
 
 /// 单流下载一个地址，按 [`RetryClass`] 的预算重试。
 fn fetch_one(
@@ -1234,12 +1816,6 @@ fn finish_file(
     })
 }
 
-enum SegmentOutcome {
-    Ok,
-    /// 服务器忽略 `Range`（回 200）或 `Content-Range` 对不上：退回单流，不算失败。
-    Unsupported,
-    Failed(String),
-}
 
 enum SegmentFail {
     Unsupported,
@@ -1359,167 +1935,6 @@ fn fetch_segment(
             }
         }
     }
-}
-
-/// 大文件分段并发下载。
-///
-/// 段线程就地 `spawn`，**不嵌套提交进共享线程池**：8 个 item 同时分段时，
-/// 池子里 8 个 worker 全在等自己的子任务就会互相饿死。
-fn segmented_download(
-    agent: &Arc<ureq::Agent>,
-    job: &Arc<Job>,
-    item: &DownloadItem,
-    url: &str,
-    ranges: &[(u64, u64)],
-) -> SegmentOutcome {
-    job.begin_item(&item.phase, &item.label);
-    job.set_current(format!(
-        "{}：分段下载（{} 个连接）",
-        item.label,
-        ranges.len()
-    ));
-    let stop = Arc::new(AtomicBool::new(false));
-    let unsupported = Arc::new(AtomicBool::new(false));
-    let counted = Arc::new(AtomicU64::new(0));
-    let first_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-    let mut handles = Vec::with_capacity(ranges.len());
-    for (index, range) in ranges.iter().copied().enumerate() {
-        let agent = agent.clone();
-        let job = job.clone();
-        let item = item.clone();
-        let url = url.to_string();
-        let path = segment_path(&item.dest, index);
-        // 进闭包用一份克隆，循环体自己还要留着 `stop` / `first_error` 处理 spawn 失败。
-        let seg_stop = stop.clone();
-        let seg_unsupported = unsupported.clone();
-        let seg_counted = counted.clone();
-        let seg_error = first_error.clone();
-        let spawned = thread::Builder::new()
-            .name("kaleid-download-seg".into())
-            .stack_size(256 * 1024)
-            .spawn(move || {
-                match fetch_segment(
-                    &agent,
-                    &job,
-                    &item,
-                    &url,
-                    range,
-                    &path,
-                    &seg_counted,
-                    &seg_stop,
-                ) {
-                    Ok(()) => {}
-                    Err(SegmentFail::Unsupported) => {
-                        seg_unsupported.store(true, Ordering::SeqCst);
-                        seg_stop.store(true, Ordering::SeqCst);
-                    }
-                    Err(SegmentFail::Attempt(err)) => {
-                        seg_stop.store(true, Ordering::SeqCst);
-                        if let Ok(mut slot) = seg_error.lock() {
-                            if slot.is_none() {
-                                *slot = Some(explain_net_error(&err.raw));
-                            }
-                        }
-                    }
-                }
-            });
-        match spawned {
-            Ok(handle) => handles.push(handle),
-            Err(e) => {
-                stop.store(true, Ordering::SeqCst);
-                if let Ok(mut slot) = first_error.lock() {
-                    if slot.is_none() {
-                        *slot = Some(format!("无法创建下载线程：{e}"));
-                    }
-                }
-            }
-        }
-    }
-    for handle in handles {
-        let _ = handle.join();
-    }
-
-    let rollback = |job: &Arc<Job>| {
-        for index in 0..ranges.len() {
-            let _ = std::fs::remove_file(segment_path(&item.dest, index));
-        }
-        let done = counted.swap(0, Ordering::SeqCst);
-        if done > 0 {
-            job.sub_bytes(&item.phase, done);
-        }
-    };
-
-    if unsupported.load(Ordering::SeqCst) {
-        rollback(job);
-        return SegmentOutcome::Unsupported;
-    }
-    if let Some(err) = first_error.lock().unwrap().clone() {
-        rollback(job);
-        return SegmentOutcome::Failed(err);
-    }
-    match join_segments(item, ranges.len()) {
-        Ok(()) => SegmentOutcome::Ok,
-        Err(err) => {
-            rollback(job);
-            let _ = std::fs::remove_file(part_path(&item.dest));
-            SegmentOutcome::Failed(explain_net_error(&err))
-        }
-    }
-}
-
-/// 把各段按序拼回一个文件，校验大小与 SHA-1 后再换成目标文件。
-fn join_segments(item: &DownloadItem, count: usize) -> Result<(), String> {
-    let part = part_path(&item.dest);
-    let result = (|| -> Result<(), String> {
-        let mut out = std::fs::File::create(&part)
-            .map_err(|e| format!("{}: {e}", part.display()))?;
-        let mut hasher = Sha1::new();
-        let mut total = 0u64;
-        let mut buf = vec![0u8; 64 * 1024];
-        for index in 0..count {
-            let seg = segment_path(&item.dest, index);
-            let mut input =
-                std::fs::File::open(&seg).map_err(|e| format!("{}: {e}", seg.display()))?;
-            loop {
-                let n = input
-                    .read(&mut buf)
-                    .map_err(|e| format!("{}: {e}", seg.display()))?;
-                if n == 0 {
-                    break;
-                }
-                hasher.update(&buf[..n]);
-                out.write_all(&buf[..n])
-                    .map_err(|e| format!("{}: {e}", part.display()))?;
-                total += n as u64;
-            }
-        }
-        out.flush().map_err(|e| format!("{}: {e}", part.display()))?;
-        drop(out);
-        if item.size > 0 && total != item.size {
-            return Err(format!(
-                "大小不符（期望 {}，实际 {} 字节）",
-                item.size, total
-            ));
-        }
-        if let Some(expected) = &item.sha1 {
-            let actual = hex::encode(hasher.finalize());
-            if !actual.eq_ignore_ascii_case(expected) {
-                return Err(format!("SHA-1 校验失败（期望 {expected}，实际 {actual}）"));
-            }
-        }
-        if item.dest.exists() {
-            let _ = std::fs::remove_file(&item.dest);
-        }
-        std::fs::rename(&part, &item.dest).map_err(|e| format!("{}: {e}", item.dest.display()))?;
-        Ok(())
-    })();
-    for index in 0..count {
-        let _ = std::fs::remove_file(segment_path(&item.dest, index));
-    }
-    if result.is_err() {
-        let _ = std::fs::remove_file(&part);
-    }
-    result
 }
 
 #[cfg(test)]
@@ -1714,32 +2129,70 @@ mod tests {
         assert!(plan_segments(0, 4).is_empty());
     }
 
+    fn consumer(remaining: u64, inflight: usize, multi: bool) -> ShareConsumer {
+        ShareConsumer {
+            remaining_bytes: remaining,
+            inflight,
+            multi,
+        }
+    }
+
     #[test]
-    fn connection_leases_respect_the_concurrency_budget() {
-        let counter = Arc::new(AtomicUsize::new(0));
-        // 池子空着：第一个文件能吃到分段上限。
-        let first = ConnLease::claim(&counter, 8, SEGMENT_MAX);
-        assert_eq!(first.slots, SEGMENT_MAX.min(8));
-        // 池子已经满了：后来的只能单流，但仍给 1 条——否则这个 worker 干不了活。
-        let second = ConnLease::claim(&counter, 8, SEGMENT_MAX);
-        assert_eq!(second.slots, 1);
-        // 并发 1 时永远是单流（尊重"就用一个连接"的设置）。
-        let solo = Arc::new(AtomicUsize::new(0));
-        assert_eq!(ConnLease::claim(&solo, 1, SEGMENT_MAX).slots, 1);
-        // 租约释放后额度必须全部还回去，否则计数会一路虚高。
-        drop(first);
-        drop(second);
-        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    fn fair_share_one_large_file_takes_the_whole_budget() {
+        let size = 8 * 1024 * 1024;
+        let targets = fair_targets(&[consumer(size, 0, true)], 64);
+        let cap = (size / MIN_SEGMENT_BYTES) as usize;
+        assert_eq!(targets, vec![64.min(cap)]);
+    }
+
+    #[test]
+    fn fair_share_splits_evenly() {
+        let size = 8 * 1024 * 1024;
+        assert_eq!(
+            fair_targets(&[consumer(size, 0, true), consumer(size, 0, true)], 8),
+            vec![4, 4]
+        );
+        // 余数给剩余字节更多的文件。三个文件、预算 8 → 3、3、2。
+        assert_eq!(
+            fair_targets(
+                &[
+                    consumer(size, 0, true),
+                    consumer(size / 2, 0, true),
+                    consumer(size, 0, true),
+                ],
+                8
+            ),
+            vec![3, 2, 3]
+        );
+    }
+
+    #[test]
+    fn rebalance_after_peer_finishes() {
+        let size = 8 * 1024 * 1024;
+        let mut unassigned = VecDeque::from([(0u64, size - 1)]);
+        let first = claim_ranges(&mut unassigned, 4, 8);
+        assert_eq!(first.len(), 4);
+        let consumed: u64 = first.iter().map(|(start, end)| end - start + 1).sum();
+        assert!(consumed < size, "不能一次把未分配字节切完，否则无法加派");
+        // 同伴结束后预算全归这个文件，只从剩下的区间加派，不重下已派出的段。
+        let targets = fair_targets(&[consumer(size - consumed, 4, true)], 8);
+        assert_eq!(targets, vec![8]);
+        let more = claim_ranges(&mut unassigned, 4, 8);
+        assert_eq!(more.len(), 4);
+        assert!(more.iter().all(|(start, _)| *start >= first[0].1));
+    }
+
+    #[test]
+    fn small_file_never_takes_a_second_connection() {
+        let targets = fair_targets(&[consumer(512 * 1024, 0, false)], 8);
+        assert_eq!(targets, vec![1]);
     }
 
     #[test]
     fn small_files_stay_single_stream() {
-        // 阈值以下不分段：版本 JSON、资源索引这类文件拆开只会多几次握手。
         assert!(plan_segments(SEGMENT_THRESHOLD_BYTES - 1, 8).is_empty());
         assert!(plan_segments(0, 8).is_empty());
-        // 到了阈值就按拿到的连接数切（8 条 → 8 段）。
-        assert_eq!(plan_segments(SEGMENT_THRESHOLD_BYTES, 8).len(), SEGMENT_MAX);
-        // 只有 1 条连接时不切：文件再大也尊重用户"就用一个连接"的设置。
+        assert_eq!(plan_segments(SEGMENT_THRESHOLD_BYTES, 8).len(), 8);
         assert!(plan_segments(64 * 1024 * 1024, 1).is_empty());
     }
 

@@ -25,6 +25,7 @@ pub mod jsonstore;
 pub mod jvm;
 pub mod launch;
 pub mod loaders;
+pub mod manifests;
 pub mod modnames;
 pub mod mods;
 pub mod msa;
@@ -51,6 +52,12 @@ pub use install::InstallService;
 pub use jar::{list_entries, read_entry_bytes, read_mod_meta, ModMeta};
 pub use java::{JavaService, ScanEnv};
 pub use launch::LaunchPlanner;
+pub use manifests::{
+    apply_to_specs, default_settings, install as install_manifest, list as list_manifests,
+    load_ready as load_ready_manifests, plugins_dir, remove as remove_manifest,
+    slots as manifest_slots, source_table as manifest_source_table, InstalledManifest, Manifest,
+    Step as ManifestStep, MANIFEST_API,
+};
 pub use loaders::{
     fabric_api_latest, fabric_loaders, fabric_profile, forge_installer_sha1_url,
     forge_installer_url, forge_loaders, loader_times, neoforge_installer_url, neoforge_loaders,

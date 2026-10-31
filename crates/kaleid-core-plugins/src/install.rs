@@ -312,17 +312,17 @@ impl InstallService {
 
     fn plan_and_run(&self, job: &Arc<Job>, root: &Root, req: &InstallRequest) -> ApiResult<()> {
         job.start_phase("prepare");
-        job.set_current("解析版本信息…");
-        let mut items = Vec::new();
+        job.set_current("读取版本 JSON…");
+        let policy = job.policy().to_string();
+        let value = self.game_version_json(&req.game_version, &policy)?;
+        let mut core = self.vanilla_core_items(root, &req.version_name, &req.game_version, &value)?;
+
         match &req.loader {
-            InstallLoader::Vanilla => {
-                items.extend(self.vanilla_items(root, &req.version_name, &req.game_version)?);
-            }
+            InstallLoader::Vanilla => {}
             InstallLoader::Fabric { version } => {
                 // 自包含布局：原版与加载器全部落在 `versions/<版本名>/` 里，
                 // 不再额外造一个 `versions/<原版 GameVersion>/` 当 inheritsFrom 的父级。
-                items.extend(self.vanilla_items(root, &req.version_name, &req.game_version)?);
-                items.extend(self.fabric_items(
+                core.extend(self.fabric_items(
                     root,
                     &req.version_name,
                     &req.game_version,
@@ -347,7 +347,7 @@ impl InstallService {
                                     && n != api.file_name
                             });
                         if !has_other {
-                            items.push(DownloadItem {
+                            core.push(DownloadItem {
                                 label: format!("Fabric API {}", api.version),
                                 phase: "fabric-api".into(),
                                 official_url: Some(api.download_url.clone()),
@@ -366,21 +366,40 @@ impl InstallService {
                 }
             }
             InstallLoader::Forge { version } => {
-                items.extend(self.vanilla_items(root, &req.version_name, &req.game_version)?);
-                items.extend(self.forge_items(job, &req.game_version, version)?);
+                core.extend(self.forge_items(job, &req.game_version, version)?);
             }
             InstallLoader::Neoforge { version } => {
-                items.extend(self.vanilla_items(root, &req.version_name, &req.game_version)?);
-                items.extend(self.neoforge_items(job, &req.game_version, version)?);
+                core.extend(self.neoforge_items(job, &req.game_version, version)?);
             }
         }
 
         job.complete_phase("prepare");
-        for item in &items {
+        for item in &core {
             job.add_total(&item.phase, item.size, 1);
         }
         job.set_status(kaleid_api::DownloadStatus::Queued, "准备下载");
-        self.downloads.run_batch(job.clone(), items)?;
+
+        // 客户端与库先开下；资源索引在另一个线程里读，读完再把资源对象追加进来。
+        let session = self.downloads.begin_session(job.clone());
+        for item in core {
+            session.push(item)?;
+        }
+        match self.vanilla_asset_items(root, &req.game_version, &value, &policy) {
+            Ok(assets) => {
+                for item in &assets {
+                    job.add_total(&item.phase, item.size, 1);
+                }
+                for item in assets {
+                    session.push(item)?;
+                }
+            }
+            Err(error) => {
+                // 资源索引拿不到时先让已排队的客户端/库下完，再把错误抛出去。
+                let _ = session.close_and_wait();
+                return Err(error);
+            }
+        }
+        session.close_and_wait()?;
 
         let installer = match &req.loader {
             InstallLoader::Forge { .. } => Some(("Forge", "forge")),
@@ -408,22 +427,29 @@ impl InstallService {
         Ok(())
     }
 
-    fn vanilla_items(&self, root: &Root, name: &str, game: &str) -> ApiResult<Vec<DownloadItem>> {
-        let manifest = self.remote.versions(false)?;
+    /// 按下载源策略取版本 JSON。镜像优先时不去等官方源超时。
+    fn game_version_json(&self, game: &str, policy: &str) -> ApiResult<Value> {
+        let manifest = self.remote.versions_with_policy(false, policy)?;
         let rv = manifest
             .versions
             .iter()
             .find(|v| v.id == game)
             .ok_or_else(|| ApiError::not_found(format!("版本清单中没有 {game}")))?;
-        let official_json = rv.url.clone();
         let mirror_json = format!(
             "https://bmclapi2.bangbang93.com/version/{}/json",
             loaders::url_encode(game)
         );
-        let value = self
-            .remote
-            .get_json(&official_json)
-            .or_else(|_| self.remote.get_json(&mirror_json))?;
+        let urls = crate::remote::meta_url_pair(&rv.url, &mirror_json, policy);
+        self.remote.fetch_json_ordered(&urls)
+    }
+
+    fn vanilla_core_items(
+        &self,
+        root: &Root,
+        name: &str,
+        game: &str,
+        value: &Value,
+    ) -> ApiResult<Vec<DownloadItem>> {
         let mut id_value = value.clone();
         id_value["id"] = json!(name);
         write_version_json(root, name, &id_value)?;
@@ -494,7 +520,19 @@ impl InstallService {
                 });
             }
         }
+        Ok(items)
+    }
 
+    /// 资源索引与资源对象。它要等版本 JSON 读完才开始，所以单独一步，追加进已在跑的会话。
+    fn vanilla_asset_items(
+        &self,
+        root: &Root,
+        game: &str,
+        value: &Value,
+        policy: &str,
+    ) -> ApiResult<Vec<DownloadItem>> {
+        let root_path = Path::new(&root.path);
+        let mut items = Vec::new();
         if let Some(index) = value.get("assetIndex") {
             let index_id = index
                 .get("id")
@@ -523,10 +561,8 @@ impl InstallService {
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string()),
             });
-            let index_value = self
-                .remote
-                .get_json(index_url)
-                .or_else(|_| self.remote.get_json(&mirror_index))?;
+            let urls = crate::remote::meta_url_pair(index_url, &mirror_index, policy);
+            let index_value = self.remote.fetch_json_ordered(&urls)?;
             let mut seen = HashSet::new();
             if let Some(objects) = index_value.get("objects").and_then(|v| v.as_object()) {
                 for obj in objects.values() {
@@ -669,9 +705,14 @@ impl InstallService {
         std::fs::create_dir_all(&staging)?;
         let installer = staging.join("installer.jar");
         let url = loaders::forge_installer_url(game, version);
+        let sha1 = crate::remote::meta_url_pair(
+            &loaders::forge_installer_sha1_url(game, version),
+            &format!("{}.sha1", loaders::forge_installer_mirror_url(game, version)),
+            job.policy(),
+        );
         let sha1 = self
             .remote
-            .get_text(&loaders::forge_installer_sha1_url(game, version))
+            .fetch_text_ordered(&sha1)
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -700,9 +741,14 @@ impl InstallService {
         std::fs::create_dir_all(&staging)?;
         let installer = staging.join("installer.jar");
         let url = loaders::neoforge_installer_url(version);
+        let sha1 = crate::remote::meta_url_pair(
+            &loaders::neoforge_installer_sha1_url(version),
+            &format!("{}.sha1", loaders::neoforge_installer_mirror_url(version)),
+            job.policy(),
+        );
         let sha1 = self
             .remote
-            .get_text(&loaders::neoforge_installer_sha1_url(version))
+            .fetch_text_ordered(&sha1)
             .ok()
             .map(|s| s.trim().to_string())
             .filter(|s| !s.is_empty());
@@ -1292,6 +1338,70 @@ fn rule_matches(rule: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 版本 JSON 一到手，客户端与依赖库就该先排进下载队列，不用等整份资源索引。
+    ///
+    /// 这是「解析版本很慢」的直接修复点：以前 `vanilla_items` 要把资源索引读完、
+    /// 攒齐几千个对象才开跑，界面上一直停在「解析版本信息…」。
+    #[test]
+    fn vanilla_core_items_are_ready_before_the_asset_index() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Root {
+            id: "r".into(),
+            path: tmp.path().to_string_lossy().to_string(),
+            kind: kaleid_api::RootKind::BareMinecraft,
+            alias: "本地".into(),
+            added_at: "0".into(),
+            isolation: kaleid_api::IsolationMode::Off,
+            auto: false,
+            last_used: None,
+        };
+        let settings = Arc::new(Settings::open(tmp.path()));
+        let versions = Arc::new(VersionStore::new());
+        let roots = Arc::new(RootRegistry::open(tmp.path(), None).unwrap());
+        let downloads = Arc::new(DownloadManager::new(settings.clone()));
+        let service = InstallService::new(
+            settings,
+            versions,
+            roots,
+            downloads,
+            tmp.path(),
+        );
+        let value = json!({
+            "id": "26.1.2",
+            "downloads": {
+                "client": {
+                    "url": "https://piston-data.mojang.com/v1/objects/abc/client.jar",
+                    "size": 27_000_000u64,
+                    "sha1": "a".repeat(40)
+                }
+            },
+            "libraries": [
+                {"name": "org.lwjgl:lwjgl:3.3.3",
+                 "downloads": {"artifact": {
+                     "path": "org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3.jar",
+                     "url": "https://libraries.minecraft.net/org/lwjgl/lwjgl/3.3.3/lwjgl-3.3.3.jar",
+                     "size": 100u64}}},
+                {"name": "other:os-only:1", "rules": [{"action": "allow", "os": {"name": "linux"}}],
+                 "downloads": {"artifact": {"path": "x/y.jar", "url": "https://example.invalid/y.jar"}}}
+            ]
+        });
+
+        let items = service
+            .vanilla_core_items(&root, "26.1.2-测试", "26.1.2", &value)
+            .expect("核心下载项应当能单独建出来");
+
+        // 客户端 + 当前系统上可用的那个库；别的系统的库不该出现。
+        assert_eq!(items.len(), 2, "got {:?}", items.iter().map(|i| &i.label).collect::<Vec<_>>());
+        assert_eq!(items[0].phase, "client");
+        assert!(items[0].mirror_url.as_deref().unwrap().contains("bmclapi2"));
+        assert_eq!(items[1].phase, "libraries");
+        assert!(items[1].mirror_url.as_deref().unwrap().contains("bmclapi2"));
+        // 版本 JSON 已经落盘，加载器那一步可以直接读取合并。
+        assert!(crate::install::loader_version_dir(&root, "26.1.2-测试")
+            .join("26.1.2-测试.json")
+            .is_file());
+    }
 
     #[test]
     fn validates_windows_names() {

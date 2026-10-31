@@ -2069,6 +2069,12 @@ async function dispatch(cmd: string, args?: unknown): Promise<unknown> {
       return { jobId };
     }
 
+    case 'plugins_slots':
+      // 演示模式没有安装第三方清单，面板区直接空着。
+      return [];
+    case 'plugins_manifests':
+      return [];
+
     default:
       throw new Error(`未知命令：${cmd}`);
   }

@@ -293,3 +293,79 @@ fn required_plugins_cannot_be_disabled() {
     assert!(required.contains(&"game-content".to_string()));
     assert!(!required.contains(&"version-manager".to_string()));
 }
+
+/// CLI 安装、列出、卸载第三方清单的完整链路（进程内，不联网）。
+///
+/// 这条用例守着文档里写的那三条命令：装上之后 `sources` 能读到新源，
+/// 卸载之后源跟着消失，内置源自始至终都还在。
+#[test]
+fn cli_installs_and_removes_a_manifest_end_to_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("kaleid-data");
+    std::fs::create_dir_all(&data).unwrap();
+    let manifest_path = dir.path().join("manifest.json");
+    std::fs::write(
+        &manifest_path,
+        serde_json::to_string(&json!({
+            "id": "example-mirror",
+            "name": "校园镜像源",
+            "version": "1.0.0",
+            "api": "1",
+            "steps": [{
+                "op": "provide-source",
+                "id": "campus-mirror",
+                "label": "校园网镜像",
+                "priority": 20,
+                "manifestUrl": "https://mirror.example.edu/minecraft/version_manifest_v2.json",
+                "baseUrl": "https://mirror.example.edu/minecraft"
+            }]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let run = |args: &[&str]| -> (bool, String) {
+        let output = std::process::Command::new(env!("CARGO_BIN_EXE_kaleid"))
+            .arg("--data-dir")
+            .arg(&data)
+            .args(args)
+            .output()
+            .expect("运行 kaleid");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        (output.status.success(), text)
+    };
+
+    // 无签名且没有 --allow-unsigned：必须拒绝。
+    let (ok, text) = run(&["plugins", "install", &manifest_path.to_string_lossy()]);
+    assert!(!ok, "默认应当拒绝无签名清单：{text}");
+
+    let (ok, text) = run(&[
+        "plugins",
+        "install",
+        &manifest_path.to_string_lossy(),
+        "--allow-unsigned",
+    ]);
+    assert!(ok, "显式允许后应当装上：{text}");
+    assert!(data.join("plugins/example-mirror/manifest.json").is_file());
+
+    let (ok, text) = run(&["plugins"]);
+    assert!(ok);
+    assert!(text.contains("example-mirror"), "{text}");
+
+    let (ok, text) = run(&["sources"]);
+    assert!(ok);
+    assert!(text.contains("campus-mirror"), "新源应当出现在 sources 里：{text}");
+    assert!(text.contains("mojang"), "内置源不能被顶掉：{text}");
+
+    let (ok, text) = run(&["plugins", "remove", "example-mirror"]);
+    assert!(ok, "卸载应当成功：{text}");
+
+    let (ok, text) = run(&["sources"]);
+    assert!(ok);
+    assert!(!text.contains("campus-mirror"), "卸载后源应当消失：{text}");
+    assert!(text.contains("mojang"), "内置源不受影响：{text}");
+}

@@ -263,7 +263,15 @@ pub fn fabric_profile_url(game: &str, loader: &str) -> String {
 }
 
 pub fn fabric_profile(client: &RemoteClient, game: &str, loader: &str) -> ApiResult<Value> {
-    client.get_json(&fabric_profile_url(game, loader))
+    // 与 `fabric_loaders` 一致：官方 meta 在部分网络下不可达，先走 BMCLAPI 的同一路径。
+    let path = format!(
+        "/versions/loader/{}/{}/profile/json",
+        url_encode(game),
+        url_encode(loader)
+    );
+    client
+        .get_json(&format!("{FABRIC_META_BMCLAPI}{path}"))
+        .or_else(|_| client.get_json(&fabric_profile_url(game, loader)))
 }
 
 pub fn neoforge_installer_url(version: &str) -> String {

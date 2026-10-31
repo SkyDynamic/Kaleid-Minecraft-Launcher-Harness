@@ -498,5 +498,8 @@ fn spare_threads_are_used_for_one_large_file() {
 
     assert_eq!(std::fs::read(&dest).unwrap(), body);
     let peak = server.peak.load(Ordering::SeqCst);
-    assert!(peak > 4, "并发 32 只剩一个文件时应当用掉更多连接，实测峰值 {peak}");
+    assert!(
+        peak > 8,
+        "并发 32 只剩一个文件时不该再停在 8 段上限，实测峰值 {peak}"
+    );
 }

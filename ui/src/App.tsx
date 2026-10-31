@@ -193,10 +193,30 @@ export function App() {
     if (!versionManagerEnabled) return;
     let stopped = false;
     let timer: ReturnType<typeof setTimeout> | undefined;
+    // 上一帧各任务的状态：用来发现「刚跑完」的那一下。安装线程写完版本 JSON
+    // 之后才应该重扫，向导提交时那次扫描通常还太早。
+    const lastStatus = new Map<string, string>();
     const tick = async () => {
       if (stopped) return;
       await refreshDownloads();
       if (stopped) return;
+      const snapshot = useDownloads.getState().snapshot;
+      let finishedOne = false;
+      for (const job of snapshot?.jobs ?? []) {
+        const before = lastStatus.get(job.id);
+        lastStatus.set(job.id, job.status);
+        if (before === undefined) continue;
+        const wasActive =
+          before === 'queued' || before === 'resolving' || before === 'running';
+        const nowDone =
+          job.status === 'completed' ||
+          job.status === 'failed' ||
+          job.status === 'cancelled';
+        if (wasActive && nowDone) finishedOne = true;
+      }
+      if (finishedOne) {
+        void useApp.getState().refreshVersions();
+      }
       const active = hasActiveDownloads(useDownloads.getState().snapshot);
       timer = setTimeout(() => void tick(), active ? 650 : 2500);
     };

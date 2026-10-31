@@ -204,6 +204,7 @@ export const useApp = create<AppState>()((set, get) => ({
   refreshVersions: async () => {
     const { activeRootId } = get();
     if (!activeRootId) return;
+    set({ scanning: true });
     try {
       const versions = await getBridge().invoke<VersionSummary[]>('versions_scan', {
         rootId: activeRootId,
@@ -211,6 +212,8 @@ export const useApp = create<AppState>()((set, get) => ({
       set({ versions });
     } catch (e) {
       useUI.getState().showToast(errText(e));
+    } finally {
+      set({ scanning: false });
     }
   },
 

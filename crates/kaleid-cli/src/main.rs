@@ -36,7 +36,12 @@ const USAGE: &str = r#"kaleid —— Kaleid 启动器的无头命令行
                                     解压 / 启动 / 等窗口），窗口出来后一直等到退出
   accounts list | off <名字> | use <id>
   settings                          打印全局设置
-  plugins                           打印插件与状态
+  plugins                           打印插件与状态，并列出已安装的第三方清单
+  plugins install <路径> [--allow-unsigned]
+                                    安装一份声明式清单（目录或 manifest.json）。
+                                    默认要求签名；本机构建没有 ed25519 后端时，
+                                    用 --allow-unsigned 安装自己确认过来源的清单
+  plugins remove <id>               卸载第三方清单（不影响内置插件）
   sources                           打印可用的下载源
 
 环境变量：
@@ -86,17 +91,33 @@ fn run() -> i32 {
 
     let kernel = Kernel::new();
     register_all(&kernel, &data_root);
-    let specs = if args.minimal {
+    // 第三方清单的配置类动作要先落到规格上，再装载内核。
+    let manifests = kaleid_core_plugins::load_ready_manifests(&data_root);
+    let mut specs = if args.minimal {
         minimal_preset()
     } else {
         standard_preset()
     };
+    if let Err(e) = kaleid_core_plugins::apply_to_specs(&manifests, &mut specs) {
+        // 清单坏了只跳过它，不拖死整个启动：用户还得能进 `plugins remove`。
+        eprintln!("清单未生效：{e}");
+    }
     if let Err(e) = kernel.load(&specs) {
         eprintln!("插件装载失败：{e}");
         return 2;
     }
+    // 服务类动作（加下载源）在装载之后注册。
+    for manifest in &manifests {
+        if let Some((owner, sources)) = kaleid_core_plugins::manifest_source_table(manifest) {
+            kernel.context().provide(
+                "install-sources",
+                kaleid_core_plugins::InstallSourceTable { owner, sources },
+                0,
+            );
+        }
+    }
 
-    match dispatch(&kernel, &args.rest) {
+    match dispatch(&kernel, &args.rest, &data_root) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("{e}");
@@ -105,7 +126,7 @@ fn run() -> i32 {
     }
 }
 
-fn dispatch(kernel: &Kernel, rest: &[String]) -> Result<(), String> {
+fn dispatch(kernel: &Kernel, rest: &[String], data_root: &Path) -> Result<(), String> {
     let ctx = kernel.context();
     let cmd = rest.first().map(|s| s.as_str()).unwrap_or("");
     let roots = ctx
@@ -434,6 +455,51 @@ fn dispatch(kernel: &Kernel, rest: &[String]) -> Result<(), String> {
             Ok(())
         }
         "plugins" => {
+            match rest.get(1).map(|s| s.as_str()) {
+                Some("install") => {
+                    let Some(source) = rest.get(2) else {
+                        return Err(
+                            "用法：kaleid plugins install <manifest.json 或目录> [--allow-unsigned]"
+                                .into(),
+                        );
+                    };
+                    let allow_unsigned = rest.iter().any(|a| a == "--allow-unsigned");
+                    let reserved: Vec<String> = describe_plugins(kernel)
+                        .into_iter()
+                        .map(|plugin| plugin.id)
+                        .collect();
+                    let (manifest, path) = kaleid_core_plugins::install_manifest(
+                        data_root,
+                        Path::new(source),
+                        allow_unsigned,
+                        &reserved,
+                    )
+                    .map_err(|e| e)?;
+                    println!(
+                        "已安装 {} {} → {}",
+                        manifest.name,
+                        manifest.version,
+                        path.display()
+                    );
+                    if !allow_unsigned {
+                        println!("（已校验签名）");
+                    }
+                    println!("下次启动生效。");
+                    return Ok(());
+                }
+                Some("remove") => {
+                    let Some(id) = rest.get(2) else {
+                        return Err("用法：kaleid plugins remove <id>".into());
+                    };
+                    kaleid_core_plugins::remove_manifest(data_root, id).map_err(|e| e)?;
+                    println!("已移除 `{id}`。下次启动生效。");
+                    return Ok(());
+                }
+                Some(other) => {
+                    return Err(format!("未知的 plugins 子命令 `{other}`（install / remove）"))
+                }
+                None => {}
+            }
             for p in describe_plugins(kernel) {
                 println!(
                     "{} {:<18} {:<12} {}",
@@ -442,6 +508,18 @@ fn dispatch(kernel: &Kernel, rest: &[String]) -> Result<(), String> {
                     format!("{:?}", p.state),
                     p.description
                 );
+            }
+            let installed = kaleid_core_plugins::list_manifests(data_root);
+            if installed.is_empty() {
+                println!("\n没有第三方清单（<数据目录>/plugins/<id>/manifest.json）");
+            } else {
+                println!("\n第三方清单：");
+                for m in installed {
+                    match &m.error {
+                        Some(error) => println!("  ✗ {:<20} {}（{error}）", m.id, m.path),
+                        None => println!("  ✓ {:<20} {} {}", m.id, m.version, m.name),
+                    }
+                }
             }
             Ok(())
         }
@@ -471,3 +549,5 @@ fn find_root(roots: &std::sync::Arc<RootRegistry>, key: &str) -> Result<kaleid_a
 
 #[allow(dead_code)]
 fn _unused(_: &dyn SettingsServiceApi) {}
+
+

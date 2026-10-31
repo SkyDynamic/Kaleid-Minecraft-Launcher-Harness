@@ -7,14 +7,9 @@
   "steps": [
     {
       "op": "bind-slot",
-      "slot": "settings.sidebar",
-      "title": "关于这个版本",
-      "view": "readonly-text:这里显示当前选中版本的来源文件夹、加载器与就绪度。"
-    },
-    {
-      "op": "set-default-setting",
-      "key": "checkBeforeLaunch",
-      "value": true
+      "slot": "overview.notices",
+      "title": "关于这个启动器",
+      "view": "readonly-text:这块面板由第三方清单提供。它只读、只能追加，不能替换内置界面，也不会执行任何脚本。"
     }
   ]
 }

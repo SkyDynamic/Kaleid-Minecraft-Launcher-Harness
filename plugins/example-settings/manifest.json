@@ -1,0 +1,22 @@
+{
+  "id": "example-settings",
+  "name": "默认启动行为",
+  "version": "1.0.0",
+  "api": "1",
+  "author": "example",
+  "steps": [
+    {
+      "op": "set-default-setting",
+      "key": "checkBeforeLaunch",
+      "value": true
+    },
+    {
+      "op": "update-config",
+      "target": "version-manager",
+      "patch": {
+        "enableMojang": true,
+        "enableBmclapi": true
+      }
+    }
+  ]
+}

@@ -14,17 +14,8 @@
       "baseUrl": "https://mirror.example.edu/minecraft"
     },
     {
-      "op": "update-config",
-      "target": "version-manager",
-      "patch": {
-        "enableMojang": true,
-        "enableBmclapi": true,
-        "autoSpeedTest": true
-      }
-    },
-    {
       "op": "bind-slot",
-      "slot": "settings.sidebar",
+      "slot": "overview.notices",
       "title": "镜像说明",
       "view": "readonly-text:校园网内优先走本地镜像，出境线路拥堵时也能正常下载。"
     }

@@ -14,7 +14,9 @@ pub const MIRROR_MANIFEST: &str =
 
 pub struct RemoteClient {
     agent: ureq::Agent,
-    cache: Mutex<Option<(Instant, RemoteVersions)>>,
+    /// 元数据换源用的短超时客户端：连不上就换下一个地址，不把安装卡在官方源。
+    meta_agent: ureq::Agent,
+    cache: Mutex<Option<(Instant, String, RemoteVersions)>>,
 }
 
 impl RemoteClient {
@@ -24,8 +26,14 @@ impl RemoteClient {
             .timeout_read(Duration::from_secs(45))
             .user_agent("KaleidLauncher/0.1")
             .build();
+        let meta_agent = ureq::AgentBuilder::new()
+            .timeout_connect(Duration::from_secs(4))
+            .timeout_read(Duration::from_secs(30))
+            .user_agent("KaleidLauncher/0.1")
+            .build();
         RemoteClient {
             agent,
+            meta_agent,
             cache: Mutex::new(None),
         }
     }
@@ -76,20 +84,61 @@ impl RemoteClient {
     }
 
     pub fn versions(&self, force: bool) -> ApiResult<RemoteVersions> {
+        self.versions_with_policy(force, kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_FIRST)
+    }
+
+    /// 按下载源策略拉版本清单。缓存键带策略，避免「仅镜像」命中之前的官方结果。
+    pub fn versions_with_policy(&self, force: bool, policy: &str) -> ApiResult<RemoteVersions> {
         if !force {
-            if let Some((at, cached)) = self.cache.lock().unwrap().as_ref() {
-                if at.elapsed() < Duration::from_secs(300) {
+            if let Some((at, cached_policy, cached)) = self.cache.lock().unwrap().as_ref() {
+                if cached_policy == policy && at.elapsed() < Duration::from_secs(300) {
                     return Ok(cached.clone());
                 }
             }
         }
-        let value = match self.get_json(OFFICIAL_MANIFEST) {
-            Ok(v) => v,
-            Err(_) => self.get_json(MIRROR_MANIFEST)?,
-        };
+        let urls = meta_url_pair(OFFICIAL_MANIFEST, MIRROR_MANIFEST, policy);
+        let value = self.fetch_json_ordered(&urls)?;
         let versions = parse_manifest(&value)?;
-        *self.cache.lock().unwrap() = Some((Instant::now(), versions.clone()));
+        *self.cache.lock().unwrap() = Some((Instant::now(), policy.to_string(), versions.clone()));
         Ok(versions)
+    }
+
+    /// 按顺序试地址。每个候选连接 4 秒、读取 30 秒，失败立刻换下一个，不再对死地址多睡一次。
+    pub fn fetch_json_ordered(&self, urls: &[String]) -> ApiResult<Value> {
+        self.fetch_ordered(urls, |response| {
+            response
+                .into_json::<Value>()
+                .map_err(|e| ApiError::Network(e.to_string()))
+        })
+    }
+
+    pub fn fetch_text_ordered(&self, urls: &[String]) -> ApiResult<String> {
+        self.fetch_ordered(urls, |response| {
+            response
+                .into_string()
+                .map_err(|e| ApiError::Network(e.to_string()))
+        })
+    }
+
+    fn fetch_ordered<T>(
+        &self,
+        urls: &[String],
+        read: impl Fn(ureq::Response) -> ApiResult<T>,
+    ) -> ApiResult<T> {
+        if urls.is_empty() {
+            return Err(ApiError::Network("没有可用的元数据地址".into()));
+        }
+        let mut last = ApiError::Network("没有可用的元数据地址".into());
+        for url in urls {
+            match self.meta_agent.get(url).call() {
+                Ok(response) => match read(response) {
+                    Ok(value) => return Ok(value),
+                    Err(error) => last = error,
+                },
+                Err(error) => last = ApiError::Network(format!("{url}: {error}")),
+            }
+        }
+        Err(last)
     }
 
     pub fn version_json_url(&self, version_id: &str) -> ApiResult<String> {
@@ -102,6 +151,27 @@ impl RemoteClient {
             .filter(|url| !url.is_empty())
             .ok_or_else(|| ApiError::not_found(format!("版本清单中没有 {version_id}")))
     }
+}
+
+/// 官方 / 镜像两个元数据地址按下载源策略排序。`mirror-only` 不包含官方地址。
+pub fn meta_url_pair(official: &str, mirror: &str, policy: &str) -> Vec<String> {
+    let mirror_first = policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
+        || policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY;
+    let mirror_only = policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY;
+    let official_only = policy == kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_ONLY;
+    let mut urls = Vec::new();
+    if mirror_first {
+        urls.push(mirror.to_string());
+        if !mirror_only {
+            urls.push(official.to_string());
+        }
+    } else {
+        urls.push(official.to_string());
+        if !official_only {
+            urls.push(mirror.to_string());
+        }
+    }
+    urls
 }
 
 pub fn parse_manifest(value: &Value) -> ApiResult<RemoteVersions> {
@@ -192,6 +262,22 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mirror_only_metadata_urls_skip_mojang() {
+        let urls = meta_url_pair(
+            "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json",
+            "https://bmclapi2.bangbang93.com/mc/game/version_manifest_v2.json",
+            kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY,
+        );
+        assert_eq!(urls.len(), 1);
+        assert!(urls[0].contains("bmclapi2.bangbang93.com"));
+        assert!(urls.iter().all(|url| {
+            !url.contains("piston-meta.mojang.com")
+                && !url.contains("launchermeta.mojang.com")
+                && !url.contains("libraries.minecraft.net")
+        }));
+    }
 
     #[test]
     fn april_fools_ids_are_exact() {

@@ -158,6 +158,86 @@ fn classify(value: &Value) -> LoaderKind {
     }
 }
 
+/// 版本目录里的 JSON 不一定叫 `<目录名>.json`：其它启动器写出来的 NeoForge /
+/// Forge 版本常带自己的命名（`neoforge-21.1.72.json`）。找不到同名文件时退而求其次。
+fn resolve_version_json(dir: &Path, dir_name: &str) -> Option<PathBuf> {
+    let expected = dir.join(format!("{dir_name}.json"));
+    if expected.is_file() {
+        return Some(expected);
+    }
+    let mut candidates: Vec<PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().map(|t| t.is_file()).unwrap_or(false))
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .map(|ext| ext.eq_ignore_ascii_case("json"))
+                .unwrap_or(false)
+        })
+        .collect();
+    candidates.sort();
+    if candidates.is_empty() {
+        return None;
+    }
+    // 多份时优先 `id` 字段正好等于目录名的那份，避免误读 profile 之类的附属 JSON。
+    for path in &candidates {
+        let Ok(text) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<Value>(&text) else {
+            continue;
+        };
+        if value.get("id").and_then(|v| v.as_str()) == Some(dir_name) {
+            return Some(path.clone());
+        }
+    }
+    if candidates.len() == 1 {
+        candidates.pop()
+    } else {
+        None
+    }
+}
+
+/// 加载器标记（`.fabric` / `.neoforge` / `.forge` 下的 `loader.json`）。
+/// 扫描时它比库坐标更可靠：NeoForge 也依赖 `net.fabricmc:sponge-mixin`。
+fn read_loader_marker(dir: &Path) -> Option<(LoaderKind, Option<String>)> {
+    for (kind, marker) in [
+        (LoaderKind::Fabric, ".fabric"),
+        (LoaderKind::NeoForge, ".neoforge"),
+        (LoaderKind::Forge, ".forge"),
+    ] {
+        let path = dir.join(marker).join("loader.json");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            return Some((
+                kind,
+                value.get("loader").and_then(|v| v.as_str()).map(str::to_string),
+            ));
+        }
+    }
+    None
+}
+
+/// 标记里记的原版版本。合并后的 JSON 没有 `inheritsFrom` 时靠它。
+fn marker_game(dir: &Path) -> Option<String> {
+    for marker in [".fabric", ".neoforge", ".forge"] {
+        let path = dir.join(marker).join("loader.json");
+        if let Ok(text) = std::fs::read_to_string(&path) {
+            let value: Value = serde_json::from_str(&text).unwrap_or(Value::Null);
+            if let Some(game) = value
+                .get("game")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                return Some(game.to_string());
+            }
+        }
+    }
+    None
+}
+
 fn loader_version(value: &Value, loader: LoaderKind) -> Option<String> {
     let prefix = match loader {
         LoaderKind::Fabric => "net.fabricmc:fabric-loader:",
@@ -337,10 +417,9 @@ impl VersionStoreService for VersionStore {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().to_string();
-            let json_path = entry.path().join(format!("{dir_name}.json"));
-            if !json_path.is_file() {
+            let Some(json_path) = resolve_version_json(&entry.path(), &dir_name) else {
                 continue;
-            }
+            };
             match self.inspect(&json_path) {
                 Ok(summary) => out.push(summary),
                 // 单个版本 JSON 损坏不应该让整个列表消失
@@ -354,8 +433,7 @@ impl VersionStoreService for VersionStore {
     fn inspect(&self, json_path: &Path) -> ApiResult<VersionSummary> {
         let text = std::fs::read_to_string(json_path)
             .map_err(|e| ApiError::io(format!("{}: {e}", json_path.display())))?;
-        let value: Value = serde_json::from_str(&text)
-            .map_err(|e| ApiError::Format(format!("{}: {e}", json_path.display())))?;
+        let parsed: Option<Value> = serde_json::from_str(&text).ok();
 
         let version_dir = json_path
             .parent()
@@ -364,6 +442,16 @@ impl VersionStoreService for VersionStore {
             .file_name()
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
+        let marker = read_loader_marker(version_dir);
+        // JSON 写坏但加载器标记还在时，仍然把这个版本列出来（标成未就绪），
+        // 否则「装到一半 / 被别的启动器写坏」的 NeoForge 会直接从侧栏消失。
+        let value = match parsed {
+            Some(value) => value,
+            None if marker.is_some() => Value::Null,
+            None => {
+                return Err(ApiError::Format(format!("{}: JSON 无法解析", json_path.display())))
+            }
+        };
         let id = value
             .get("id")
             .and_then(|v| v.as_str())
@@ -375,8 +463,12 @@ impl VersionStoreService for VersionStore {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .filter(|s| !s.is_empty());
-        let loader = classify(&value);
-        let loader_version = loader_version(&value, loader).map(|version| {
+        // 标记优先：NeoForge 自己依赖 `net.fabricmc:sponge-mixin`，只靠库名会认错。
+        let (loader, marker_version) = match &marker {
+            Some((kind, version)) => (*kind, version.clone()),
+            None => (classify(&value), None),
+        };
+        let loader_version = marker_version.or_else(|| loader_version(&value, loader)).map(|version| {
             // Forge 的 Maven 坐标是 `1.21.4-54.1.22`，而安装请求只带 `54.1.22`。
             if loader == LoaderKind::Forge {
                 if let Some(game) = inherits_from.as_deref() {
@@ -419,7 +511,7 @@ impl VersionStoreService for VersionStore {
             loader,
             loader_version,
             inherits_from,
-            game_version: base_game_version(&chain, &dir_name),
+            game_version: marker_game(version_dir).or_else(|| base_game_version(&chain, &dir_name)),
             readiness,
             java_major,
             json_path: json_path.to_string_lossy().to_string(),
@@ -668,6 +760,61 @@ mod tests {
         let list = store.scan(&f.root).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "1.21.4");
+    }
+
+    /// 其它启动器写出来的 NeoForge 版本：JSON 文件名不等于目录名，加载器只记在标记里。
+    ///
+    /// 旧扫描只认 `versions/<目录>/<目录>.json`，这类版本会整条消失——用户看到的就是
+    /// 「NeoForge 读不出来」。
+    #[test]
+    fn neoforge_with_marker_and_odd_json_name_is_listed() {
+        let f = make_fixture();
+        let dir = f.root.join("versions/26.1.2-NeoForge");
+        std::fs::create_dir_all(dir.join(".neoforge")).unwrap();
+        std::fs::write(
+            dir.join(".neoforge/loader.json"),
+            json!({"kind": "neoforge", "loader": "26.1.2.125", "game": "26.1.2"}).to_string(),
+        )
+        .unwrap();
+        // 文件名与目录名不同，内容里也没有 neoforge 库坐标。
+        std::fs::write(
+            dir.join("neoforge-26.1.2.125.json"),
+            json!({"id": "26.1.2-NeoForge"}).to_string(),
+        )
+        .unwrap();
+
+        let store = VersionStore::new();
+        let list = store.scan(&f.root).unwrap();
+        let neo = list
+            .iter()
+            .find(|v| v.id == "26.1.2-NeoForge")
+            .expect("带标记的 NeoForge 版本必须能被列出");
+        assert_eq!(neo.loader, LoaderKind::NeoForge);
+        assert_eq!(neo.loader_version.as_deref(), Some("26.1.2.125"));
+        assert_eq!(neo.game_version.as_deref(), Some("26.1.2"));
+    }
+
+    /// JSON 写坏但标记还在：仍然列出（标成未就绪），不要从 NeoForge 分组里消失。
+    #[test]
+    fn neoforge_with_broken_json_still_listed_via_marker() {
+        let f = make_fixture();
+        let dir = f.root.join("versions/26.3-NeoForge");
+        std::fs::create_dir_all(dir.join(".neoforge")).unwrap();
+        std::fs::write(
+            dir.join(".neoforge/loader.json"),
+            json!({"kind": "neoforge", "loader": "26.3.0.99", "game": "26.3"}).to_string(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("26.3-NeoForge.json"), b"{ broken").unwrap();
+
+        let store = VersionStore::new();
+        let list = store.scan(&f.root).unwrap();
+        let neo = list
+            .iter()
+            .find(|v| v.id == "26.3-NeoForge")
+            .expect("标记可读时不该整条丢掉");
+        assert_eq!(neo.loader, LoaderKind::NeoForge);
+        assert!(matches!(neo.readiness, Readiness::Incomplete { .. }));
     }
 
     #[test]

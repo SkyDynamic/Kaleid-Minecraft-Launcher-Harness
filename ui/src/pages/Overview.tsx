@@ -63,8 +63,49 @@ export function Overview() {
         <div className="col-span-2">
           <InstancePanel />
         </div>
+        {/* 插件面板是**追加**的：这里只往下加一块只读说明，不替换任何内置界面。 */}
+        <PluginNotices />
       </div>
     </div>
+  );
+}
+
+interface PluginNotice {
+  plugin: string;
+  slot: string;
+  title: string;
+  text: string;
+}
+
+/** 第三方清单通过 `bind-slot` 往 `overview.notices` 加只读说明。 */
+function PluginNotices() {
+  const [notices, setNotices] = useState<PluginNotice[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    getBridge()
+      .invoke<PluginNotice[]>('plugins_slots')
+      .then((rows) => {
+        if (!cancelled) setNotices(rows.filter((row) => row.slot === 'overview.notices'));
+      })
+      .catch(() => {
+        if (!cancelled) setNotices([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  if (notices.length === 0) return null;
+  return (
+    <>
+      {notices.map((notice) => (
+        <Card key={`${notice.plugin}:${notice.title}`} className="col-span-2 px-4 py-3">
+          <Label>{notice.title}</Label>
+          <p className="mt-1 text-[12px] leading-[1.6] text-ink3">{notice.text}</p>
+        </Card>
+      ))}
+    </>
   );
 }
 

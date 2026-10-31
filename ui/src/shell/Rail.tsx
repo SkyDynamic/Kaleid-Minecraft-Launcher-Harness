@@ -10,6 +10,7 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Plus,
+  RefreshCw,
   Search,
   Settings,
   Star,
@@ -599,6 +600,7 @@ function useGroupedVersions(versions: VersionSummary[]) {
 export function VersionsZone() {
   const versions = useApp((s) => s.versions);
   const scanning = useApp((s) => s.scanning);
+  const refreshVersions = useApp((s) => s.refreshVersions);
   const activeRoot = useApp((s) => s.roots.find((r) => r.id === s.activeRootId) ?? null);
   const [query, setQuery] = useState('');
   const [collapsed, setCollapsed] = useState<Set<LoaderKind>>(new Set(['unrecognized']));
@@ -625,7 +627,20 @@ export function VersionsZone() {
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
-      <SectionHeader title="版本" count={versions.length} />
+      <SectionHeader
+        title="版本"
+        count={versions.length}
+        action={
+          <IconButton
+            label="重新读取版本"
+            size={20}
+            disabled={scanning || !activeRoot}
+            onClick={() => void refreshVersions()}
+          >
+            <RefreshCw size={11} className={scanning ? 'animate-spin' : undefined} />
+          </IconButton>
+        }
+      />
       <div className="px-3 pb-1.5">
         <div className="relative">
           <Search
