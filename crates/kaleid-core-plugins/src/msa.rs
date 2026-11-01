@@ -177,6 +177,55 @@ pub fn describe_mc_error(url: &str, status: u16, value: &Value) -> String {
     format!("{url} 返回 HTTP {status}：{detail}")
 }
 
+/// 刷新失败的两种性质：要不要让用户重新登录，完全是两件事。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TokenFailure {
+    /// 微软明确说这个刷新令牌不能用了（`invalid_grant` / `interaction_required`…）。
+    /// 只能重新走一次设备码登录。
+    Relogin(String),
+    /// 网络、5xx、限流之类：令牌本身还是好的，过一会儿再试就行。
+    Retryable(String),
+}
+
+impl TokenFailure {
+    pub fn message(&self) -> &str {
+        match self {
+            TokenFailure::Relogin(message) | TokenFailure::Retryable(message) => message,
+        }
+    }
+}
+
+/// 刷新时微软回的 `error` 里，哪些意味着"这个刷新令牌彻底废了"。
+///
+/// 这些错误码必须清掉本地令牌：留着它下次还会继续失败，用户会以为是启动器坏了。
+fn is_relogin_error(code: &str) -> bool {
+    matches!(
+        code,
+        "invalid_grant"
+            | "interaction_required"
+            | "consent_required"
+            | "unauthorized_client"
+            | "bad_verification_code"
+    )
+}
+
+/// 把令牌端点的失败响应分类。`status`/`value` 与 `classify_token` 同一套语义。
+fn classify_refresh_failure(value: &Value, status: u16) -> TokenFailure {
+    let code = str_at(value, "error").unwrap_or_default();
+    let description = str_at(value, "error_description").unwrap_or("");
+    if is_relogin_error(code) {
+        return TokenFailure::Relogin(format!(
+            "微软不再认可这个账号的登录状态（{code}）。请重新登录。{description}"
+        ));
+    }
+    if code.is_empty() {
+        return TokenFailure::Retryable(format!(
+            "刷新登录令牌失败（HTTP {status}）：微软没有返回原因"
+        ));
+    }
+    TokenFailure::Retryable(format!("刷新登录令牌失败（{code}）：{description}"))
+}
+
 /// 一次 poll 换来的一组微软令牌。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TokenSet {
@@ -350,6 +399,8 @@ pub fn parse_profile(value: &Value) -> ApiResult<McProfile> {
 /// 一个账号存下来的令牌（整体加密后才落盘）。
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct StoredToken {
+    /// 微软的刷新令牌。**这才是"登录状态"的本体**：Minecraft 访问令牌只有 24
+    /// 小时，刷新令牌能撑几个月，而且每次续期都会换一个新的。
     #[serde(default)]
     pub refresh_token: Option<String>,
     #[serde(default)]
@@ -357,14 +408,39 @@ pub struct StoredToken {
     /// Minecraft 访问令牌的到期时间（Unix 秒）。
     #[serde(default)]
     pub expires_at: Option<u64>,
+    /// 上次成功续期的时间（Unix 秒）。用来避免短时间内反复打微软的令牌端点。
+    #[serde(default)]
+    pub last_refresh_at: Option<u64>,
+    /// 微软已经明确拒绝了这个刷新令牌：再试也没用，必须重新登录。
+    #[serde(default)]
+    pub relogin_required: Option<bool>,
 }
 
 impl StoredToken {
+    /// Minecraft 访问令牌还能直接用吗。
     pub fn fresh(&self, now: u64) -> bool {
         match (self.access_token.as_deref(), self.expires_at) {
             (Some(token), Some(exp)) => !token.is_empty() && exp > now + TOKEN_SKEW_SECS,
             _ => false,
         }
+    }
+
+    /// 还能靠刷新令牌续上吗。
+    pub fn can_renew(&self) -> bool {
+        !self.relogin_required.unwrap_or(false)
+            && self
+                .refresh_token
+                .as_deref()
+                .map(|token| !token.is_empty())
+                .unwrap_or(false)
+    }
+
+    /// 这个账号的登录状态还能用吗（访问令牌没过期，或者能续）。
+    ///
+    /// 旧实现只看访问令牌，于是登录满 24 小时界面就显示"登录已过期"——明明刷新
+    /// 令牌还好好的，点一下启动就能自动续。这就是"一天就失效"的来源。
+    pub fn usable(&self, now: u64) -> bool {
+        self.fresh(now) || self.can_renew()
     }
 }
 
@@ -682,6 +758,8 @@ impl MsaAuth {
                 refresh_token: set.refresh_token.clone(),
                 access_token: Some(mc.access_token.clone()),
                 expires_at: Some(now_secs() + mc.expires_in),
+                last_refresh_at: Some(now_secs()),
+                relogin_required: None,
             },
         )?;
         Ok(account)
@@ -883,7 +961,12 @@ impl MsaAuthApi for MsaAuth {
                     .map(|t| !t.is_empty())
                     .unwrap_or(false),
                 expires_at: stored.as_ref().and_then(|s| s.expires_at),
-                usable: stored.as_ref().map(|s| s.fresh(now)).unwrap_or(false),
+                // 能续期就算"可用"：访问令牌过期只是需要自动续一次，不等于掉登录。
+                usable: stored.as_ref().map(|s| s.usable(now)).unwrap_or(false),
+                relogin_required: stored
+                    .as_ref()
+                    .map(|s| s.relogin_required.unwrap_or(false))
+                    .unwrap_or(false),
             });
         }
         Ok(out)
@@ -904,64 +987,138 @@ impl MsaAuthApi for MsaAuth {
         }
         let now = now_secs();
         let stored = self.store.load(&account.uuid)?;
-        if let Some(token) = stored.as_ref() {
-            if token.fresh(now) {
-                return Ok(token.access_token.clone());
-            }
+        let Some(stored) = stored else {
+            return Ok(None);
+        };
+        if stored.fresh(now) {
+            return Ok(stored.access_token.clone());
         }
-        // 访问令牌过期：用刷新令牌静默续一次。
-        //
-        // 续不上的三种情况要分开说（界面会把它原样弹给用户，笼统一句"登录失效"
-        // 只会让人反复点启动）：
-        // - 压根没有刷新令牌 → `Ok(None)`，宿主说"需要重新登录"；
-        // - 微软拒绝（`invalid_grant` 等）→ `Err`，带微软给的原因；
-        // - 网络/解析失败 → `Err`，带失败环节。
-        let refresh_token = match stored.and_then(|s| s.refresh_token) {
-            Some(token) if !token.is_empty() => token,
-            _ => return Ok(None),
-        };
-        let client_id = match self.client_id.as_deref() {
-            Some(id) => id,
-            None => return Ok(None),
-        };
-        let (status, value) = self.post_form(
-            TOKEN_URL,
-            &[
-                ("client_id", client_id),
-                ("grant_type", "refresh_token"),
-                ("refresh_token", &refresh_token),
-                ("scope", SCOPE),
-            ],
-        )?;
+        if stored.relogin_required.unwrap_or(false) || !stored.can_renew() {
+            return Ok(None);
+        }
+        match self.renew(&account.uuid, &stored) {
+            Ok(token) => Ok(Some(token)),
+            // 微软明确说刷新令牌不能用了：当作"需要重新登录"（宿主/界面会说清楚），
+            // 而不是抛一个看起来像网络故障的错误。
+            Err(TokenFailure::Relogin(_)) => Ok(None),
+            Err(TokenFailure::Retryable(message)) => Err(ApiError::Network(message)),
+        }
+    }
+}
+
+impl MsaAuth {
+    /// 用刷新令牌换一个新的 Minecraft 访问令牌。
+    ///
+    /// 关键顺序（这就是"隔天登录就没了"的根因）：**微软一给出新的刷新令牌就立刻
+    /// 落盘**，然后才去打通 XBL → XSTS → Minecraft。旧实现把落盘放在最后，中间
+    /// 任何一步网络抖动都会让"已经作废的旧刷新令牌 + 没拿到的新刷新令牌"一起丢掉，
+    /// 用户从此只能重新登录。
+    fn renew(&self, uuid: &str, stored: &StoredToken) -> Result<String, TokenFailure> {
+        let refresh_token = stored
+            .refresh_token
+            .clone()
+            .filter(|token| !token.is_empty())
+            .ok_or_else(|| TokenFailure::Relogin("账号没有可用的刷新令牌，请重新登录".into()))?;
+        let client_id = self
+            .client_id
+            .as_deref()
+            .ok_or_else(|| TokenFailure::Retryable(MISSING_CLIENT_ID_HINT.to_string()))?;
+        let (status, value) = self
+            .post_form(
+                TOKEN_URL,
+                &[
+                    ("client_id", client_id),
+                    ("grant_type", "refresh_token"),
+                    ("refresh_token", &refresh_token),
+                    ("scope", SCOPE),
+                ],
+            )
+            .map_err(|err| TokenFailure::Retryable(format!("刷新登录令牌失败：{err}")))?;
+
         let set = match classify_token(&value, status, MIN_INTERVAL) {
             Ok(TokenPoll::Authorized(set)) => set,
-            Ok(other) => {
-                return Err(ApiError::Invalid(format!(
-                    "微软没有受理这次令牌刷新（{}），请重新登录这个账号",
-                    match other {
-                        TokenPoll::Pending { .. } => "authorization_pending",
-                        TokenPoll::SlowDown { .. } => "slow_down",
-                        // Authorized 上面已经处理过，这里只是让 match 穷尽
-                        TokenPoll::Authorized(_) => "authorized",
-                    }
-                )))
+            Ok(TokenPoll::Pending { .. }) | Ok(TokenPoll::SlowDown { .. }) => {
+                return Err(TokenFailure::Retryable(
+                    "微软没有立刻受理这次令牌刷新，稍后会自动重试".into(),
+                ))
             }
             Err(err) => {
-                return Err(ApiError::Invalid(format!(
-                    "刷新登录令牌失败：{err}。请重新登录这个微软账号"
+                // `classify_token` 把认不出的 `error` 归到 Network；刷新场景里那些
+                // 恰恰包括 invalid_grant 这类"必须重新登录"的终态，所以这里按错误码
+                // 重新分类，终态的还要把本地令牌标成"需要重新登录"。
+                let failure = classify_refresh_failure(&value, status);
+                if matches!(failure, TokenFailure::Relogin(_)) {
+                    self.mark_relogin(uuid);
+                    return Err(failure);
+                }
+                if str_at(&value, "error").is_none() {
+                    // 微软没给错误码（真正的网络/解析失败）：保留原来的中文说明。
+                    return Err(TokenFailure::Retryable(format!("刷新登录令牌失败：{err}")));
+                }
+                return Err(failure);
+            }
+        };
+        // 第一步先落盘：新的刷新令牌已经到手，旧的很可能已经作废。
+        let rotated = set
+            .refresh_token
+            .clone()
+            .unwrap_or_else(|| refresh_token.clone());
+        self.save_refreshed(uuid, stored, &rotated, None, Some(now_secs()))
+            .map_err(|err| TokenFailure::Retryable(format!("保存令牌失败：{err}")))?;
+
+        let (mc, _profile) = match self.minecraft_from_msa(&set.access_token) {
+            Ok(pair) => pair,
+            // 令牌已经存好了，下次直接重试即可——不算"登录失效"。
+            Err(err) => {
+                return Err(TokenFailure::Retryable(format!(
+                    "登录状态已续期，但换取 Minecraft 令牌失败：{err}"
                 )))
             }
         };
-        let (mc, profile) = self.minecraft_from_msa(&set.access_token)?;
+        self.save_refreshed(
+            uuid,
+            stored,
+            &rotated,
+            Some((mc.access_token.clone(), now_secs() + mc.expires_in)),
+            Some(now_secs()),
+        )
+        .map_err(|err| TokenFailure::Retryable(format!("保存令牌失败：{err}")))?;
+        Ok(mc.access_token)
+    }
+
+    /// 微软拒绝了这个刷新令牌：把本地这份标记成"需要重新登录"。
+    ///
+    /// 不直接删文件：账号条目还在，界面需要知道"是过期了，不是从没登录过"。
+    fn mark_relogin(&self, uuid: &str) {
+        if let Ok(Some(mut stored)) = self.store.load(uuid) {
+            stored.relogin_required = Some(true);
+            let _ = self.store.save(uuid, &stored);
+        }
+    }
+
+    /// 保存续期结果。`mc` 为 `None` 时只更新刷新令牌与续期时间。
+    fn save_refreshed(
+        &self,
+        uuid: &str,
+        previous: &StoredToken,
+        refresh_token: &str,
+        mc: Option<(String, u64)>,
+        refreshed_at: Option<u64>,
+    ) -> ApiResult<()> {
+        let (access_token, expires_at) = match mc {
+            Some((token, expires_at)) => (Some(token), Some(expires_at)),
+            None => (previous.access_token.clone(), previous.expires_at),
+        };
         self.store.save(
-            &profile.uuid,
+            uuid,
             &StoredToken {
-                refresh_token: set.refresh_token.clone().or(Some(refresh_token)),
-                access_token: Some(mc.access_token.clone()),
-                expires_at: Some(now_secs() + mc.expires_in),
+                refresh_token: Some(refresh_token.to_string()),
+                access_token,
+                expires_at,
+                last_refresh_at: refreshed_at.or(previous.last_refresh_at),
+                relogin_required: None,
             },
-        )?;
-        Ok(Some(mc.access_token))
+        )
     }
 }
 
@@ -1193,6 +1350,7 @@ mod tests {
             refresh_token: Some("refresh".into()),
             access_token: Some("access".into()),
             expires_at: Some(now_secs() + 3600),
+            ..Default::default()
         };
         store
             .save("069A79F4-44E9-4726-A5BE-FCA90E38AAFF", &token)
@@ -1217,6 +1375,7 @@ mod tests {
             refresh_token: None,
             access_token: Some("a".into()),
             expires_at: Some(now + TOKEN_SKEW_SECS - 1),
+            ..Default::default()
         };
         assert!(!almost.fresh(now), "快过期就该刷新，别等启动那一刻掉线");
         assert!(almost.fresh(now - 120));
@@ -1242,6 +1401,7 @@ mod tests {
             refresh_token: Some("M.R3_BAY.secret-refresh".into()),
             access_token: Some("mc-access".into()),
             expires_at: Some(now_secs() + 3600),
+            ..Default::default()
         };
         store.save(uuid, &token).unwrap();
 
@@ -1292,9 +1452,127 @@ mod tests {
         assert!(message.contains("client_id"), "{message}");
     }
 
+    /// 「一天就失效」的根因：`usable` 只认 Minecraft 访问令牌的 24 小时有效期。
+    /// 刷新令牌还好好的，界面却已经写"登录已过期"。
     #[test]
-    fn poll_before_start_is_an_actionable_error() {
-        let (auth, _accounts, _dir) = auth_with(Some("0000-client-id"));
+    fn an_expired_access_token_does_not_mean_logged_out() {
+        let now = 1_000_000;
+        let after_a_day = StoredToken {
+            refresh_token: Some("M.R3_BAY.refresh".into()),
+            access_token: Some("mc-access".into()),
+            expires_at: Some(now - 60),
+            ..Default::default()
+        };
+        assert!(!after_a_day.fresh(now), "访问令牌确实过期了");
+        assert!(after_a_day.can_renew(), "但刷新令牌还在");
+        assert!(
+            after_a_day.usable(now),
+            "能自动续期就该算有效，否则界面会谎报掉登录"
+        );
+
+        // 刷新令牌被微软作废之后，才算真的需要重新登录。
+        let dead = StoredToken {
+            relogin_required: Some(true),
+            ..after_a_day.clone()
+        };
+        assert!(!dead.can_renew());
+        assert!(!dead.usable(now));
+    }
+
+    /// 微软明确拒绝刷新令牌（invalid_grant）与"网络不通"必须分开：前者只能重新
+    /// 登录，后者等一会儿就好。旧代码把两者都当成 `ApiError::Invalid` 一并报
+    /// "请重新登录"，网络抖一下就把用户的登录状态判了死刑。
+    #[test]
+    fn refresh_failures_are_split_into_relogin_and_retryable() {
+        let invalid_grant = json!({
+            "error": "invalid_grant",
+            "error_description": "AADSTS70008: The refresh token has expired."
+        });
+        match classify_refresh_failure(&invalid_grant, 400) {
+            TokenFailure::Relogin(message) => {
+                assert!(message.contains("重新登录"), "{message}");
+            }
+            other => panic!("invalid_grant 必须是终态：{other:?}"),
+        }
+
+        let interaction = json!({"error": "interaction_required"});
+        assert!(matches!(
+            classify_refresh_failure(&interaction, 400),
+            TokenFailure::Relogin(_)
+        ));
+
+        let server_error = json!({"error": "temporarily_unavailable"});
+        assert!(matches!(
+            classify_refresh_failure(&server_error, 503),
+            TokenFailure::Retryable(_)
+        ));
+
+        // 微软什么都没说（网关挡了、返回了一段 HTML）：只能当临时故障。
+        assert!(matches!(
+            classify_refresh_failure(&json!({}), 502),
+            TokenFailure::Retryable(_)
+        ));
+    }
+
+    /// 续期时**先**把微软刚给的刷新令牌落盘，再去打通 XBL → XSTS → Minecraft。
+    ///
+    /// 旧实现反过来：等到 Minecraft 令牌拿到之后才存。中间任何一步网络抖动，用户
+    /// 就会同时失去"已经作废的旧刷新令牌"和"没存下来的新刷新令牌"，从此只能重新
+    /// 登录——这就是"隔天登录就没了"最常见的触发方式。
+    #[test]
+    fn rotated_refresh_token_is_saved_before_the_xbox_chain_runs() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = Arc::new(Accounts::open(dir.path()).unwrap());
+        let memory = Arc::new(MemoryTokenStore::new());
+        let auth = MsaAuth::with_store(Some("0000-client-id"), accounts, memory.clone());
+        let uuid = "069a79f444e94726a5befca90e38aaff";
+        let previous = StoredToken {
+            refresh_token: Some("old-refresh".into()),
+            access_token: Some("old-mc".into()),
+            expires_at: Some(1_000),
+            ..Default::default()
+        };
+        memory.save(uuid, &previous).unwrap();
+
+        auth.save_refreshed(uuid, &previous, "rotated-refresh", None, Some(2_000))
+            .unwrap();
+
+        let stored = memory.load(uuid).unwrap().unwrap();
+        assert_eq!(stored.refresh_token.as_deref(), Some("rotated-refresh"));
+        assert_eq!(stored.last_refresh_at, Some(2_000));
+        // Minecraft 令牌还没换到：旧值原地留着，别清空成"没登录过"。
+        assert_eq!(stored.access_token.as_deref(), Some("old-mc"));
+        assert_eq!(stored.expires_at, Some(1_000));
+        assert!(!stored.relogin_required.unwrap_or(false));
+    }
+
+    /// 微软作废刷新令牌时只做标记，不删账号记录：界面得能说清"是过期了"。
+    #[test]
+    fn rejected_refresh_token_is_marked_not_deleted() {
+        let dir = tempfile::tempdir().unwrap();
+        let accounts = Arc::new(Accounts::open(dir.path()).unwrap());
+        let memory = Arc::new(MemoryTokenStore::new());
+        let auth = MsaAuth::with_store(Some("0000-client-id"), accounts, memory.clone());
+        let uuid = "069a79f444e94726a5befca90e38aaff";
+        memory
+            .save(
+                uuid,
+                &StoredToken {
+                    refresh_token: Some("dead".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        auth.mark_relogin(uuid);
+        let stored = memory.load(uuid).unwrap().unwrap();
+        assert_eq!(stored.relogin_required, Some(true));
+        assert_eq!(stored.refresh_token.as_deref(), Some("dead"));
+        assert!(!stored.can_renew(), "标记之后不该再拿它去撞微软");
+    }
+
+    #[test]
+    fn poll_before_start_is_an_actionable_error() {        let (auth, _accounts, _dir) = auth_with(Some("0000-client-id"));
         let message = auth.poll().unwrap_err().to_string();
         assert!(message.contains("添加正版账号"), "{message}");
         // cancel 永远成功：界面关闭弹窗时不该因为"本来就没在登录"报错
@@ -1327,6 +1605,7 @@ mod tests {
                     refresh_token: Some("refresh".into()),
                     access_token: Some("access".into()),
                     expires_at: None,
+                    ..Default::default()
                 },
             )
             .unwrap();

@@ -63,8 +63,14 @@ pub struct MsaAccountState {
     pub has_refresh_token: bool,
     /// 当前 Minecraft 访问令牌的到期时间（Unix 秒）。
     pub expires_at: Option<u64>,
-    /// 现在能不能直接拿去启动（访问令牌还在有效期内）。
+    /// 现在能不能拿去启动。
+    ///
+    /// **不是**"访问令牌还没过期"：只要刷新令牌还在，过期了也能自动续，所以这里
+    /// 表示"这次登录还能用"。真正需要用户动手的只有 [`Self::relogin_required`]。
     pub usable: bool,
+    /// 微软已经明确说这个账号的刷新令牌不能用了（`invalid_grant` 之类）：
+    /// 界面要提示"需要重新登录"，而不是"网络不好稍后再试"。
+    pub relogin_required: bool,
 }
 
 /// 登录能力是否可用（`client_id` 是编译期注入的，可能没配）。
