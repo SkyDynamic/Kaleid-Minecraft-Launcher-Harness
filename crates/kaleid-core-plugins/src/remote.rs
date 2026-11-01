@@ -141,6 +141,62 @@ impl RemoteClient {
         Err(last)
     }
 
+    /// 抓一个"必须真的是 JSON"的远程文件（资源索引、版本 JSON 之类）。
+    ///
+    /// 为什么不能直接 `into_json`：镜像站被限流或上游出错时，常常回 **200 + 一段
+    /// HTML 错误页**。这时候 serde 只会吐一句 `expected value at line 1 column 1`，
+    /// 用户看到的"JSON 解析失败"其实跟 JSON 一点关系都没有。这里做四件事：
+    ///
+    /// 1. 非 2xx 直接记一笔，换下一个地址；
+    /// 2. `Content-Type` 明显不是 JSON 就拒收，并把正文开头摘出来（HTML 的话能
+    ///    一眼看出是 429 / 403 还是 502）；
+    /// 3. 读取有上限，防止镜像把整个 jar 当 JSON 灌过来；
+    /// 4. 每个地址试 `VERIFY_ROUNDS` 轮，最后的错误里带上"是谁回的不是 JSON"。
+    pub fn fetch_verified_json(&self, urls: &[String], what: &str) -> ApiResult<Value> {
+        if urls.is_empty() {
+            return Err(ApiError::Network(format!("{what}：没有可用的地址")));
+        }
+        let mut last = ApiError::Network(format!("{what}：没有可用的地址"));
+        let mut tried: Vec<String> = Vec::new();
+        for round in 0..VERIFY_ROUNDS {
+            for url in urls {
+                let host = host_of(url);
+                if !tried.iter().any(|seen| seen == &host) {
+                    tried.push(host.clone());
+                }
+                match self.meta_agent.get(url).call() {
+                    Ok(response) => match verified_body(response, what, &host) {
+                        Ok(text) => match serde_json::from_str::<Value>(&text) {
+                            Ok(value) => return Ok(value),
+                            Err(error) => {
+                                last = ApiError::Network(format!(
+                                    "{what}下载失败：{host} 返回的内容不是合法的 JSON（{error}）：{}",
+                                    snippet(&text)
+                                ));
+                            }
+                        },
+                        Err(error) => last = error,
+                    },
+                    Err(error) => {
+                        last = ApiError::Network(format!("{what}下载失败：{host}：{error}"));
+                    }
+                }
+            }
+            // 全部地址都失败：下一轮之前歇一下，别把对方的限流越撞越死。
+            if round + 1 < VERIFY_ROUNDS {
+                std::thread::sleep(Duration::from_millis(VERIFY_PAUSE_MS));
+            }
+        }
+        Err(match last {
+            ApiError::Network(message) => ApiError::Network(format!(
+                "{message}（已尝试 {} 轮，地址：{}）",
+                VERIFY_ROUNDS,
+                tried.join("、")
+            )),
+            other => other,
+        })
+    }
+
     pub fn version_json_url(&self, version_id: &str) -> ApiResult<String> {
         let versions = self.versions(false)?;
         versions
@@ -151,6 +207,70 @@ impl RemoteClient {
             .filter(|url| !url.is_empty())
             .ok_or_else(|| ApiError::not_found(format!("版本清单中没有 {version_id}")))
     }
+}
+
+/// 元数据"必须是 JSON"的抓取要试几轮、读多少字节、歇多久。
+const VERIFY_ROUNDS: usize = 2;
+const VERIFY_MAX_BYTES: usize = 16 * 1024 * 1024;
+const VERIFY_PAUSE_MS: u64 = 500;
+/// 报错时摘多少字节的正文——够看清是 429 还是 502 就行。
+const SNIPPET_BYTES: usize = 120;
+
+fn host_of(url: &str) -> String {
+    crate::urlcache::host_of(url)
+}
+
+/// 把一段正文压成一行，放进中文错误信息里。
+fn snippet(text: &str) -> String {
+    let head: String = text.trim_start().chars().take(SNIPPET_BYTES).collect();
+    let mut clean: String = head
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
+    if text.trim_start().chars().count() > SNIPPET_BYTES {
+        clean.push('…');
+    }
+    clean
+}
+
+/// 校验并读出正文：拦掉"200 + HTML 错误页"和体积离谱的响应。
+fn verified_body(response: ureq::Response, what: &str, host: &str) -> ApiResult<String> {
+    let content_type = response.header("content-type").unwrap_or("").to_string();
+    let mut reader = response.into_reader();
+    let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
+    let mut chunk = [0u8; 64 * 1024];
+    loop {
+        let read = reader
+            .read(&mut chunk)
+            .map_err(|e| ApiError::Network(format!("{what}下载失败：{host} 读取中断：{e}")))?;
+        if read == 0 {
+            break;
+        }
+        // 超限就地停下：读满 16 MiB 再判断等于白吃内存。
+        if buffer.len() + read > VERIFY_MAX_BYTES {
+            return Err(ApiError::Network(format!(
+                "{what}下载失败：{host} 返回的内容过大（超过 16 MiB 上限），镜像可能把大文件当成了元数据"
+            )));
+        }
+        buffer.extend_from_slice(&chunk[..read]);
+    }
+    let text = String::from_utf8_lossy(&buffer).to_string();
+    let trimmed = text.trim_start_matches('\u{feff}').trim_start();
+    // 明显是 HTML / XML：这类响应一定是错误页，不需要再让 serde 猜。
+    let looks_markup = trimmed.starts_with('<');
+    let says_json = content_type.to_ascii_lowercase().contains("json");
+    if looks_markup || (!says_json && content_type.to_ascii_lowercase().contains("html")) {
+        return Err(ApiError::Network(format!(
+            "{what}下载失败：{host} 返回的不是 JSON（Content-Type: {}）：{}",
+            if content_type.is_empty() {
+                "未知"
+            } else {
+                &content_type
+            },
+            snippet(trimmed)
+        )));
+    }
+    Ok(text)
 }
 
 /// 官方 / 镜像两个元数据地址按下载源策略排序。`mirror-only` 不包含官方地址。

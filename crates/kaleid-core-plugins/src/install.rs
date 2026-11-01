@@ -477,7 +477,10 @@ impl InstallService {
             loaders::url_encode(game)
         );
         let urls = crate::remote::meta_url_pair(&rv.url, &mirror_json, policy);
-        self.remote.fetch_json_ordered(&urls)
+        // 走"必须真的是 JSON"的通道：镜像被限流时回的是 HTML 错误页，直接解析只会
+        // 得到一句看不懂的 expected value。
+        self.remote
+            .fetch_verified_json(&urls, &format!("{game} 的版本 JSON"))
     }
 
     fn vanilla_core_items(
@@ -618,7 +621,11 @@ impl InstallService {
                     .map(|s| s.to_string()),
             });
             let urls = crate::remote::meta_url_pair(index_url, &mirror_index, policy);
-            let index_value = self.remote.fetch_json_ordered(&urls)?;
+            // 资源索引是整次安装的命门：解析不出来就一个资源都排不进去。镜像被限流
+            // 时会回 200 + HTML 错误页，所以必须走"验证过才解析"的通道。
+            let index_value = self
+                .remote
+                .fetch_verified_json(&urls, &format!("资源索引 {index_id}"))?;
             let mut seen = HashSet::new();
             if let Some(objects) = index_value.get("objects").and_then(|v| v.as_object()) {
                 for obj in objects.values() {
