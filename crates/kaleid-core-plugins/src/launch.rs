@@ -345,7 +345,11 @@ fn build_plan(
         root.to_path_buf()
     };
     let games_dir_str = games_dir_string(&game_dir);
-    let natives_dir = game_dir.join("natives");
+    // natives 跟版本走，不跟隔离走：多个版本共用一个 `natives/` 时，并发启动会
+    // 互相覆盖 DLL（windows 上写同名文件直接失败或留下半个文件）。PCL2 也把
+    // natives 放在 `versions/<id>/natives`。注意它必须和 `game_dir` 解耦——
+    // 关掉隔离时 `gameDir` 是根目录，但 natives 仍在版本目录里。
+    let natives_dir = root.join("versions").join(version_id).join("natives");
     let assets_dir = root.join("assets");
 
     // 5) 变量表
@@ -371,6 +375,12 @@ fn build_plan(
         },
     );
     vars.insert("auth_xuid".into(), String::new());
+    // `${auth_session}` 是 1.5.x 的 legacy 参数（`--session ${auth_session}`），
+    // `${user_properties}` 从 1.6 一直用到 1.12。这两个变量不填，`substitute`
+    // 会原样留下占位符：前者让参数错位，后者喂给 1.7.10 时 Gson 解析直接崩。
+    // 官方启动器对离线档案给的就是 "0" 和 "{}"。
+    vars.insert("auth_session".into(), "0".into());
+    vars.insert("user_properties".into(), "{}".into());
     // `${clientid}` 是官方启动器自己的客户端标识（Realms / 遥测用），官方 JSON 里
     // 1.20+ 的 `--clientId ${clientid}` 必须有个值——不给就会把占位符原样写进命令行。
     // 我们没有 Realms 客户端，按官方默认值给空串（见上面「空串也是合法取值」）。
@@ -925,6 +935,150 @@ mod tests {
         assert!(!args.iter().any(|a| a.starts_with("${")), "还有占位符没替换：{args:?}");
         // 渲染出来的命令行也要能看出这里是个"空参数位"
         assert!(plan.command_line().contains("--xuid \"\""));
+    }
+
+    /// 1.5.x / 1.7.10 这类版本用 `minecraftArguments` 字符串，里面还有
+    /// `${auth_session}` 和 `${user_properties}` 两个现代版本早就没有的变量。
+    /// 变量表里没有它们，`substitute` 就会把占位符原样拼进命令行：
+    /// 轻则参数错位（把 `${user_properties}` 当成一个属性表喂给游戏），
+    /// 重则 1.7.10 在 Gson 解析 `--userProperties` 时直接崩。
+    fn legacy_fixture() -> (tempfile::TempDir, PathBuf) {
+        let (dir, root) = fixture();
+        std::fs::create_dir_all(root.join("versions/1.7.10")).unwrap();
+        let value = json!({
+            "id": "1.7.10",
+            "type": "release",
+            "mainClass": "net.minecraft.client.main.Main",
+            "assets": "1.7.10",
+            "assetIndex": { "id": "1.7.10" },
+            "downloads": { "client": { "url": "https://example/client.jar" } },
+            "libraries": [],
+            "minecraftArguments": "--username ${auth_player_name} --session ${auth_session} --version ${version_name} --gameDir ${game_directory} --assetsDir ${assets_root} --assetIndex ${assets_index_name} --uuid ${auth_uuid} --userProperties ${user_properties} --userType ${user_type}"
+        });
+        std::fs::write(
+            root.join("versions/1.7.10/1.7.10.json"),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+        std::fs::write(root.join("versions/1.7.10/1.7.10.jar"), b"jar").unwrap();
+        (dir, root)
+    }
+
+    #[test]
+    fn legacy_minecraft_arguments_leave_no_placeholders() {
+        let (_dir, root) = legacy_fixture();
+        let store = VersionStore::new();
+        let plan = build_plan(
+            &store,
+            &root,
+            "1.7.10",
+            &test_account(),
+            &effective(true),
+            None,
+        )
+        .unwrap();
+
+        assert!(
+            !plan.game_args.iter().any(|a| a.starts_with("${")),
+            "还有占位符没替换：{:?}",
+            plan.game_args
+        );
+        // 1.5.x 的 `--session` 给 "0"；1.6–1.12 的 `--userProperties` 必须是
+        // 一段合法 JSON（`{}`），否则 1.7.10 解析时崩。
+        let session_at = plan
+            .game_args
+            .iter()
+            .position(|a| a == "--session")
+            .unwrap();
+        assert_eq!(plan.game_args[session_at + 1], "0");
+        let props_at = plan
+            .game_args
+            .iter()
+            .position(|a| a == "--userProperties")
+            .unwrap();
+        assert_eq!(plan.game_args[props_at + 1], "{}");
+        assert_eq!(
+            plan.game_args[plan
+                .game_args
+                .iter()
+                .position(|a| a == "--userType")
+                .unwrap()
+                + 1],
+            "legacy"
+        );
+    }
+
+    /// natives 目录必须在**版本目录**里：多个版本共用一个 `natives/` 时
+    /// 并发启动会互相覆盖 DLL（PCL2 也是按版本放的）。
+    #[test]
+    fn natives_dir_lives_under_the_version_folder() {
+        let (_dir, root) = fixture();
+        let store = VersionStore::new();
+        for isolated in [true, false] {
+            let plan = build_plan(
+                &store,
+                &root,
+                "1.21.4",
+                &test_account(),
+                &effective(isolated),
+                None,
+            )
+            .unwrap();
+            let natives = plan.natives_dir.replace('\\', "/");
+            assert!(
+                natives.ends_with("versions/1.21.4/natives"),
+                "natives 目录应固定在版本目录下（isolated={isolated}），实际 {natives}"
+            );
+        }
+    }
+
+    /// 分类器形态的原生包要进 `natives_jars`，但**不能**进 classpath：
+    /// 它们只有 DLL，放到 classpath 上会在启动时被当成普通 jar 扫到。
+    #[test]
+    fn classifier_natives_are_listed_but_not_on_the_classpath() {
+        let (_dir, root) = fixture();
+        let mut value: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(root.join("versions/1.21.4/1.21.4.json")).unwrap(),
+        )
+        .unwrap();
+        value["libraries"].as_array_mut().unwrap().push(json!({
+            "name": "org.lwjgl.lwjgl:lwjgl-platform:2.9.0",
+            "natives": {"windows": "natives-windows", "linux": "natives-linux", "osx": "natives-osx"},
+            "extract": {"exclude": ["META-INF/"]},
+            "downloads": {"classifiers": {
+                "natives-windows": {"path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-windows.jar", "url": "https://libraries.minecraft.net/x.jar"},
+                "natives-linux": {"path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-linux.jar"}
+            }}
+        }));
+        std::fs::write(
+            root.join("versions/1.21.4/1.21.4.json"),
+            serde_json::to_string_pretty(&value).unwrap(),
+        )
+        .unwrap();
+
+        let store = VersionStore::new();
+        let plan = build_plan(
+            &store,
+            &root,
+            "1.21.4",
+            &test_account(),
+            &effective(true),
+            None,
+        )
+        .unwrap();
+
+        let os = crate::natives::current_os();
+        let expected = format!("lwjgl-platform-2.9.0-natives-{os}.jar");
+        let jar = plan
+            .natives_jars
+            .iter()
+            .find(|jar| jar.path.ends_with(&expected))
+            .unwrap_or_else(|| panic!("当前平台的原生包没进清单：{:?}", plan.natives_jars));
+        assert_eq!(jar.excludes, vec!["META-INF/".to_string()]);
+        assert!(!plan
+            .classpath
+            .iter()
+            .any(|entry| entry.replace('\\', "/").contains("natives-")));
     }
 
     #[test]
