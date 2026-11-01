@@ -518,6 +518,21 @@ impl InstallService {
                         .and_then(|v| v.as_str())
                         .map(|s| s.to_string()),
                 });
+
+                // 1.12.2 及更早的原生库在 `downloads.classifiers` 里，不进上面的
+                // artifact 分支。漏掉它们 = `natives/` 空 = `no lwjgl` 启动失败。
+                for native in crate::natives::native_jars(lib, crate::natives::current_os()) {
+                    items.push(DownloadItem {
+                        label: format!("原生库 {}", native.path),
+                        phase: "libraries".into(),
+                        official_url: Some(native.url.clone()),
+                        mirror_url: Some(loaders::bmclapi_maven_url(&native.path)),
+                        fallback_url: None,
+                        dest: root_path.join("libraries").join(&native.path),
+                        size: native.size,
+                        sha1: native.sha1.clone(),
+                    });
+                }
             }
         }
         Ok(items)
@@ -1401,6 +1416,100 @@ mod tests {
         assert!(crate::install::loader_version_dir(&root, "26.1.2-测试")
             .join("26.1.2-测试.json")
             .is_file());
+    }
+
+    /// 1.12.2 及更早的原生库在 `downloads.classifiers` 里，不在 `downloads.artifact`
+    /// 分支上。不把它们排进下载队列，`natives/` 就是空的，启动必然
+    /// `java.lang.UnsatisfiedLinkError: no lwjgl in java.library.path`。
+    #[test]
+    fn vanilla_core_items_include_classifier_natives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Root {
+            id: "r".into(),
+            path: tmp.path().to_string_lossy().to_string(),
+            kind: kaleid_api::RootKind::BareMinecraft,
+            alias: "本地".into(),
+            added_at: "0".into(),
+            isolation: kaleid_api::IsolationMode::Off,
+            auto: false,
+            last_used: None,
+        };
+        let settings = Arc::new(Settings::open(tmp.path()));
+        let service = InstallService::new(
+            settings,
+            Arc::new(VersionStore::new()),
+            Arc::new(RootRegistry::open(tmp.path(), None).unwrap()),
+            Arc::new(DownloadManager::new(Arc::new(Settings::open(tmp.path())))),
+            tmp.path(),
+        );
+        let value = json!({
+            "id": "1.5.2",
+            "downloads": {"client": {
+                "url": "https://piston-data.mojang.com/v1/objects/abc/client.jar",
+                "size": 1u64,
+                "sha1": "a".repeat(40)
+            }},
+            "libraries": [{
+                "name": "org.lwjgl.lwjgl:lwjgl-platform:2.9.0",
+                "natives": {"windows": "natives-windows", "linux": "natives-linux", "osx": "natives-osx"},
+                "extract": {"exclude": ["META-INF/"]},
+                "downloads": {
+                    "artifact": {
+                        "path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0.jar",
+                        "url": "https://libraries.minecraft.net/org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0.jar"
+                    },
+                    "classifiers": {
+                        "natives-windows": {
+                            "path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-windows.jar",
+                            "url": "https://libraries.minecraft.net/org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-windows.jar",
+                            "size": 578_680u64,
+                            "sha1": "b".repeat(40)
+                        },
+                        "natives-linux": {
+                            "path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-linux.jar"
+                        },
+                        "natives-osx": {
+                            "path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-osx.jar"
+                        }
+                    }
+                }
+            }]
+        });
+
+        let items = service
+            .vanilla_core_items(&root, "1.5.2-原生库", "1.5.2", &value)
+            .expect("核心下载项应当能建出来");
+
+        // 客户端 + 基础 jar，还有且只有一个「当前平台」的原生包。
+        let natives: Vec<&DownloadItem> = items
+            .iter()
+            .filter(|item| item.label.starts_with("原生库"))
+            .collect();
+        assert_eq!(
+            natives.len(),
+            1,
+            "只该排当前平台的原生包，got {:?}",
+            items.iter().map(|i| &i.label).collect::<Vec<_>>()
+        );
+        let expected = format!(
+            "libraries/org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-{}.jar",
+            crate::natives::current_os()
+        );
+        assert!(
+            natives[0]
+                .dest
+                .to_string_lossy()
+                .replace('\\', "/")
+                .ends_with(&expected),
+            "落盘位置不对：{}",
+            natives[0].dest.display()
+        );
+        assert_eq!(natives[0].phase, "libraries");
+        assert!(natives[0]
+            .mirror_url
+            .as_deref()
+            .unwrap_or_default()
+            .contains("bmclapi2"));
     }
 
     #[test]

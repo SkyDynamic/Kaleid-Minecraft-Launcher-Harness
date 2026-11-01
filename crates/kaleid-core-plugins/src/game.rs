@@ -1228,7 +1228,11 @@ fn prefer_windowless_java(java: &str) -> PathBuf {
     path
 }
 
-/// 从 classpath 里挑出 `natives-*.jar`，把里面的动态库解压到 `natives_dir`。
+/// 把原生包里的动态库解压到 `natives_dir`。
+///
+/// 优先用计划里的 `natives_jars` 清单：1.12.2 及更早的原生库在
+/// `downloads.classifiers` 里，压根不在 classpath 上，靠"扫 classpath 里带
+/// natives 的 jar"永远扫不到。老计划（没有清单）仍然走 classpath 扫描。
 /// 已经解压过就跳过（同一版本反复启动时省一次全量 IO）。
 fn extract_natives(plan: &LaunchPlan, cap: Option<usize>) -> std::io::Result<()> {
     if plan.natives_dir.is_empty() {
@@ -1238,13 +1242,31 @@ fn extract_natives(plan: &LaunchPlan, cap: Option<usize>) -> std::io::Result<()>
     std::fs::create_dir_all(&dir)?;
     let budget = cap.unwrap_or(64 * 1024 * 1024);
     let mut written = 0usize;
-    for jar_path in &plan.classpath {
-        let lower = jar_path.to_ascii_lowercase();
-        if !lower.contains("natives") || !lower.ends_with(".jar") {
-            continue;
+
+    // (jar 绝对路径, 要跳过的条目前缀)
+    let mut sources: Vec<(String, Vec<String>)> = Vec::new();
+    for native in &plan.natives_jars {
+        if let Some(path) = resolve_library_file(plan, &native.path) {
+            sources.push((path, native.excludes.clone()));
         }
-        let entries = jar::list_entries(Path::new(jar_path), 4096);
+    }
+    if sources.is_empty() {
+        // 兼容：老计划没有清单时，classpath 里文件名带 `natives` 的 jar 仍是候选。
+        for jar_path in &plan.classpath {
+            let lower = jar_path.to_ascii_lowercase();
+            if !lower.contains("natives") || !lower.ends_with(".jar") {
+                continue;
+            }
+            sources.push((jar_path.clone(), Vec::new()));
+        }
+    }
+
+    for (jar_path, excludes) in sources {
+        let entries = jar::list_entries(Path::new(&jar_path), 4096);
         for entry in entries {
+            if !crate::natives::native_entry_allowed(&entry, &excludes) {
+                continue;
+            }
             let lower_entry = entry.to_ascii_lowercase();
             let is_lib = lower_entry.ends_with(".dll")
                 || lower_entry.ends_with(".so")
@@ -1259,7 +1281,7 @@ fn extract_natives(plan: &LaunchPlan, cap: Option<usize>) -> std::io::Result<()>
             if target.is_file() {
                 continue;
             }
-            let Some(bytes) = jar::read_entry_bytes(Path::new(jar_path), &entry, 16 * 1024 * 1024)
+            let Some(bytes) = jar::read_entry_bytes(Path::new(&jar_path), &entry, 16 * 1024 * 1024)
             else {
                 continue;
             };
@@ -1271,6 +1293,21 @@ fn extract_natives(plan: &LaunchPlan, cap: Option<usize>) -> std::io::Result<()>
         }
     }
     Ok(())
+}
+
+/// `libraries/` 相对路径 → 真实文件：版本本地库目录优先，根 `libraries/` 兜底。
+fn resolve_library_file(plan: &LaunchPlan, relative: &str) -> Option<String> {
+    let mut candidates: Vec<PathBuf> = plan.libraries_dirs.iter().map(PathBuf::from).collect();
+    if candidates.is_empty() && !plan.libraries_dir.is_empty() {
+        candidates.push(PathBuf::from(&plan.libraries_dir));
+    }
+    for base in candidates {
+        let path = base.join(relative);
+        if path.is_file() {
+            return Some(path.to_string_lossy().to_string());
+        }
+    }
+    None
 }
 
 /// 把子进程的一个输出管道按行搬进内存日志与 `console.log`。
@@ -1393,6 +1430,75 @@ mod tests {
         }
     }
 
+    /// natives 清单里的原生包要真的解出动态库，`META-INF/` 要按 `extract.exclude` 跳过。
+    /// 这是 `no lwjgl in java.library.path` 的最后一道关：即使下对了包，
+    /// 不解压到 `natives/` 依然是空目录。
+    #[test]
+    fn extract_natives_uses_the_plan_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let libraries = dir.path().join("libraries");
+        let native_rel = "org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-windows.jar";
+        let jar_path = libraries.join(native_rel);
+        std::fs::create_dir_all(jar_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &jar_path,
+            crate::jar::tests::zip_stored(&[
+                ("lwjgl.dll", b"DLL".as_slice()),
+                ("META-INF/MANIFEST.MF", b"ignored".as_slice()),
+                ("README.txt", b"nope".as_slice()),
+            ]),
+        )
+        .unwrap();
+
+        let natives_dir = dir.path().join("natives");
+        let plan = LaunchPlan {
+            natives_dir: natives_dir.to_string_lossy().to_string(),
+            natives_jars: vec![kaleid_api::NativeJarRef {
+                path: native_rel.to_string(),
+                url: None,
+                sha1: None,
+                size: 0,
+                excludes: vec!["META-INF/".to_string()],
+            }],
+            libraries_dir: libraries.to_string_lossy().to_string(),
+            libraries_dirs: vec![libraries.to_string_lossy().to_string()],
+            // 老代码只认 classpath：这里故意留空，证明清单足以定位原生包。
+            classpath: Vec::new(),
+            ..plan()
+        };
+
+        extract_natives(&plan, None).unwrap();
+
+        assert!(natives_dir.join("lwjgl.dll").is_file(), "动态库必须解出来");
+        assert!(
+            !natives_dir.join("MANIFEST.MF").is_file(),
+            "META-INF/ 里的东西不该落地"
+        );
+        assert!(!natives_dir.join("README.txt").is_file(), "只解动态库");
+    }
+
+    /// 老计划没有 `natives_jars` 时，退回"扫 classpath 里带 natives 的 jar"。
+    #[test]
+    fn extract_natives_falls_back_to_classpath_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let jar_path = dir.path().join("natives-1.jar");
+        std::fs::write(
+            &jar_path,
+            crate::jar::tests::zip_stored(&[("OpenAL64.dll", b"DLL".as_slice())]),
+        )
+        .unwrap();
+
+        let natives_dir = dir.path().join("natives");
+        let plan = LaunchPlan {
+            natives_dir: natives_dir.to_string_lossy().to_string(),
+            classpath: vec![jar_path.to_string_lossy().to_string()],
+            ..plan()
+        };
+
+        extract_natives(&plan, None).unwrap();
+        assert!(natives_dir.join("OpenAL64.dll").is_file());
+    }
+
     fn plan() -> LaunchPlan {
         LaunchPlan {
             version_id: "26.3-Fabric".into(),
@@ -1421,6 +1527,7 @@ mod tests {
             launcher_brand: Some("Kaleid MC Launcher".into()),
             launch_dir: "C:/mc".into(),
             natives_dir: "C:/mc/versions/26.3-Fabric/natives".into(),
+            natives_jars: Vec::new(),
             libraries_dirs: vec!["C:/mc/libraries".into()],
             game_version: "26.3".into(),
             access_token_injected: false,

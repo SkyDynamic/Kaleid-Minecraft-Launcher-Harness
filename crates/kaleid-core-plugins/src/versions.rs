@@ -387,6 +387,15 @@ fn check_integrity(root: &Path, version_id: &str, chain: &[Value]) -> Integrity 
             if !in_version && !libraries.join(&path).is_file() {
                 out.missing_libraries += 1;
             }
+
+            // 原生库走分类器，不在 `downloads.artifact` 里，所以要单独数一遍：
+            // 少了它们启动就是 `no lwjgl in java.library.path`。
+            for native in crate::natives::native_jars(lib, crate::natives::current_os()) {
+                let in_version = version_libraries.join(&native.path).is_file();
+                if !in_version && !libraries.join(&native.path).is_file() {
+                    out.missing_libraries += 1;
+                }
+            }
         }
     }
 
@@ -865,6 +874,54 @@ mod tests {
         std::fs::write(lib.join("b-1.jar"), b"x").unwrap();
         std::fs::create_dir_all(f.root.join("assets/indexes")).unwrap();
         std::fs::write(f.root.join("assets/indexes/17.json"), b"{}").unwrap();
+
+        assert_eq!(
+            store.inspect(&json_path).unwrap().readiness,
+            Readiness::Ready
+        );
+    }
+
+    /// 原生库走分类器，不在 `downloads.artifact` 上：缺了它启动必炸，
+    /// 所以"缺几个依赖库"里必须算上。
+    #[test]
+    fn integrity_counts_missing_classifier_natives() {
+        let f = make_fixture();
+        write_version(
+            &f.root,
+            "1.5.2",
+            json!({
+                "id": "1.5.2",
+                "libraries": [{
+                    "name": "org.lwjgl.lwjgl:lwjgl-platform:2.9.0",
+                    "natives": {"windows": "natives-windows", "linux": "natives-linux", "osx": "natives-osx"},
+                    "downloads": {"artifact": {"path": "org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0.jar"}}
+                }]
+            }),
+            true,
+            &[],
+        );
+        let json_path = VersionStore::json_path(&f.root, "1.5.2");
+        let store = VersionStore::new();
+
+        // 基础 jar 先备好，这样"缺 1 个"就只能是原生库。
+        let natives = f.root.join("libraries/org/lwjgl/lwjgl/lwjgl-platform/2.9.0");
+        std::fs::create_dir_all(&natives).unwrap();
+        std::fs::write(natives.join("lwjgl-platform-2.9.0.jar"), b"x").unwrap();
+
+        // 基础 jar 有、原生库没有 → 缺 1 个。
+        assert_eq!(
+            store.inspect(&json_path).unwrap().readiness,
+            Readiness::Incomplete { missing: 1 }
+        );
+
+        std::fs::write(
+            natives.join(format!(
+                "lwjgl-platform-2.9.0-natives-{}.jar",
+                crate::natives::current_os()
+            )),
+            b"x",
+        )
+        .unwrap();
 
         assert_eq!(
             store.inspect(&json_path).unwrap().readiness,

@@ -684,6 +684,15 @@ pub struct LaunchPlan {
     /// natives 解压目录。
     #[serde(default)]
     pub natives_dir: String,
+    /// 当前平台需要解压到 [`Self::natives_dir`] 的原生包清单。
+    ///
+    /// 1.12.2 及更早的版本把原生库放在 `downloads.classifiers` 里，它们既不在
+    /// classpath 上，也不在 `downloads.artifact` 里——只靠"扫 classpath 里带
+    /// natives 的 jar"根本找不到，`natives/` 于是永远是空的，游戏启动直接
+    /// `UnsatisfiedLinkError: no lwjgl in java.library.path`。所以安装、补全、
+    /// 校验、解压统一读这份清单（老计划里没有这个字段时按空处理）。
+    #[serde(default)]
+    pub natives_jars: Vec<NativeJarRef>,
     /// 参与 classpath 的库目录候选：版本本地 `libraries/` 在前，根 `libraries/` 在后。
     #[serde(default)]
     pub libraries_dirs: Vec<String>,
@@ -708,6 +717,25 @@ pub struct LaunchPlan {
     /// 把启动器与 Java 设成"使用高性能显卡"（仅 Windows）。
     #[serde(default)]
     pub high_performance_gpu: bool,
+}
+
+/// 一个要解压到 `natives/` 的原生包。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct NativeJarRef {
+    /// `libraries/` 下的相对路径（Maven 布局，正斜杠）。
+    pub path: String,
+    /// 官方下载地址；离线计划里可能为空（补全时会按 Maven 布局自己拼）。
+    #[serde(default)]
+    pub url: Option<String>,
+    #[serde(default)]
+    pub sha1: Option<String>,
+    /// 字节数；分类器条目没写大小时是 0（进度条按"文件个数"照样能走）。
+    #[serde(default)]
+    pub size: u64,
+    /// `extract.exclude`：解压时按前缀跳过的条目，典型是 `META-INF/`。
+    #[serde(default)]
+    pub excludes: Vec<String>,
 }
 
 /// 一次完整校验的明细（`versions_verify`）。

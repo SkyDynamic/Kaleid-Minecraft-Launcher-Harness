@@ -709,7 +709,7 @@ fn strip_comment(line: &str) -> &str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::io::Write;
     use std::path::PathBuf;
@@ -797,8 +797,8 @@ mod tests {
         out
     }
 
-    /// stored（method 0）的 zip。
-    fn zip_stored(files: &[(&str, &[u8])]) -> Vec<u8> {
+    /// stored（method 0）的 zip。`pub(crate)`：别的模块（natives 解压）也要造 jar。
+    pub(crate) fn zip_stored(files: &[(&str, &[u8])]) -> Vec<u8> {
         assemble(files, 0, |data| data.to_vec())
     }
 
@@ -812,7 +812,7 @@ mod tests {
         })
     }
 
-    fn write_jar(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
+    pub(crate) fn write_jar(dir: &Path, name: &str, bytes: &[u8]) -> PathBuf {
         let path = dir.join(name);
         std::fs::write(&path, bytes).expect("临时目录应当可写");
         path

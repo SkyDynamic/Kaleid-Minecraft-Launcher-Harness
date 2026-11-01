@@ -29,6 +29,7 @@ pub mod manifests;
 pub mod modnames;
 pub mod mods;
 pub mod msa;
+pub mod natives;
 pub mod nbt;
 pub mod options;
 pub mod paths;

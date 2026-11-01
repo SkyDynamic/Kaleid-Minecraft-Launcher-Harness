@@ -38,7 +38,7 @@ pub use model::{
     normalize_gc_mode, normalize_jvm_args_mode, normalize_launch_after_action, offline_uuid,
     resolve_isolation, resolve_launch_brand, validate_launch_brand, validate_offline_name, Account,
     AccountKind, EffectiveConfig, GlobalSettings, IntegrityReport, IsolationMode, LaunchPlan,
-    LoaderKind, Pick, Readiness, Root, RootKind, VersionSettings, VersionSummary,
+    LoaderKind, NativeJarRef, Pick, Readiness, Root, RootKind, VersionSettings, VersionSummary,
     DEFAULT_JVM_ARGS, DOWNLOAD_SOURCE_MIRROR_FIRST,
     DOWNLOAD_SOURCE_MIRROR_ONLY, DOWNLOAD_SOURCE_OFFICIAL_FIRST, DOWNLOAD_SOURCE_OFFICIAL_ONLY,
     GC_MODE_G1, GC_MODE_G1_TUNED, GC_MODE_NONE, GC_MODE_ZGC, GC_MODE_ZGC_GENERATIONAL,

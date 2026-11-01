@@ -268,7 +268,55 @@ fn build_plan(
         classpath.push(chosen.to_string_lossy().to_string());
     }
 
-    // 3) 客户端 jar：自包含版本目录里就是 `<id>.jar`；否则顺着链条找声明
+    // 3) natives 清单。
+    //
+    //    1.12.2 及更早的版本把原生库写在 `downloads.classifiers` 里：它们既不是
+    //    `downloads.artifact`（所以安装/补全/校验都看不到），也不在 classpath 上
+    //    （所以"扫 classpath 里的 natives jar"也找不到）。没有这份清单，
+    //    `natives/` 永远是空的，启动就是 `no lwjgl in java.library.path`。
+    //    1.13+ 换了写法（原生包本身是普通库、`name` 带 `:natives-windows`），
+    //    这里一并记下，解压时两种形状都能覆盖。
+    let natives_os = crate::natives::current_os();
+    let mut natives_jars: BTreeMap<String, kaleid_api::NativeJarRef> = BTreeMap::new();
+    for lib in libraries.values() {
+        for native in crate::natives::native_jars(lib, natives_os) {
+            natives_jars.insert(
+                native.path.clone(),
+                kaleid_api::NativeJarRef {
+                    path: native.path,
+                    url: Some(native.url),
+                    sha1: native.sha1,
+                    size: native.size,
+                    excludes: native.excludes,
+                },
+            );
+        }
+        let Some(path) = library_relative_path(lib) else {
+            continue;
+        };
+        let lower = path.to_ascii_lowercase();
+        if lower.contains(&format!("natives-{natives_os}")) && lower.ends_with(".jar") {
+            let artifact = lib.get("downloads").and_then(|d| d.get("artifact"));
+            natives_jars.entry(path.clone()).or_insert_with(|| kaleid_api::NativeJarRef {
+                path,
+                url: artifact
+                    .and_then(|a| a.get("url"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                sha1: artifact
+                    .and_then(|a| a.get("sha1"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string),
+                size: artifact
+                    .and_then(|a| a.get("size"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0),
+                excludes: Vec::new(),
+            });
+        }
+    }
+
+    // 4) 客户端 jar：自包含版本目录里就是 `<id>.jar`；否则顺着链条找声明
     //    downloads.client 的那一层（老的分离布局）。
     let own_jar = root
         .join("versions")
@@ -492,6 +540,7 @@ fn build_plan(
         launcher_brand,
         launch_dir: games_dir_str.clone(),
         natives_dir: natives_dir.to_string_lossy().to_string(),
+        natives_jars: natives_jars.into_values().collect(),
         libraries_dirs: if version_libraries_dir.is_dir() {
             vec![
                 version_libraries_dir.to_string_lossy().to_string(),

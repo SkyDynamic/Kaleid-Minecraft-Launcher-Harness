@@ -192,6 +192,31 @@ pub fn missing_items(plan: &LaunchPlan) -> ApiResult<RepairPlan> {
         ));
     }
 
+    // ---- 2.5) 原生库 ----
+    // 1.12.2 及更早把原生库放在 `downloads.classifiers` 里，不在上面的 artifact
+    // 收集里。漏了它们，启动会以 `no lwjgl in java.library.path` 收场，而"缺什么"
+    // 的清单上却一个字都没有。
+    for native in &plan.natives_jars {
+        if libraries_dirs
+            .iter()
+            .any(|dir| dir.join(&native.path).is_file())
+        {
+            continue;
+        }
+        let url = native
+            .url
+            .clone()
+            .unwrap_or_else(|| format!("https://libraries.minecraft.net/{}", native.path));
+        items.push(item(
+            &plan.version_id,
+            "libraries",
+            &url,
+            lib_target.join(&native.path),
+            native.size,
+            native.sha1.clone(),
+        ));
+    }
+
     // ---- 3) 资源索引 ----
     let assets = mc.join("assets");
     let (index_id, index_value) = chain
@@ -329,6 +354,7 @@ mod tests {
             launcher_brand: None,
             launch_dir: mc.to_string_lossy().to_string(),
             natives_dir: mc.join("natives").to_string_lossy().to_string(),
+            natives_jars: Vec::new(),
             libraries_dirs: vec![mc.join("libraries").to_string_lossy().to_string()],
             game_version: version.to_string(),
             access_token_injected: false,
@@ -376,6 +402,43 @@ mod tests {
         let repair = missing_items(&plan).unwrap();
         assert!(repair.is_empty(), "不该有缺失：{:?}", repair.items.len());
         assert_eq!(repair.total_bytes, 0);
+    }
+
+    /// 分类器形态的原生库（1.12.2 及更早）缺失时也要报出来，并带下载地址。
+    #[test]
+    fn missing_classifier_natives_are_reported() {
+        let dir = tempdir().unwrap();
+        let mc = dir.path();
+        write_version(mc, "1.5.2", json!({"id": "1.5.2"}));
+        std::fs::write(mc.join("versions/1.5.2/1.5.2.jar"), b"jar").unwrap();
+
+        let os = crate::natives::current_os();
+        let relative = format!(
+            "org/lwjgl/lwjgl/lwjgl-platform/2.9.0/lwjgl-platform-2.9.0-natives-{os}.jar"
+        );
+        let mut plan = plan_for(mc, "1.5.2");
+        plan.natives_jars = vec![kaleid_api::NativeJarRef {
+            path: relative.clone(),
+            url: Some(format!("https://libraries.minecraft.net/{relative}")),
+            sha1: Some("c".repeat(40)),
+            size: 578_680,
+            excludes: vec!["META-INF/".to_string()],
+        }];
+
+        let repair = missing_items(&plan).unwrap();
+        assert_eq!(repair.files(), 1, "{:?}", repair.items.len());
+        assert!(repair.items[0]
+            .dest
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with(&format!("libraries/{relative}")));
+        assert_eq!(repair.total_bytes, 578_680, "进度条要有分母");
+
+        // 补上之后就不该再报。
+        std::fs::create_dir_all(mc.join("libraries/org/lwjgl/lwjgl/lwjgl-platform/2.9.0"))
+            .unwrap();
+        std::fs::write(mc.join("libraries").join(&relative), b"jar").unwrap();
+        assert!(missing_items(&plan).unwrap().is_empty());
     }
 
     /// 只有 Maven 坐标（没有 `downloads.artifact`）的库也要能算出下载地址。
