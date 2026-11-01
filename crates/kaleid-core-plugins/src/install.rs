@@ -357,6 +357,7 @@ impl InstallService {
                                 // 决定（`ordered_urls`），官方优先时官方失败会立刻换过来。
                                 mirror_url: kaleid_api::mirror_url_for(&api.download_url),
                                 fallback_url: None,
+                                prefer_mirror: false,
                                 dest: mods.join(&api.file_name),
                                 size: api.size,
                                 sha1: api.sha1.clone(),
@@ -473,6 +474,7 @@ impl InstallService {
                 loaders::url_encode(game)
             )),
             fallback_url: None,
+            prefer_mirror: false,
             dest: root_path
                 .join("versions")
                 .join(name)
@@ -511,6 +513,7 @@ impl InstallService {
                     official_url: Some(url),
                     mirror_url: Some(format!("https://bmclapi2.bangbang93.com/maven/{path}")),
                     fallback_url: None,
+                    prefer_mirror: false,
                     dest: root_path.join("libraries").join(path),
                     size: artifact.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
                     sha1: artifact
@@ -528,6 +531,7 @@ impl InstallService {
                         official_url: Some(native.url.clone()),
                         mirror_url: Some(loaders::bmclapi_maven_url(&native.path)),
                         fallback_url: None,
+                        prefer_mirror: false,
                         dest: root_path.join("libraries").join(&native.path),
                         size: native.size,
                         sha1: native.sha1.clone(),
@@ -567,6 +571,7 @@ impl InstallService {
                 official_url: Some(index_url.to_string()),
                 mirror_url: Some(mirror_index.clone()),
                 fallback_url: None,
+                prefer_mirror: false,
                 dest: root_path
                     .join("assets/indexes")
                     .join(format!("{index_id}.json")),
@@ -598,6 +603,7 @@ impl InstallService {
                             "https://bmclapi2.bangbang93.com/assets/{prefix}/{hash}"
                         )),
                         fallback_url: None,
+                        prefer_mirror: false,
                         dest: root_path.join("assets/objects").join(prefix).join(hash),
                         size: obj.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
                         sha1: Some(hash.to_string()),
@@ -621,6 +627,7 @@ impl InstallService {
                     official_url: Some(url.to_string()),
                     mirror_url: None,
                     fallback_url: None,
+                    prefer_mirror: false,
                     dest: root_path.join("assets/log_configs").join(id),
                     size: file.get("size").and_then(|v| v.as_u64()).unwrap_or(0),
                     sha1: file
@@ -697,6 +704,7 @@ impl InstallService {
                     // BMCLAPI 的 `/maven/` 按同一条相对路径镜像这份文件。
                     mirror_url: Some(loaders::bmclapi_maven_url(&path)),
                     fallback_url: None,
+                    prefer_mirror: false,
                     // 加载器库也进版本目录：整个 `versions/<版本名>/` 可以直接拷走。
                     dest: dir.join("libraries").join(&path),
                     size,
@@ -720,9 +728,10 @@ impl InstallService {
         std::fs::create_dir_all(&staging)?;
         let installer = staging.join("installer.jar");
         let url = loaders::forge_installer_url(game, version);
+        // 官方 Maven 在国内常年超时，`.sha1` 也常常一并超时——先问镜像那份。
         let sha1 = crate::remote::meta_url_pair(
-            &loaders::forge_installer_sha1_url(game, version),
             &format!("{}.sha1", loaders::forge_installer_mirror_url(game, version)),
+            &loaders::forge_installer_sha1_url(game, version),
             job.policy(),
         );
         let sha1 = self
@@ -737,6 +746,8 @@ impl InstallService {
             official_url: Some(url),
             mirror_url: Some(loaders::forge_installer_mirror_url(game, version)),
             fallback_url: None,
+            // 安装器只有这一个文件是"官方几乎连不上"的，其它库仍按玩家策略走。
+            prefer_mirror: true,
             dest: installer,
             size: 0,
             sha1,
@@ -756,9 +767,10 @@ impl InstallService {
         std::fs::create_dir_all(&staging)?;
         let installer = staging.join("installer.jar");
         let url = loaders::neoforge_installer_url(version);
+        // 同 Forge：`.sha1` 先问镜像，官方那份常年超时。
         let sha1 = crate::remote::meta_url_pair(
-            &loaders::neoforge_installer_sha1_url(version),
             &format!("{}.sha1", loaders::neoforge_installer_mirror_url(version)),
+            &loaders::neoforge_installer_sha1_url(version),
             job.policy(),
         );
         let sha1 = self
@@ -774,6 +786,7 @@ impl InstallService {
             official_url: Some(url),
             mirror_url: Some(loaders::neoforge_installer_mirror_url(version)),
             fallback_url: None,
+            prefer_mirror: true,
             dest: installer,
             size: 0,
             sha1,
@@ -811,6 +824,10 @@ impl InstallService {
         // 下进 staging/libraries，再跑官方安装器。安装器看到校验通过的文件就
         // 不再去 maven.neoforged.net / maven.minecraftforge.net（国内经常超时）。
         self.prefetch_installer_libraries(job, staging, label)?;
+        // 下到的可能根本不是 jar：镜像/服务端偶尔会回一个 HTML 错误页，
+        // 或者干脆只写了个空文件。让它进 Java 只会换来一句
+        // `Invalid or corrupt jarfile installer.jar`，玩家完全不知道下一步做什么。
+        ensure_installer_jar(&staging.join("installer.jar"))?;
         let java = resolve_java(&self.settings.global()?);
         let log = staging.join("installer.log");
         let out = std::fs::File::create(&log)?;
@@ -831,7 +848,8 @@ impl InstallService {
                 if !status.success() {
                     let tail = tail_lines(&log, 20);
                     return Err(ApiError::Network(format!(
-                        "{label} 安装器失败（{status}）。依赖已尽量从 BMCLAPI 补过，下面是安装器自己的输出：\n{tail}"
+                        "{label} 安装器失败（{status}）。依赖已尽量从 BMCLAPI 补过，下面是安装器自己的输出：\n{tail}{}",
+                        installer_failure_hint(&tail)
                     )));
                 }
                 break;
@@ -1052,6 +1070,7 @@ fn installer_library_item(lib: &Value, libraries_dir: &Path) -> Option<DownloadI
         official_url: official,
         mirror_url: Some(loaders::bmclapi_maven_url(&path)),
         fallback_url: None,
+        prefer_mirror: false,
         dest: libraries_dir.join(&path),
         size: artifact
             .and_then(|a| a.get("size"))
@@ -1116,6 +1135,56 @@ fn tail_lines(path: &Path, n: usize) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// 安装器落盘后确认它真的是个 jar（ZIP 开头 `PK\x03\x04`）。
+///
+/// 镜像或 CDN 出错时经常回一页 HTML、或者只留个 0 字节文件；直接交给 Java 会
+/// 得到 `Invalid or corrupt jarfile`，这句话对玩家没有任何指引作用。
+fn ensure_installer_jar(path: &Path) -> ApiResult<()> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| ApiError::Network(format!("安装器没有下载成功（{}）：{e}", path.display())))?;
+    if bytes.starts_with(b"PK\x03\x04") {
+        return Ok(());
+    }
+    let looks_like_html = {
+        let head = String::from_utf8_lossy(&bytes[..bytes.len().min(256)]);
+        let head = head.trim_start().to_ascii_lowercase();
+        head.starts_with("<!doctype") || head.starts_with("<html")
+    };
+    let detail = if bytes.is_empty() {
+        "下载到的是空文件".to_string()
+    } else if looks_like_html {
+        "下载到的是网页（HTML），不是 jar".to_string()
+    } else {
+        format!("文件只有 {} 字节且不是 jar", bytes.len())
+    };
+    Err(ApiError::Network(format!(
+        "安装器不是有效的 jar：{detail}。多半是下载源返回了错误页面，\
+         请到「设置 → 下载」换一个下载源（推荐「BMCLAPI 优先」）后重试。"
+    )))
+}
+
+/// 安装器失败时，把日志尾部翻译成一句"下一步怎么办"。
+///
+/// 安装器自己会去 `maven.neoforged.net` / `maven.minecraftforge.net` 拉缺失的库，
+/// 这两台在国内经常直接 Connect timed out——日志里出现域名或超时，就是它，
+/// 而不是玩家的 Java 有问题。
+fn installer_failure_hint(tail: &str) -> String {
+    let lower = tail.to_ascii_lowercase();
+    let official_maven_dead = lower.contains("maven.neoforged.net")
+        || lower.contains("maven.minecraftforge.net")
+        || lower.contains("connect timed out")
+        || lower.contains("connection timed out")
+        || lower.contains("unknownhost")
+        || lower.contains("certificate");
+    if official_maven_dead {
+        "\n\n提示：日志里出现了官方 Maven 的域名或连接超时，说明它连不上（国内很常见）。\
+         请把下载源改成「BMCLAPI 优先」后重试。"
+            .to_string()
+    } else {
+        String::new()
+    }
 }
 
 fn write_version_json(root: &Root, name: &str, value: &Value) -> ApiResult<()> {
@@ -1586,6 +1655,85 @@ mod tests {
         );
         let fabric = loaders::bmclapi_maven_url("net/fabricmc/fabric-loader/0.16.9/fabric-loader-0.16.9.jar");
         assert!(fabric.starts_with("https://bmclapi2.bangbang93.com/maven/net/fabricmc/"));
+    }
+
+    /// 下到 HTML 错误页 / 空文件时，报错要说人话（不是让 Java 抛 Invalid jarfile）。
+    #[test]
+    fn installer_jar_must_be_a_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.jar");
+        std::fs::write(&good, b"PK\x03\x04rest-of-a-zip").unwrap();
+        assert!(ensure_installer_jar(&good).is_ok());
+
+        let html = dir.path().join("html.jar");
+        std::fs::write(&html, b"<!DOCTYPE html><html><body>403 Forbidden</body></html>").unwrap();
+        let err = ensure_installer_jar(&html).unwrap_err().to_string();
+        assert!(err.contains("不是有效的 jar"), "{err}");
+        assert!(err.contains("下载源"), "要指向下一步动作：{err}");
+
+        let empty = dir.path().join("empty.jar");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(ensure_installer_jar(&empty)
+            .unwrap_err()
+            .to_string()
+            .contains("空文件"));
+
+        let missing = dir.path().join("nope.jar");
+        assert!(ensure_installer_jar(&missing).is_err());
+    }
+
+    /// 安装器日志里出现官方 Maven 域名/超时时，错误信息要告诉玩家换下载源。
+    #[test]
+    fn installer_failure_hint_points_at_the_download_source() {
+        let tail = "[main/ERROR] Could not download libraries\njava.net.ConnectException: Connect timed out: maven.neoforged.net";
+        let hint = installer_failure_hint(tail);
+        assert!(hint.contains("BMCLAPI"), "{hint}");
+        // 与网络无关的失败（例如 Java 版本不对）不要乱指路。
+        assert!(installer_failure_hint("UnsupportedClassVersionError: 65").is_empty());
+    }
+
+    /// 真机：安装器在「BMCLAPI 优先」下能不能拿到一个**真的** jar。
+    ///
+    /// 这是"NeoForge 装不上"的直接证据收集：`maven.neoforged.net` 在国内经常
+    /// 直接超时，这个测试按"镜像先、官方后"的顺序试，打印每条 URL 的结果。
+    /// 命令：`cargo test -p kaleid-core-plugins real_neoforge_installer_downloads_via_bmclapi
+    /// -- --ignored --nocapture`（可用 `KALEID_NEOFORGE_VERSION` 换版本）。
+    #[test]
+    #[ignore = "联网，验证安装器能从 BMCLAPI 下到一个真正的 jar"]
+    fn real_neoforge_installer_downloads_via_bmclapi() {
+        use std::io::Read;
+
+        let version = std::env::var("KALEID_NEOFORGE_VERSION")
+            .unwrap_or_else(|_| "26.3.0.99".to_string());
+        let candidates = vec![
+            loaders::neoforge_installer_mirror_url(&version),
+            loaders::neoforge_installer_url(&version),
+        ];
+        let client = crate::remote::RemoteClient::new();
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("installer.jar");
+        let mut errors: Vec<String> = Vec::new();
+        for url in &candidates {
+            match client.agent().get(url).call() {
+                Ok(response) => {
+                    let mut bytes = Vec::new();
+                    if let Err(e) = response.into_reader().read_to_end(&mut bytes) {
+                        errors.push(format!("{url}: 读取失败 {e}"));
+                        continue;
+                    }
+                    std::fs::write(&dest, &bytes).unwrap();
+                    match ensure_installer_jar(&dest) {
+                        Ok(()) => {
+                            eprintln!("{} → {} 字节，是有效 jar", url, bytes.len());
+                            return;
+                        }
+                        Err(e) => errors.push(format!("{url}: {e}（{} 字节）", bytes.len())),
+                    }
+                }
+                Err(e) => errors.push(format!("{url}: {e}")),
+            }
+        }
+        panic!("没有任何候选源拿到有效安装器：\n{}", errors.join("\n"));
     }
 
     /// 真机：用已经下好的 NeoForge 安装器，经 BMCLAPI 补库后再跑 `--installClient`。

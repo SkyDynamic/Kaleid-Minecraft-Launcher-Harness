@@ -1372,6 +1372,7 @@ impl ContentService {
             official_url,
             mirror_url,
             fallback_url: None,
+            prefer_mirror: false,
             dest: staging.clone(),
             size: update.size,
             sha1: update.sha1.clone(),

@@ -1586,6 +1586,7 @@ impl ModService {
             official_url,
             mirror_url,
             fallback_url: None,
+            prefer_mirror: false,
             dest,
             size: file.size,
             sha1: file.sha1.clone(),

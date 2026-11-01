@@ -517,6 +517,13 @@ pub struct DownloadItem {
     pub dest: PathBuf,
     pub size: u64,
     pub sha1: Option<String>,
+    /// 先试镜像，再试官方。
+    ///
+    /// 只给"官方源常年连不上"的文件用——目前就是 NeoForge / Forge 的安装器：
+    /// `maven.neoforged.net` 在国内经常直接超时，而玩家的下载源设置是
+    /// 「官方优先」，于是安装器每次都要先白等一次超时才轮到镜像。玩家选
+    /// `official-only` 时这条不生效（那时连镜像都不能碰）。
+    pub prefer_mirror: bool,
 }
 
 #[derive(Clone)]
@@ -860,6 +867,7 @@ fn accept_file(job: &Arc<Job>, item: DownloadItem, id: u64, desired: usize) -> L
         item.fallback_url.as_deref(),
         &job.source(),
         job.policy(),
+        item.prefer_mirror,
     );
     let size = item.size;
     let multi = !finished && size >= SEGMENT_THRESHOLD_BYTES && desired >= 2;
@@ -1270,19 +1278,24 @@ fn join_spans(item: &DownloadItem, spans: &[(u64, u64)]) -> Result<(), String> {
 /// - `source == "bmclapi"`：这条任务当前已切到镜像（官方优先被慢速监控切过来的），
 ///   所以镜像排前面；
 /// - `mirror-only`：只给镜像；`official-only`：只给官方；
-/// - 官方优先 / 镜像优先：按名字排序，另一边兜底。
+/// - 官方优先 / 镜像优先：按名字排序，另一边兜底；
+/// - `prefer_mirror`（逐文件）：即使策略写的是"官方优先"也先试镜像。只影响这一条
+///   文件，且 `official-only` 时无效——玩家明确选了"仅官方"就不能偷偷连镜像。
 fn ordered_urls(
     official: Option<&str>,
     mirror: Option<&str>,
     fallback: Option<&str>,
     source: &str,
     policy: &str,
+    prefer_mirror: bool,
 ) -> Vec<String> {
     let policy = policy.trim_start_matches("mod-");
     let mirror_only = policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY;
     let official_only = policy == kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_ONLY;
-    let mirror_first =
-        mirror_only || policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST || source == "bmclapi";
+    let mirror_first = mirror_only
+        || policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
+        || source == "bmclapi"
+        || (prefer_mirror && !official_only);
 
     let mut urls = Vec::new();
     if mirror_first {
@@ -1950,42 +1963,75 @@ mod tests {
 
         // 官方优先：官方先试，失败再镜像。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "official-first"),
+            ordered_urls(official, mirror, None, "mojang", "official-first", false),
             vec![official_s.clone(), mirror_s.clone()]
         );
         // 模组任务带 `mod-` 前缀，排序规则相同（只是不会被慢速监控切源）。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "mod-official-first"),
+            ordered_urls(official, mirror, None, "mojang", "mod-official-first", false),
             vec![official_s.clone(), mirror_s.clone()]
         );
         // 镜像优先：镜像先试，官方兜底。
         assert_eq!(
-            ordered_urls(official, mirror, None, "bmclapi", "mirror-first"),
+            ordered_urls(official, mirror, None, "bmclapi", "mirror-first", false),
             vec![mirror_s.clone(), official_s.clone()]
         );
         // 仅官方：不碰镜像。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "official-only"),
+            ordered_urls(official, mirror, None, "mojang", "official-only", false),
             vec![official_s.clone()]
         );
         // 仅镜像：不碰官方；没有官方直链（CurseForge）时行为一致。
         assert_eq!(
-            ordered_urls(official, mirror, None, "bmclapi", "mirror-only"),
+            ordered_urls(official, mirror, None, "bmclapi", "mirror-only", false),
             vec![mirror_s.clone()]
         );
         assert_eq!(
-            ordered_urls(None, mirror, None, "bmclapi", "mirror-first"),
+            ordered_urls(None, mirror, None, "bmclapi", "mirror-first", false),
             vec![mirror_s.clone()]
         );
         // 「仅官方」但压根没有官方地址：镜像就是唯一选择。
         assert_eq!(
-            ordered_urls(None, mirror, None, "mojang", "official-only"),
+            ordered_urls(None, mirror, None, "mojang", "official-only", false),
             vec![mirror_s.clone()]
         );
         // 官方优先被慢速监控切到镜像后，镜像排前面；fallback 最后且不重复。
         assert_eq!(
-            ordered_urls(official, mirror, official, "bmclapi", "official-first"),
+            ordered_urls(official, mirror, official, "bmclapi", "official-first", false),
             vec![mirror_s.clone(), official_s.clone()]
+        );
+    }
+
+    /// 加载器安装器这类"官方源常年连不上"的文件要能先试镜像那条路，
+    /// 但玩家选了「仅官方」时不许偷偷连镜像。
+    #[test]
+    fn prefer_mirror_puts_bmclapi_first_without_breaking_official_only() {
+        let official =
+            Some("https://maven.neoforged.net/releases/net/neoforged/neoforge/26.3.0.99/neoforge-26.3.0.99-installer.jar");
+        let mirror =
+            Some("https://bmclapi2.bangbang93.com/maven/net/neoforged/neoforge/26.3.0.99/neoforge-26.3.0.99-installer.jar");
+        let official_s = official.unwrap().to_string();
+        let mirror_s = mirror.unwrap().to_string();
+
+        // 默认策略是「官方优先」，但这条文件先试镜像。
+        assert_eq!(
+            ordered_urls(official, mirror, None, "mojang", "official-first", true),
+            vec![mirror_s.clone(), official_s.clone()]
+        );
+        // 「仅镜像」不变。
+        assert_eq!(
+            ordered_urls(official, mirror, None, "mojang", "mirror-only", true),
+            vec![mirror_s.clone()]
+        );
+        // 「仅官方」压过 prefer_mirror：镜像连排都不该排进去。
+        assert_eq!(
+            ordered_urls(official, mirror, None, "mojang", "official-only", true),
+            vec![official_s.clone()]
+        );
+        // 没标 prefer_mirror 的文件，顺序一个字都不变。
+        assert_eq!(
+            ordered_urls(official, mirror, None, "mojang", "official-first", false),
+            vec![official_s.clone(), mirror_s.clone()]
         );
     }
 

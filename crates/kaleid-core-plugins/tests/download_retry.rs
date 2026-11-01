@@ -266,6 +266,7 @@ fn item(label: &str, url: String, dest: &Path, body: &[u8]) -> DownloadItem {
         official_url: Some(url),
         mirror_url: None,
         fallback_url: None,
+        prefer_mirror: false,
         dest: dest.to_path_buf(),
         size: body.len() as u64,
         sha1: Some(sha1_hex(body)),

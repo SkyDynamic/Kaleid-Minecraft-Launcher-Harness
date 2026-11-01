@@ -316,6 +316,7 @@ fn item(
         // 补全走和安装同一套镜像策略：官方连不上会自动换镜像。
         mirror_url: kaleid_api::mirror_url_for(url),
         fallback_url: None,
+        prefer_mirror: false,
         dest,
         size,
         sha1,
