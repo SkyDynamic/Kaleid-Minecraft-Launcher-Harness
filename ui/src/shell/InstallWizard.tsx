@@ -30,7 +30,6 @@ import type {
 
 type Step = 1 | 2 | 3;
 type LoaderChoice = 'vanilla' | 'fabric' | 'forge' | 'neoforge';
-
 const GROUP_META: Array<{
   key: RemoteVersion['category'];
   title: string;
@@ -47,6 +46,24 @@ function loaderLabel(loader: LoaderChoice): string {
   if (loader === 'forge') return 'Forge';
   if (loader === 'neoforge') return 'NeoForge';
   return '原版';
+}
+
+/** OptiFine 从 1.13 起只能是 mod（必须挂 Forge）；1.12.2 及更早可以单装。 */
+function isModernOptifine(game: string | undefined): boolean {
+  if (!game) return false;
+  const [, minor] = game.split('.');
+  const n = Number.parseInt(minor ?? '', 10);
+  if (Number.isNaN(n)) return false;
+  const major = Number.parseInt(game.split('.')[0] ?? '', 10);
+  if (major >= 2) return true;
+  return n >= 13;
+}
+
+/** `HD_U_J3` → `{kind:'HD_U', patch:'J3'}`（和 rust 侧 OptifineRef 一致）。 */
+function splitOptifineVersion(version: string): { kind: string; patch: string } | null {
+  const at = version.lastIndexOf('_');
+  if (at <= 0 || at === version.length - 1) return null;
+  return { kind: version.slice(0, at), patch: version.slice(at + 1) };
 }
 
 function defaultVersionName(game: string, loader: LoaderChoice, version: string | null): string {
@@ -284,10 +301,16 @@ export function InstallWizard() {
   const [fabricData, setFabricData] = useState<LoaderVersions | null>(null);
   const [forgeData, setForgeData] = useState<LoaderVersions | null>(null);
   const [neoData, setNeoData] = useState<LoaderVersions | null>(null);
+  const [optifineData, setOptifineData] = useState<LoaderVersions | null>(null);
   const [loadingLoaders, setLoadingLoaders] = useState(false);
   const [loaderError, setLoaderError] = useState<string | null>(null);
   const [loaderChoice, setLoaderChoice] = useState<LoaderChoice>('vanilla');
   const [loaderVersion, setLoaderVersion] = useState<string | null>(null);
+  /**
+   * OptiFine 是"加载器之外再加一层"：它不是 [`LoaderChoice`] 的一种，而是和它
+   * 并存的开关。高版本必须挂在 Forge 上，低版本可以脱离加载器单独装。
+   */
+  const [optifineVersion, setOptifineVersion] = useState<string | null>(null);
   const [loaderTimes, setLoaderTimes] = useState<Record<string, Record<string, string | null>>>({});
   const [timesLoading, setTimesLoading] = useState<Record<string, boolean>>({});
   const selectedIdRef = useRef<string | null>(null);
@@ -298,6 +321,7 @@ export function InstallWizard() {
     fabric: false,
     forge: false,
     neoforge: false,
+    optifine: false,
   });
   const [fabricApi, setFabricApi] = useState(true);
   const [fabricApiInfo, setFabricApiInfo] = useState<FabricApiInfo | null>(null);
@@ -340,13 +364,15 @@ export function InstallWizard() {
     setFabricData(null);
     setForgeData(null);
     setNeoData(null);
+    setOptifineData(null);
     setLoaderError(null);
     setLoaderChoice('vanilla');
     setLoaderVersion(null);
+    setOptifineVersion(null);
     setLoaderTimes({});
     setTimesLoading({});
     timesRequested.current.clear();
-    setExpandedLoaders({ vanilla: true, fabric: false, forge: false, neoforge: false });
+    setExpandedLoaders({ vanilla: true, fabric: false, forge: false, neoforge: false, optifine: false });
     setFabricApi(true);
     setFabricApiInfo(null);
     setName('');
@@ -378,28 +404,30 @@ export function InstallWizard() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open]);
 
-  // 进入第二步时并发加载 Fabric / Forge / NeoForge，任何一个慢都不阻塞其他两个。
+  // 进入第二步时并发加载 Fabric / Forge / NeoForge / OptiFine，任何一个慢都不阻塞其它。
   useEffect(() => {
     if (!selected || step !== 2) return;
     let cancelled = false;
     setLoadingLoaders(true);
     setLoaderError(null);
     const bridge = getBridge();
-    const load = (loader: LoaderChoice) =>
+    const load = (loader: 'fabric' | 'forge' | 'neoforge' | 'optifine') =>
       bridge.invoke<LoaderVersions>('loaders_versions', {
         gameVersion: selected.id,
         loader,
       });
-    Promise.allSettled([load('fabric'), load('forge'), load('neoforge')]).then(
-      ([fabric, forge, neo]) => {
+    Promise.allSettled([load('fabric'), load('forge'), load('neoforge'), load('optifine')]).then(
+      ([fabric, forge, neo, optifine]) => {
         if (cancelled) return;
         setFabricData(fabric.status === 'fulfilled' ? fabric.value : null);
         setForgeData(forge.status === 'fulfilled' ? forge.value : null);
         setNeoData(neo.status === 'fulfilled' ? neo.value : null);
+        setOptifineData(optifine.status === 'fulfilled' ? optifine.value : null);
         if (
           fabric.status === 'rejected' &&
           forge.status === 'rejected' &&
-          neo.status === 'rejected'
+          neo.status === 'rejected' &&
+          optifine.status === 'rejected'
         ) {
           setLoaderError('加载器列表获取失败，可先安装原版，稍后重试。');
         }
@@ -459,7 +487,8 @@ export function InstallWizard() {
     if (step < 2 || !selected) return;
     const bridge = getBridge();
     const gameId = selected.id;
-    const choices: LoaderChoice[] = ['fabric', 'forge', 'neoforge'];
+    // OptiFine 的时间条目不在这套接口里（BMCLAPI 的列表没有时间），所以不请求。
+    const choices: Array<'fabric' | 'forge' | 'neoforge'> = ['fabric', 'forge', 'neoforge'];
     for (const choice of choices) {
       if (!expandedLoaders[choice] || loaderTimes[choice] || timesLoading[choice]) continue;
       const requestKey = `${gameId}:${choice}`;
@@ -565,9 +594,11 @@ export function InstallWizard() {
     setNameTouched(false);
     setLoaderChoice('vanilla');
     setLoaderVersion(null);
+    setOptifineVersion(null);
     setFabricData(null);
     setForgeData(null);
     setNeoData(null);
+    setOptifineData(null);
     setLoaderTimes({});
     setFabricApiInfo(null);
   };
@@ -588,12 +619,45 @@ export function InstallWizard() {
       fabric: choice === 'fabric',
       forge: choice === 'forge',
       neoforge: choice === 'neoforge',
+      optifine: Boolean(optifineVersion),
     });
     if (choice === 'fabric') setFabricApi(true);
+    // Fabric / NeoForge 与 OptiFine 互斥：选了它们就把 OptiFine 摘掉。
+    if (choice === 'fabric' || choice === 'neoforge') setOptifineVersion(null);
   };
 
-  const toggleLoaderGroup = (choice: LoaderChoice) => {
-    if (lockedLoader && choice !== 'vanilla' && choice !== lockedLoader) return;
+  /**
+   * 选中/取消 OptiFine。
+   *
+   * - 高版本（1.13+）的 OptiFine 只是 mod，必须有 Forge 兜着：这里顺手把加载器
+   *   切成 Forge（没选过就自动挑推荐版本），否则装出来的东西根本起不来；
+   * - 低版本可以单独装，但如果当前选的是 Fabric / NeoForge，就退回原版
+   *   （那两家装不了 OptiFine）。
+   */
+  const chooseOptifine = (version: string | null) => {
+    if (!version || version === optifineVersion) {
+      setOptifineVersion(null);
+      return;
+    }
+    setOptifineVersion(version);
+    setExpandedLoaders((prev) => ({ ...prev, optifine: true }));
+    const modern = isModernOptifine(selected?.id);
+    if (modern) {
+      if (loaderChoice !== 'forge') {
+        const fallback =
+          forgeData?.recommended ?? forgeData?.versions[0]?.version ?? null;
+        setLoaderChoice('forge');
+        setLoaderVersion(fallback);
+        setExpandedLoaders((prev) => ({ ...prev, optifine: true, forge: true }));
+      }
+    } else if (loaderChoice === 'fabric' || loaderChoice === 'neoforge') {
+      setLoaderChoice('vanilla');
+      setLoaderVersion(null);
+    }
+  };
+
+  const toggleLoaderGroup = (choice: LoaderChoice | 'optifine') => {
+    if (lockedLoader && choice !== 'vanilla' && choice !== lockedLoader && choice !== 'optifine') return;
     setExpandedLoaders((prev) => ({ ...prev, [choice]: !prev[choice] }));
   };
 
@@ -614,12 +678,14 @@ export function InstallWizard() {
             : loaderChoice === 'forge'
               ? { kind: 'forge', version: loaderVersion }
               : { kind: 'neoforge', version: loaderVersion };
+      const optifine = optifineVersion ? splitOptifineVersion(optifineVersion) : null;
       await getBridge().invoke<InstallQueued>('versions_install', {
         rootId: activeRoot.id,
         gameVersion: selected.id,
         versionName: name.trim(),
         loader,
         installFabricApi: loaderChoice === 'fabric' && fabricApi,
+        optifine,
       });
       closeInstall();
       showToast(`已加入下载队列：${name.trim()}`);
@@ -632,11 +698,20 @@ export function InstallWizard() {
     }
   };
 
+  // 高版本 OptiFine 必须挂在 Forge 上：选了 OptiFine 但加载器不是 Forge 就不让下一步。
+  const optifineNeedsForge =
+    Boolean(optifineVersion) &&
+    isModernOptifine(selected?.id) &&
+    !(loaderChoice === 'forge' && Boolean(loaderVersion));
+
   const canNext =
     step === 1
       ? Boolean(selected)
       : step === 2
-        ? Boolean(name.trim()) && !nameError && (loaderChoice === 'vanilla' || Boolean(loaderVersion))
+        ? Boolean(name.trim()) &&
+          !nameError &&
+          (loaderChoice === 'vanilla' || Boolean(loaderVersion)) &&
+          !optifineNeedsForge
         : true;
 
   const selectedIcon = versionIcon(selected, loaderChoice);
@@ -856,7 +931,10 @@ export function InstallWizard() {
               {(['fabric', 'forge', 'neoforge'] as const).map((choice) => {
                 const data =
                   choice === 'fabric' ? fabricData : choice === 'forge' ? forgeData : neoData;
-                const disabled = Boolean(lockedLoader && lockedLoader !== choice);
+                // OptiFine 和 Fabric / NeoForge 互斥（那两个加载器不支持 OptiFine）。
+                const blockedByOptifine =
+                  Boolean(optifineVersion) && (choice === 'fabric' || choice === 'neoforge');
+                const disabled = Boolean(lockedLoader && lockedLoader !== choice) || blockedByOptifine;
                 const openGroup = !disabled && expandedLoaders[choice];
                 return (
                   <section
@@ -947,7 +1025,79 @@ export function InstallWizard() {
                   </section>
                 );
               })}
+
+              {/* OptiFine：不是加载器，而是"加载器之外再加一层"。 */}
+              {(() => {
+                const modern = isModernOptifine(selected?.id);
+                // 选了 Fabric / NeoForge 就不能再选 OptiFine（它们不兼容）。
+                const blockedByLoader = loaderChoice === 'fabric' || loaderChoice === 'neoforge';
+                const disabled = blockedByLoader || Boolean(lockedLoader && lockedLoader !== 'forge');
+                const openGroup = !disabled && expandedLoaders.optifine;
+                const count = optifineData?.versions.length ?? 0;
+                return (
+                  <section
+                    className={cx(
+                      'rounded-[8px] border border-line bg-layer2/25',
+                      disabled && 'opacity-45',
+                    )}
+                  >
+                    <GroupHeader
+                      title="OptiFine"
+                      hint={modern ? '光影前置 · 需配合 Forge' : '光影前置 · 可单独安装'}
+                      count={count}
+                      open={openGroup}
+                      disabled={disabled}
+                      onToggle={() => toggleLoaderGroup('optifine')}
+                    />
+                    <Collapse open={Boolean(openGroup)}>
+                      <div className="px-1.5 pb-1.5">
+                        {loadingLoaders && !optifineData ? (
+                          <div className="flex items-center gap-2 px-2 py-3 text-[10.5px] text-ink4">
+                            <Loader2 size={12} className="animate-spin" />
+                            正在读取 OptiFine 版本…
+                          </div>
+                        ) : optifineData && optifineData.versions.length > 0 ? (
+                          <div className="max-h-[190px] space-y-0.5 overflow-y-auto">
+                            {optifineData.versions.map((item) => (
+                              <LoaderRow
+                                key={item.version}
+                                icon={LOADER_ICONS.optifine}
+                                title={item.version}
+                                subtitle={item.stable ? '正式版' : '预览版'}
+                                recommended={item.recommended}
+                                selected={optifineVersion === item.version}
+                                onSelect={() => chooseOptifine(item.version)}
+                              />
+                            ))}
+                          </div>
+                        ) : (
+                          <p className="px-2 py-3 text-[10.5px] text-ink4">
+                            该游戏版本没有可用的 OptiFine。
+                          </p>
+                        )}
+                      </div>
+                    </Collapse>
+                    {optifineVersion ? (
+                      <p className="mx-1.5 mb-1.5 rounded-[6px] border border-line bg-layer1/70 px-2 py-1.5 text-[9.5px] leading-[14px] text-ink4">
+                        {modern
+                          ? 'OptiFine 会放进版本的 mods/ 目录，和 Forge 一起生效。'
+                          : 'OptiFine 会作为独立版本安装（launchwrapper + OptiFineTweaker）。'}
+                      </p>
+                    ) : null}
+                    {blockedByLoader ? (
+                      <p className="mx-1.5 mb-1.5 text-[9.5px] leading-[14px] text-amber">
+                        Fabric / NeoForge 不支持 OptiFine；改选 Forge 或原版后可用。
+                      </p>
+                    ) : null}
+                  </section>
+                );
+              })()}
             </div>
+            {optifineNeedsForge ? (
+              <p className="mt-2 text-[10.5px] leading-[15px] text-amber">
+                {selected?.id} 的 OptiFine 必须和 Forge 一起安装，请在上方选择一个 Forge 版本。
+              </p>
+            ) : null}
             {loaderError ? (
               <p className="mt-2 text-[10.5px] leading-[15px] text-amber">{loaderError}</p>
             ) : null}
@@ -1017,6 +1167,15 @@ export function InstallWizard() {
                         ? `安装 ${fabricApiInfo.version}`
                         : '安装（读取中）'
                       : '不安装'}
+                  </dd>
+                </div>
+              ) : null}
+              {optifineVersion ? (
+                <div className="flex justify-between gap-3">
+                  <dt className="text-ink4">OptiFine</dt>
+                  <dd className="text-ink2">
+                    {optifineVersion}
+                    {isModernOptifine(selected?.id) ? '（放进 mods/，配合 Forge）' : '（独立版本）'}
                   </dd>
                 </div>
               ) : null}

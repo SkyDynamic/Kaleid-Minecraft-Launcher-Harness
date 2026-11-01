@@ -285,7 +285,7 @@ const REMOTE_VERSIONS: RemoteVersion[] = [
 
 function mockLoaders(
   gameVersion: string,
-  loader: 'fabric' | 'forge' | 'neoforge',
+  loader: 'fabric' | 'forge' | 'neoforge' | 'optifine',
 ): LoaderVersions {
   const fabric = [
     { version: '0.19.2', stable: true, recommended: true, time: 'Tue, 24 Mar 2026 12:00:00 GMT' },
@@ -330,7 +330,28 @@ function mockLoaders(
                 { version: '26.1.2.124', stable: true, recommended: false, time: null },
                 { version: '26.2.0.8-beta', stable: false, recommended: false, time: null },
               ];
-  const versions = loader === 'fabric' ? fabric : loader === 'forge' ? forge : neoforge;
+  // OptiFine 的版本号是 `HD_U_J3` 这种形状，BMCLAPI 给的列表由旧到新，
+  // 宿主那边会翻成由新到旧，这里直接按新到旧写。
+  const optifine =
+    gameVersion === '1.12.2'
+      ? [
+          { version: 'HD_U_G5', stable: true, recommended: true, time: null },
+          { version: 'HD_U_F5', stable: true, recommended: false, time: null },
+          { version: 'HD_U_E2', stable: true, recommended: false, time: null },
+        ]
+      : [
+          { version: 'HD_U_J3', stable: true, recommended: true, time: null },
+          { version: 'HD_U_J2', stable: true, recommended: false, time: null },
+          { version: 'HD_U_J4_pre1', stable: false, recommended: false, time: null },
+        ];
+  const versions =
+    loader === 'fabric'
+      ? fabric
+      : loader === 'forge'
+        ? forge
+        : loader === 'optifine'
+          ? optifine
+          : neoforge;
   return {
     gameVersion,
     loader,
@@ -1038,6 +1059,9 @@ function launchMainClass(loader: LoaderKind): string {
       return 'net.minecraftforge.bootstrap.ForgeBootstrap';
     case 'neoforge':
       return 'cpw.mods.bootstraplauncher.BootstrapLauncher';
+    // 低版本单装 OptiFine 走 launchwrapper + OptiFineTweaker。
+    case 'optifine':
+      return 'net.minecraft.launchwrapper.Launch';
     default:
       return 'net.minecraft.client.main.Main';
   }
@@ -1511,7 +1535,7 @@ async function dispatch(cmd: string, args?: unknown): Promise<unknown> {
 
     case 'loaders_versions': {
       const gameVersion = String(arg<string>(args, 'gameVersion'));
-      const loader = arg<'fabric' | 'forge' | 'neoforge'>(args, 'loader') ?? 'fabric';
+      const loader = arg<'fabric' | 'forge' | 'neoforge' | 'optifine'>(args, 'loader') ?? 'fabric';
       return mockLoaders(gameVersion, loader);
     }
 

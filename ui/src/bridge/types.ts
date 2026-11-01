@@ -17,7 +17,7 @@ export interface Root {
   lastUsed: string | null;
 }
 
-export type LoaderKind = 'vanilla' | 'fabric' | 'forge' | 'neoforge' | 'unrecognized';
+export type LoaderKind = 'vanilla' | 'fabric' | 'forge' | 'neoforge' | 'optifine' | 'unrecognized';
 
 export interface RemoteVersion {
   id: string;
@@ -76,12 +76,22 @@ export type InstallLoader =
   | { kind: 'forge'; version: string }
   | { kind: 'neoforge'; version: string };
 
+/**
+ * OptiFine 的版本指认：`kind` 是 `HD_U`，`patch` 是 `J3`，拼起来就是 `HD_U_J3`。
+ * 它是「加载器之外再加一层」的东西：高版本要挂在 Forge 上，低版本可以单装。
+ */
+export interface OptifineRef {
+  kind: string;
+  patch: string;
+}
+
 export interface InstallRequest {
   rootId: string;
   gameVersion: string;
   versionName: string;
   loader: InstallLoader;
   installFabricApi: boolean;
+  optifine?: OptifineRef | null;
 }
 
 export interface InstallQueued {

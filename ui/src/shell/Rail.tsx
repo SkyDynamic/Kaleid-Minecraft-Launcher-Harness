@@ -38,6 +38,8 @@ const LOADER_GROUPS: Array<{ kind: LoaderKind; label: string }> = [
   { kind: 'fabric', label: 'Fabric' },
   { kind: 'forge', label: 'Forge' },
   { kind: 'neoforge', label: 'NeoForge' },
+  // 只有低版本单装 OptiFine 会落到这一组；配合 Forge 的仍归在 Forge 下。
+  { kind: 'optifine', label: 'OptiFine' },
   { kind: 'unrecognized', label: '未识别' },
 ];
 

@@ -24,7 +24,9 @@ function loaderLabel(version: VersionSummary | null): string | null {
           ? 'Forge'
           : version.loader === 'neoforge'
             ? 'NeoForge'
-            : '未识别';
+            : version.loader === 'optifine'
+              ? 'OptiFine'
+              : '未识别';
   return version.loaderVersion ? `${base} ${version.loaderVersion}` : base;
 }
 

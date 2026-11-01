@@ -5,6 +5,7 @@ import goldBlock from '../assets/versions/gold-block.png';
 import fabricIcon from '../assets/loaders/fabric.png';
 import forgeIcon from '../assets/loaders/forge.png';
 import neoforgeIcon from '../assets/loaders/neoforge.png';
+import optifineIcon from '../assets/loaders/optifine.svg';
 import steveSkin from '../assets/skins/steve-classic-64x64.png';
 import alexSkin from '../assets/skins/alex-slim-64x64.png';
 
@@ -20,6 +21,8 @@ export const LOADER_ICONS = {
   fabric: fabricIcon,
   forge: forgeIcon,
   neoforge: neoforgeIcon,
+  /** 自绘的镜片图标（官方没有可再分发的商标图）。 */
+  optifine: optifineIcon,
 } as const;
 
 /** 内置的 Mojang 官方经典 Steve 皮肤；远端官方纹理加载失败时兜底。 */
