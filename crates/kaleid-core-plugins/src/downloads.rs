@@ -18,6 +18,7 @@ use kaleid_api::{
 
 use crate::hostlimit::{HostLimits, HostState};
 use crate::settings::Settings;
+use crate::urlcache::UrlCache;
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
 
@@ -541,6 +542,12 @@ pub struct DownloadManager {
     connections: Arc<AtomicUsize>,
     /// 按主机记账的并发上限与 AIMD 降速（见 [`crate::hostlimit`]）。
     limits: Arc<HostLimits>,
+    /// 镜像重定向终点缓存（见 [`crate::urlcache`]）。
+    ///
+    /// BMCLAPI 是重定向服务：`/assets/<p>/<h>` 会跳到国内节点，`/version/<id>/client`
+    /// 却跳回官方。记住终点有两点好处：分段连接直接打终点（不再每条连接都吃一次
+    /// 配额），以及能判断"走镜像其实等于走官方"。
+    cache: Arc<UrlCache>,
 }
 
 impl DownloadManager {
@@ -557,7 +564,14 @@ impl DownloadManager {
             last_snapshot: Arc::new(Mutex::new((Instant::now(), 0))),
             connections: Arc::new(AtomicUsize::new(0)),
             limits: Arc::new(HostLimits::for_concurrency(concurrency)),
+            cache: Arc::new(UrlCache::in_memory()),
         }
+    }
+
+    /// 把重定向缓存落到 `<data_root>/download-cache`，跨进程复用（TTL 6 小时）。
+    pub fn with_data_root(mut self, data_root: &Path) -> Self {
+        self.cache = Arc::new(UrlCache::open(&data_root.join("download-cache")));
+        self
     }
 
     /// 读一下各主机的记账状态（诊断/界面用）。
@@ -679,10 +693,11 @@ impl DownloadManager {
         let agent = self.agent.clone();
         let connections = self.connections.clone();
         let limits = self.limits.clone();
+        let cache = self.cache.clone();
         thread::Builder::new()
             .name("kaleid-download-sched".into())
             .spawn(move || {
-                let result = drive_session(job, executor, agent, connections, limits, cmd_rx);
+                let result = drive_session(job, executor, agent, connections, limits, cache, cmd_rx);
                 let _ = result_tx.send(result);
             })
             .expect("无法创建下载调度线程");
@@ -791,6 +806,7 @@ fn drive_session(
     agent: Arc<ureq::Agent>,
     connections: Arc<AtomicUsize>,
     limits: Arc<HostLimits>,
+    cache: Arc<UrlCache>,
     cmd_rx: Receiver<SessionCmd>,
 ) -> Result<(), String> {
     job.reset_speed_window();
@@ -821,7 +837,14 @@ fn drive_session(
             while let Ok(cmd) = cmd_rx.try_recv() {
                 match cmd {
                     SessionCmd::Push(item) => {
-                        files.push(accept_file(&job, item, next_id, executor.concurrency()));
+                        files.push(accept_file(
+                            &job,
+                            item,
+                            next_id,
+                            executor.concurrency(),
+                            &cache,
+                            &limits,
+                        ));
                         next_id += 1;
                     }
                     SessionCmd::Close => closed = true,
@@ -832,6 +855,7 @@ fn drive_session(
                 &executor,
                 &agent,
                 &connections,
+                &limits,
                 &done_tx,
                 &mut files,
             );
@@ -857,7 +881,14 @@ fn drive_session(
                     if let Ok(cmd) = cmd {
                         match cmd {
                             SessionCmd::Push(item) => {
-                                files.push(accept_file(&job, item, next_id, executor.concurrency()));
+                                files.push(accept_file(
+                                    &job,
+                                    item,
+                                    next_id,
+                                    executor.concurrency(),
+                                    &cache,
+                                    &limits,
+                                ));
                                 next_id += 1;
                             }
                             SessionCmd::Close => closed = true,
@@ -891,7 +922,116 @@ fn drive_session(
     result
 }
 
-fn accept_file(job: &Arc<Job>, item: DownloadItem, id: u64, desired: usize) -> LiveFile {
+/// 决定一个文件按什么顺序试哪些地址。
+///
+/// 显式策略（官方优先 / 镜像优先 / 仅官方 / 仅镜像）完全照用户说的办，只额外做一件
+/// 无害的事：把镜像地址换成它的**终点**，这样分段连接不必每条都吃一次重定向配额。
+///
+/// `auto` 才做"看情况挑"：解析镜像到底会去哪——
+/// - 终点就是官方主机（实测 `/version/<id>/client` 会跳回 piston-data）：那就直接用
+///   官方地址，省掉一次配额和一次跳转；
+/// - 终点是别的节点（实测 `/assets/<p>/<h>` 跳到国内节点）：用那个节点，分段直连；
+/// - 镜像主机正在冷却（刚被限流过）：先走官方。
+fn plan_urls(
+    job: &Arc<Job>,
+    item: &DownloadItem,
+    cache: &UrlCache,
+    limits: &HostLimits,
+) -> Vec<String> {
+    // 注意看的是**策略**而不是 `job.source()`：后者是"现在实际在用哪一侧"
+    // （mojang / bmclapi），会被慢速监控改写。
+    let policy = job.policy().trim_start_matches("mod-").to_string();
+    let auto = policy == kaleid_api::DOWNLOAD_SOURCE_AUTO;
+    let current_source = job.source();
+    // 自动模式在 `ordered_urls` 里按"镜像优先"起步；解析完之后再决定要不要翻到官方。
+    let effective_policy = if auto {
+        kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
+    } else {
+        job.policy()
+    };
+    let base = ordered_urls(
+        item.official_url.as_deref(),
+        item.mirror_url.as_deref(),
+        item.fallback_url.as_deref(),
+        if auto {
+            kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
+        } else {
+            current_source.as_str()
+        },
+        effective_policy,
+        item.prefer_mirror,
+    );
+    // 只有"要分段下载的大文件"才值得解析终点。
+    //
+    // 解析一次就是一次请求，而一个原版安装有 4000 多个资源文件——给它们每个都发一条
+    // HEAD 只会把配额翻倍，换来的信息（终点是谁）对小文件毫无价值。大文件不同：
+    // 8 条分段连接若各自跟一次重定向就是 8 次配额，解析一次才划算。
+    if item.size < SEGMENT_THRESHOLD_BYTES {
+        return base;
+    }
+    let Some(mirror) = item.mirror_url.as_deref() else {
+        return base;
+    };
+    let resolved = cache.resolve(mirror);
+    let mirror_final = resolved.final_url.clone();
+
+    let mut urls: Vec<String> = Vec::with_capacity(3);
+    if auto {
+        // 镜像的终点和官方是同一台机器：再走镜像只是多一次跳转、多一次配额。
+        let mirror_is_official = item
+            .official_url
+            .as_deref()
+            .map(|official| cache.resolve(official).host == resolved.host)
+            .unwrap_or(false);
+        let cooling = limits.cooling_down(&resolved.host);
+        if mirror_is_official || cooling {
+            if let Some(official) = item.official_url.as_deref() {
+                urls.push(official.to_string());
+            }
+            if !urls.iter().any(|url| url == &mirror_final) {
+                urls.push(mirror_final.clone());
+            }
+        } else {
+            urls.push(mirror_final.clone());
+            if let Some(official) = item.official_url.as_deref() {
+                if !urls.iter().any(|url| url == official) {
+                    urls.push(official.to_string());
+                }
+            }
+        }
+    } else {
+        // 显式策略：只把"原本就打算走的镜像"换成终点，顺序一个字都不改。
+        for url in base {
+            if url == mirror && mirror_final != mirror {
+                urls.push(mirror_final.clone());
+            } else {
+                urls.push(url);
+            }
+        }
+    }
+    if let Some(fallback) = item.fallback_url.as_deref() {
+        if !urls.iter().any(|url| url == fallback) {
+            urls.push(fallback.to_string());
+        }
+    }
+    // 去重：终点可能和另一个候选撞上（镜像跳官方时就是如此）。
+    let mut seen: Vec<String> = Vec::with_capacity(urls.len());
+    for url in urls {
+        if !seen.iter().any(|kept| kept == &url) {
+            seen.push(url);
+        }
+    }
+    seen
+}
+
+fn accept_file(
+    job: &Arc<Job>,
+    item: DownloadItem,
+    id: u64,
+    desired: usize,
+    cache: &UrlCache,
+    limits: &HostLimits,
+) -> LiveFile {
     if let Some(parent) = item.dest.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
@@ -907,14 +1047,7 @@ fn accept_file(job: &Arc<Job>, item: DownloadItem, id: u64, desired: usize) -> L
             finished = true;
         }
     }
-    let urls = ordered_urls(
-        item.official_url.as_deref(),
-        item.mirror_url.as_deref(),
-        item.fallback_url.as_deref(),
-        &job.source(),
-        job.policy(),
-        item.prefer_mirror,
-    );
+    let urls = plan_urls(job, &item, cache, limits);
     let size = item.size;
     let multi = !finished && size >= SEGMENT_THRESHOLD_BYTES && desired >= 2;
     let mut unassigned = VecDeque::new();
@@ -945,6 +1078,7 @@ fn assign_work(
     executor: &Arc<Executor>,
     agent: &Arc<ureq::Agent>,
     connections: &Arc<AtomicUsize>,
+    limits: &Arc<HostLimits>,
     done_tx: &Sender<WorkReport>,
     files: &mut [LiveFile],
 ) {
@@ -990,7 +1124,16 @@ fn assign_work(
             break;
         }
         let take = deficit.min(slots);
-        let started = start_file_work(job, executor, agent, done_tx, &mut files[index], take, desired);
+        let started = start_file_work(
+            job,
+            executor,
+            agent,
+            limits,
+            done_tx,
+            &mut files[index],
+            take,
+            desired,
+        );
         if started < take {
             connections.fetch_sub(take - started, Ordering::SeqCst);
         }
@@ -1002,6 +1145,7 @@ fn start_file_work(
     job: &Arc<Job>,
     executor: &Arc<Executor>,
     agent: &Arc<ureq::Agent>,
+    limits: &Arc<HostLimits>,
     done_tx: &Sender<WorkReport>,
     file: &mut LiveFile,
     take: usize,
@@ -1016,10 +1160,17 @@ fn start_file_work(
     if file.url_index > 0 {
         job.switch_to_mirror("官方源下载失败，已尝试镜像");
     }
+    // 按主机记账：BMCLAPI 只给我们 10 次/分钟的短时配额，硬开 8 条连接只会换来 429。
+    let host = crate::urlcache::host_of(&url);
     if file.multi_active() {
         let ranges = claim_ranges(&mut file.unassigned, take, budget.max(2));
         let mut started = 0usize;
         for range in ranges {
+            if limits.try_acquire(&host).is_err() {
+                // 这台主机暂时不让连：区间放回去，下一轮再看。
+                file.unassigned.push_front(range);
+                break;
+            }
             let agent = agent.clone();
             let job = job.clone();
             let item = file.item.clone();
@@ -1027,8 +1178,15 @@ fn start_file_work(
             let url = url.clone();
             let id = file.id;
             let task_job = job.clone();
+            let limits = limits.clone();
+            let task_host = host.clone();
             executor.submit(Box::new(move || {
                 let report = run_range(&agent, &task_job, &item, &url, range, id);
+                let ok = matches!(report, WorkReport::RangeOk(..));
+                limits.release(&task_host);
+                if ok {
+                    limits.note_ok(&task_host);
+                }
                 let _ = done_tx.send(report);
             }));
             file.inflight += 1;
@@ -1044,6 +1202,9 @@ fn start_file_work(
     if file.single_started || file.inflight > 0 {
         return 0;
     }
+    if limits.try_acquire(&host).is_err() {
+        return 0;
+    }
     let agent = agent.clone();
     let job = job.clone();
     let item = file.item.clone();
@@ -1051,6 +1212,8 @@ fn start_file_work(
     let id = file.id;
     let discover = item.size == 0;
     let task_job = job.clone();
+    let limits = limits.clone();
+    let task_host = host.clone();
     executor.submit(Box::new(move || {
         let report = if discover {
             match discover_size(&agent, &task_job, &url) {
@@ -1063,6 +1226,11 @@ fn start_file_work(
         } else {
             run_single(&agent, &task_job, &item, &url, id)
         };
+        let ok = matches!(report, WorkReport::SingleOk(_) | WorkReport::DiscoveredSize(..));
+        limits.release(&task_host);
+        if ok {
+            limits.note_ok(&task_host);
+        }
         let _ = done_tx.send(report);
     }));
     file.inflight = 1;
@@ -1268,7 +1436,13 @@ fn note_throttled(
         .get(file.url_index)
         .cloned()
         .unwrap_or_default();
-    limits.note_throttled(&crate::urlcache::host_of(&url), None);
+    // 冷却只给一个很短的提示值：真正让这台主机慢下来的是"预算减半"，而同一个文件
+    // 的下一轮重试本来就要在 `fetch_one` 里按自己的退避表等——两边叠加只会让用户
+    // 白等。3 秒的默认冷却在这里会变成"每个文件多等 3 秒 × 3 轮"。
+    limits.note_throttled(
+        &crate::urlcache::host_of(&url),
+        Some(crate::hostlimit::RETRY_HINT_MS),
+    );
     if file.throttle_rounds < MAX_THROTTLE_ROUNDS {
         file.throttle_rounds += 1;
         job.set_current(format!(
@@ -2160,6 +2334,157 @@ fn fetch_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn plan_job(source: &str) -> Arc<Job> {
+        Job::new(
+            "plan".into(),
+            "t".into(),
+            "v".into(),
+            "r".into(),
+            "1.21.4".into(),
+            LoaderKind::Vanilla,
+            None,
+            source.into(),
+        )
+    }
+
+    fn plan_item(size: u64) -> DownloadItem {
+        DownloadItem {
+            label: "客户端".into(),
+            phase: "client".into(),
+            official_url: Some("https://piston-data.mojang.com/v1/objects/abc/client.jar".into()),
+            mirror_url: Some("https://bmclapi2.bangbang93.com/version/1.21.4/client".into()),
+            fallback_url: None,
+            prefer_mirror: false,
+            dest: PathBuf::from("client.jar"),
+            size,
+            sha1: None,
+        }
+    }
+
+    fn seeded_cache(mirror_final: &str) -> UrlCache {
+        let cache = UrlCache::in_memory();
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        cache.put(
+            "https://bmclapi2.bangbang93.com/version/1.21.4/client",
+            crate::urlcache::Resolved {
+                final_url: mirror_final.to_string(),
+                hops: 2,
+                host: crate::urlcache::host_of(mirror_final),
+                at,
+            },
+        );
+        cache
+    }
+
+    #[test]
+    fn auto_source_drops_the_mirror_when_it_only_redirects_to_official() {
+        // 实测：/version/<id>/client 最终 302 回 piston-data。走镜像等于多花一次配额。
+        let cache = seeded_cache(
+            "https://piston-data.mojang.com/v1/objects/abc/client.jar",
+        );
+        let limits = HostLimits::for_concurrency(8);
+        let urls = plan_urls(
+            &plan_job(kaleid_api::DOWNLOAD_SOURCE_AUTO),
+            &plan_item(28 * 1024 * 1024),
+            &cache,
+            &limits,
+        );
+        assert_eq!(
+            urls,
+            vec!["https://piston-data.mojang.com/v1/objects/abc/client.jar".to_string()],
+            "镜像只是把同一份文件转给官方时，应当直接用官方地址（并去重）"
+        );
+    }
+
+    #[test]
+    fn auto_source_uses_the_mirror_node_when_it_ends_elsewhere() {
+        // 实测：/assets/<p>/<h> 会跳到国内节点，这时候镜像才真的有用。
+        let cache = seeded_cache("https://bmclapi22.sakura.sld.tw/download/abc");
+        let limits = HostLimits::for_concurrency(8);
+        let urls = plan_urls(
+            &plan_job(kaleid_api::DOWNLOAD_SOURCE_AUTO),
+            &plan_item(28 * 1024 * 1024),
+            &cache,
+            &limits,
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://bmclapi22.sakura.sld.tw/download/abc".to_string(),
+                "https://piston-data.mojang.com/v1/objects/abc/client.jar".to_string(),
+            ],
+            "分段连接应当直接打镜像的终点，官方做兜底"
+        );
+    }
+
+    #[test]
+    fn small_files_skip_url_resolution_entirely() {
+        // 4000 个资源文件每个都发一条 HEAD 只会把配额翻倍，所以小文件不解析。
+        let cache = seeded_cache("https://bmclapi22.sakura.sld.tw/download/abc");
+        let limits = HostLimits::for_concurrency(8);
+        let urls = plan_urls(
+            &plan_job(kaleid_api::DOWNLOAD_SOURCE_AUTO),
+            &plan_item(4096),
+            &cache,
+            &limits,
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://bmclapi2.bangbang93.com/version/1.21.4/client".to_string(),
+                "https://piston-data.mojang.com/v1/objects/abc/client.jar".to_string(),
+            ],
+            "小文件保持原样的镜像优先顺序"
+        );
+    }
+
+    #[test]
+    fn explicit_source_keeps_its_order_but_uses_the_resolved_node() {
+        let cache = seeded_cache("https://bmclapi22.sakura.sld.tw/download/abc");
+        let limits = HostLimits::for_concurrency(8);
+        let urls = plan_urls(
+            &plan_job(kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST),
+            &plan_item(28 * 1024 * 1024),
+            &cache,
+            &limits,
+        );
+        assert_eq!(
+            urls,
+            vec![
+                "https://bmclapi22.sakura.sld.tw/download/abc".to_string(),
+                "https://piston-data.mojang.com/v1/objects/abc/client.jar".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn throttled_mirror_host_sends_auto_traffic_to_official_first() {
+        let cache = seeded_cache("https://bmclapi22.sakura.sld.tw/download/abc");
+        let limits = HostLimits::for_concurrency(8);
+        // 假装镜像节点刚被限流、要冷却一分钟。
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        limits.note_throttled_at("bmclapi22.sakura.sld.tw", Some(60_000), now);
+        assert!(limits.cooling_down("bmclapi22.sakura.sld.tw"));
+
+        let urls = plan_urls(
+            &plan_job(kaleid_api::DOWNLOAD_SOURCE_AUTO),
+            &plan_item(28 * 1024 * 1024),
+            &cache,
+            &limits,
+        );
+        assert_eq!(
+            urls.first().map(String::as_str),
+            Some("https://piston-data.mojang.com/v1/objects/abc/client.jar"),
+            "镜像正在冷却时应当先走官方，别明知会被挡还硬撞"
+        );
+    }
 
     #[test]
     fn url_order_follows_source_and_policy() {

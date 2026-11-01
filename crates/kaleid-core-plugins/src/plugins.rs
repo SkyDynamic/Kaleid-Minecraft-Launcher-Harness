@@ -307,7 +307,10 @@ impl Plugin for VersionManagerPlugin {
         let settings = ctx.service::<Settings>().ok_or("settings 服务不可用")?;
         let versions = ctx.service::<VersionStore>().ok_or("versions 服务不可用")?;
         let roots = ctx.service::<RootRegistry>().ok_or("roots 服务不可用")?;
-        let downloads = Arc::new(DownloadManager::new(settings.clone()));
+        // 重定向终点缓存放进数据目录：跨进程复用，同一个版本的资源不必反复探测。
+        let downloads = Arc::new(
+            DownloadManager::new(settings.clone()).with_data_root(&self.data_root),
+        );
         let install = Arc::new(InstallService::new(
             settings,
             versions.clone(),

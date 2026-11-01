@@ -283,8 +283,15 @@ fn md5_bytes(input: &[u8]) -> [u8; 16] {
 // 生效配置
 // ---------------------------------------------------------------------------
 
-// 下载源（游戏文件）。四态，语义就是字面意思，不再靠「auto 顺便也切镜像」隐含约定。
+// 下载源（游戏文件）。五态，语义就是字面意思，不再靠「auto 顺便也切镜像」隐含约定。
 
+/// 自动（内置默认）：按"镜像到底会不会真给我们文件"逐文件决定。
+///
+/// 实测（2026-11）BMCLAPI 是**重定向服务**：`/version/<id>/client` 最终 302 回
+/// `piston-data.mojang.com`，走镜像只是多花一次配额；而 `/assets/<p>/<h>` 会跳到
+/// 国内节点，比直连官方快。所以自动模式先解析镜像的终点：
+/// 终点就是官方 → 直接走官方；终点是别的节点 → 走那个节点；镜像主机正被限流 → 先走官方。
+pub const DOWNLOAD_SOURCE_AUTO: &str = "auto";
 /// 官方优先：先走官方源；连续两个慢速窗口（或失败）再换镜像。
 pub const DOWNLOAD_SOURCE_OFFICIAL_FIRST: &str = "official-first";
 /// 镜像优先：先走镜像，失败再回官方源。
@@ -298,7 +305,8 @@ pub const DOWNLOAD_SOURCE_MIRROR_ONLY: &str = "mirror-only";
 pub fn is_valid_download_source(value: &str) -> bool {
     matches!(
         value,
-        DOWNLOAD_SOURCE_OFFICIAL_FIRST
+        DOWNLOAD_SOURCE_AUTO
+            | DOWNLOAD_SOURCE_OFFICIAL_FIRST
             | DOWNLOAD_SOURCE_MIRROR_FIRST
             | DOWNLOAD_SOURCE_OFFICIAL_ONLY
             | DOWNLOAD_SOURCE_MIRROR_ONLY
@@ -306,9 +314,12 @@ pub fn is_valid_download_source(value: &str) -> bool {
 }
 
 /// 把旧版下载源取值折算成新取值（老配置文件里是 `auto` / `mojang` / `bmclapi`）。
+///
+/// 注意 `auto` 现在是一个**真取值**（自动选源），不再折算成"官方优先"；
+/// 空值等于没配置过，也按自动算。
 pub fn normalize_download_source(value: &str) -> String {
     match value.trim() {
-        "" | "auto" => DOWNLOAD_SOURCE_OFFICIAL_FIRST.to_string(),
+        "" | DOWNLOAD_SOURCE_AUTO => DOWNLOAD_SOURCE_AUTO.to_string(),
         "mojang" => DOWNLOAD_SOURCE_OFFICIAL_ONLY.to_string(),
         "bmclapi" => DOWNLOAD_SOURCE_MIRROR_ONLY.to_string(),
         other => other.to_string(),
@@ -509,7 +520,7 @@ fn default_concurrency() -> u32 {
     8
 }
 fn default_source() -> String {
-    DOWNLOAD_SOURCE_OFFICIAL_FIRST.into()
+    DOWNLOAD_SOURCE_AUTO.into()
 }
 fn default_mod_source() -> String {
     crate::mods::MOD_SOURCE_OFFICIAL_FIRST.into()
@@ -946,7 +957,7 @@ mod tests {
         assert_eq!(s.memory_mb, 4096);
         assert!(s.isolation_default, "版本隔离内置默认必须是开启");
         assert_eq!(s.download_concurrency, 8);
-        assert_eq!(s.download_source, DOWNLOAD_SOURCE_OFFICIAL_FIRST);
+        assert_eq!(s.download_source, DOWNLOAD_SOURCE_AUTO);
         assert_eq!(s.mod_source, crate::mods::MOD_SOURCE_OFFICIAL_FIRST);
         assert_eq!(s.mod_description, crate::mods::MOD_DESCRIPTION_ORIGINAL);
         // 用户拍板的三条默认值：标准 G1GC / 高性能显卡开 / 自动中文开
@@ -971,10 +982,8 @@ mod tests {
 
     #[test]
     fn legacy_download_source_values_are_normalized() {
-        assert_eq!(
-            normalize_download_source("auto"),
-            DOWNLOAD_SOURCE_OFFICIAL_FIRST
-        );
+        // `auto` 现在是真取值（自动按文件挑源），不再折算成"官方优先"。
+        assert_eq!(normalize_download_source("auto"), DOWNLOAD_SOURCE_AUTO);
         assert_eq!(
             normalize_download_source("mojang"),
             DOWNLOAD_SOURCE_OFFICIAL_ONLY
@@ -983,17 +992,15 @@ mod tests {
             normalize_download_source("bmclapi"),
             DOWNLOAD_SOURCE_MIRROR_ONLY
         );
-        assert_eq!(
-            normalize_download_source(""),
-            DOWNLOAD_SOURCE_OFFICIAL_FIRST
-        );
+        // 空值 = 没配置过 → 自动。
+        assert_eq!(normalize_download_source(""), DOWNLOAD_SOURCE_AUTO);
         // 新取值原样通过
         assert_eq!(
             normalize_download_source(DOWNLOAD_SOURCE_MIRROR_FIRST),
             DOWNLOAD_SOURCE_MIRROR_FIRST
         );
         assert!(is_valid_download_source(DOWNLOAD_SOURCE_MIRROR_FIRST));
-        assert!(!is_valid_download_source("auto"));
+        assert!(is_valid_download_source(DOWNLOAD_SOURCE_AUTO));
     }
 
     #[test]

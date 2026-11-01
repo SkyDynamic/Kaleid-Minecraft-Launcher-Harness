@@ -190,6 +190,23 @@ impl HostLimits {
         self.inner.lock().unwrap().get(host).cloned()
     }
 
+    /// 这台主机是否正在限流冷却期（只读，不占配额）。
+    ///
+    /// 选源时要用它："镜像刚被限流过就先去官方"——不然明知会被挡还硬撞。
+    pub fn cooling_down(&self, host: &str) -> bool {
+        self.cooling_down_at(host, now_ms())
+    }
+
+    /// [`Self::cooling_down`] 的显式时间版本（测试用）。
+    pub fn cooling_down_at(&self, host: &str, now_ms: u64) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(host)
+            .map(|state| state.cooldown_until_ms > now_ms)
+            .unwrap_or(false)
+    }
+
     fn fresh_state(&self, host: &str) -> HostState {
         let limit = if host.eq_ignore_ascii_case(BMCLAPI_HOST) {
             self.concurrency.min(BMCLAPI_LIMIT)
