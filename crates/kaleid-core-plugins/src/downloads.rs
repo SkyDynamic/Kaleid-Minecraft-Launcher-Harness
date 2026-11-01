@@ -745,15 +745,44 @@ struct LiveFile {
     unassigned: VecDeque<(u64, u64)>,
     inflight: usize,
     size: u64,
+    /// 文件大到值得切段（与服务端是否支持 Range 无关）。
     multi: bool,
-    probed: bool,
-    unsupported: bool,
+    /// 每个地址各自认不认 `Range`。按地址记而不是按文件记，是因为镜像换过去
+    /// 之后能力可能完全不同——旧实现把结果钉在文件上，一换源就永远单线程。
+    capability: HashMap<String, bool>,
     segments: Vec<(u64, u64)>,
     finished: bool,
     failed: Option<String>,
     single_started: bool,
     /// 同一个地址已经被限流过几轮。轮满了才认输换源，避免"限速 = 立刻换源"。
     throttle_rounds: usize,
+    /// 该换源了，但还有连接在跑：等它们收尾再换，免得两份来源的字节混在一起。
+    pending_switch: bool,
+}
+
+impl LiveFile {
+    /// 当前在用的地址。
+    fn current_url(&self) -> Option<&String> {
+        if self.urls.is_empty() {
+            return None;
+        }
+        self.urls.get(self.url_index.min(self.urls.len() - 1))
+    }
+
+    /// 当前地址对 `Range` 的态度：`None` 表示还没试过。
+    fn range_known(&self) -> Option<bool> {
+        self.capability.get(self.current_url()?).copied()
+    }
+
+    /// 现在可以按分段落任务吗。
+    fn multi_active(&self) -> bool {
+        self.multi && self.range_known() != Some(false)
+    }
+
+    /// 大文件但还没探测过 Range：先只放 1 条连接试探。
+    fn needs_probe(&self) -> bool {
+        self.multi && self.range_known().is_none()
+    }
 }
 
 fn drive_session(
@@ -901,13 +930,13 @@ fn accept_file(job: &Arc<Job>, item: DownloadItem, id: u64, desired: usize) -> L
         inflight: 0,
         size,
         multi,
-        probed: !multi,
-        unsupported: false,
+        capability: HashMap::new(),
         segments: Vec::new(),
         finished,
         failed: None,
         single_started: false,
         throttle_rounds: 0,
+        pending_switch: false,
     }
 }
 
@@ -926,9 +955,9 @@ fn assign_work(
     let consumers: Vec<ShareConsumer> = files
         .iter()
         .map(|file| ShareConsumer {
-            remaining_bytes: if file.finished || file.failed.is_some() {
+            remaining_bytes: if file.finished || file.failed.is_some() || file.pending_switch {
                 0
-            } else if file.multi && !file.unsupported {
+            } else if file.multi_active() {
                 file.unassigned.iter().map(|(s, e)| e - s + 1).sum()
             } else if !file.single_started && !file.finished {
                 file.size.max(1)
@@ -936,13 +965,13 @@ fn assign_work(
                 0
             },
             inflight: file.inflight,
-            multi: file.multi && !file.unsupported && file.probed,
+            multi: file.multi_active() && file.range_known() == Some(true),
         })
         .collect();
     // 还没探测 Range 的大文件先只占 1 条，避免服务器不支持分段时把整文件下八遍。
     let mut targets = fair_targets(&consumers, desired);
     for (index, file) in files.iter().enumerate() {
-        if file.multi && !file.probed && !file.unsupported {
+        if file.needs_probe() {
             targets[index] = targets[index].min(file.inflight + 1);
         }
     }
@@ -987,7 +1016,7 @@ fn start_file_work(
     if file.url_index > 0 {
         job.switch_to_mirror("官方源下载失败，已尝试镜像");
     }
-    if file.multi && !file.unsupported {
+    if file.multi_active() {
         let ranges = claim_ranges(&mut file.unassigned, take, budget.max(2));
         let mut started = 0usize;
         for range in ranges {
@@ -1140,12 +1169,14 @@ fn on_report(
             file.item.size = size;
             file.single_started = false;
             file.multi = true;
-            file.probed = false;
             file.unassigned.clear();
             file.unassigned.push_back((0, size - 1));
         }
         WorkReport::RangeOk(_, start, end) => {
-            file.probed = true;
+            // Range 的能力按"当前地址"记：这个地址认 Range 不代表下一个也认。
+            if let Some(url) = file.current_url().cloned() {
+                file.capability.insert(url, true);
+            }
             file.segments.push((start, end));
             let covered = file.unassigned.is_empty() && file.inflight == 0;
             let span = if file.size == 0 {
@@ -1167,9 +1198,11 @@ fn on_report(
             }
         }
         WorkReport::RangeUnsupported(_) => {
-            file.probed = true;
-            file.unsupported = true;
-            file.multi = false;
+            // 只把**这个地址**标成不支持；换源之后还要重新探测一次，
+            // 旧实现把 `multi` 永久钉成 false，于是一换源就永远单线程。
+            if let Some(url) = file.current_url().cloned() {
+                file.capability.insert(url, false);
+            }
             file.unassigned.clear();
             if file.inflight == 0 {
                 discard_segments(job, file);
@@ -1195,9 +1228,20 @@ fn on_report(
             note_throttled(limits, job, file, first_error, &error);
         }
     }
-    if file.unsupported && file.inflight == 0 && !file.finished && file.failed.is_none() {
+    // 当前地址不认 Range：把分段的半成品丢掉，改单流。别的地址的能力记录不受影响。
+    if file.range_known() == Some(false)
+        && file.inflight == 0
+        && !file.finished
+        && file.failed.is_none()
+    {
+        file.unassigned.clear();
         discard_segments(job, file);
         file.single_started = false;
+    }
+    // 换源要等在途连接收尾：新旧来源的字节混在一起，拼出来的文件一定是坏的。
+    if file.pending_switch && file.inflight == 0 && !file.finished && file.failed.is_none() {
+        file.pending_switch = false;
+        switch_url(job, file);
     }
     if file.failed.is_some() && file.inflight == 0 {
         file.finished = true;
@@ -1248,16 +1292,37 @@ fn note_transfer_failure(
         return;
     }
     if file.url_index + 1 < file.urls.len() {
-        file.url_index += 1;
-        file.single_started = false;
         // 换了地址，限流计数也归零：新地址有它自己的脾气。
         file.throttle_rounds = 0;
+        file.single_started = false;
+        if file.inflight == 0 {
+            switch_url(job, file);
+        } else {
+            // 还有连接在跑：等它们收尾。新旧来源的字节不能混在一个文件里。
+            file.pending_switch = true;
+        }
         return;
     }
     if file.inflight == 0 {
         fail_file(job, file, first_error, error);
     } else if file.failed.is_none() {
         file.failed = Some(error);
+    }
+}
+
+/// 换到下一个地址，并从干净状态重来。
+///
+/// "干净"很关键：半个来自官方源的 span 加上半个来自镜像的 span 拼出来的文件
+/// 大小对得上、SHA-1 却一定不对，用户看到的是"校验失败"而不是"换源慢了一点"。
+fn switch_url(job: &Arc<Job>, file: &mut LiveFile) {
+    file.url_index += 1;
+    file.single_started = false;
+    file.throttle_rounds = 0;
+    discard_segments(job, file);
+    file.unassigned.clear();
+    // 新地址以前被证明不支持 Range 就仍然单流；没试过/试过能用就继续分段。
+    if file.multi && file.size > 0 && file.range_known() != Some(false) {
+        file.unassigned.push_back((0, file.size - 1));
     }
 }
 

@@ -37,6 +37,8 @@ enum Mode {
     SlowRange { chunk: usize, delay_ms: u64 },
     /// 前 n 个请求回 429（限流），可以带 `Retry-After`。
     Throttle { times: usize, retry_after: Option<u64> },
+    /// 既不支持 `Range`，整个文件也给不完（发一半就掐）：逼出"换源"。
+    TruncateFull,
 }
 
 struct TestServer {
@@ -146,6 +148,18 @@ fn serve(mut stream: TcpStream, body: &[u8], mode: Mode, index: usize) {
     } else {
         parse_range(&head)
     };
+    if mode == Mode::TruncateFull {
+        // 先按"不支持 Range"回 200（于是客户端会退回单流），再只给一半就断开，
+        // 让单流也失败——这样才逼得它换源。
+        let head_text = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = stream.write_all(head_text.as_bytes());
+        let _ = stream.write_all(&body[..body.len() / 2]);
+        let _ = stream.flush();
+        return;
+    }
     let throttle = match mode {
         Mode::SlowRange { chunk, delay_ms } => Some((chunk, delay_ms)),
         _ => None,
@@ -499,6 +513,45 @@ fn gives_up_on_a_persistently_throttled_source_and_switches() {
     assert!(
         mirror.requests.load(Ordering::SeqCst) >= 1,
         "官方源彻底限流后应当改用镜像"
+    );
+}
+
+#[test]
+fn reprobes_ranges_after_switching_source() {
+    let dir = tempfile::tempdir().unwrap();
+    // 超过 1 MiB 才会尝试分段。
+    let body = body_of(2 * 1024 * 1024 + 5);
+    // 官方源：不认 Range，而且整份文件也给不完 → 必然换源。
+    let official = TestServer::start(body.clone(), Mode::TruncateFull);
+    // 镜像：规矩地支持 Range。
+    let mirror = TestServer::start(body.clone(), Mode::RangeOk);
+    let manager = manager_with_concurrency(dir.path(), 8);
+    let dest = dir.path().join("client.jar");
+
+    manager
+        .run_batch(
+            job("reprobe"),
+            vec![item_with_mirror(
+                "客户端",
+                format!("{}/client.jar", official.base),
+                format!("{}/client.jar", mirror.base),
+                &dest,
+                &body,
+            )],
+        )
+        .expect("官方源不支持 Range 又给不完，应当换到镜像并成功");
+
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+    assert_no_leftovers(&dest);
+    assert!(
+        official.requests.load(Ordering::SeqCst) >= 2,
+        "应当先在官方源上试过分段与单流"
+    );
+    // 回归点：旧实现把"这个文件不支持 Range"钉死，换源之后永远单线程。
+    assert!(
+        mirror.peak.load(Ordering::SeqCst) >= 2,
+        "换源之后必须重新启用分段（镜像实测峰值 {}）",
+        mirror.peak.load(Ordering::SeqCst)
     );
 }
 
