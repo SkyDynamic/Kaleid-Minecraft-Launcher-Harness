@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Plus } from 'lucide-react';
+import { Plus, TriangleAlert } from 'lucide-react';
 import { getBridge } from '../bridge';
 import type { Account, AccountKind, MsaAccountState, MsaConfig } from '../bridge/types';
 import { Button, Card, Label, PillTabs, TextLink } from '../primitives';
@@ -14,7 +14,17 @@ import { useSettings } from '../store/settings';
 import { useUI } from '../store/ui';
 import { cx, formatGb } from '../lib/util';
 
-const OFFLINE_NAME_RE = /^[A-Za-z0-9_]{1,16}$/;
+/**
+ * 离线名允许汉字：原版客户端只拿它算 `OfflinePlayer:<名字>` 的 uuid，本地不校验。
+ * 但服务器侧（正版校验、白名单、部分聊天组件）多半不认，所以输入框下面要挂
+ * 一条黄字警告，别让用户装完才发现进不去服。
+ */
+const OFFLINE_NAME_RE = /^[A-Za-z0-9_\u4e00-\u9fa5]{1,16}$/;
+
+/** 名字里是否含非 ASCII 字符（也就是"用了中文"）。 */
+function hasNonAscii(name: string): boolean {
+  return /[^\x00-\x7f]/.test(name);
+}
 
 function InfoCard({
   label,
@@ -297,8 +307,8 @@ function MsaPanel({ accounts, active }: { accounts: Account[]; active: Account |
 
 function offlineReason(value: string, current: string): string {
   if (value.length === 0) return `名称不能为空；当前仍是 ${current}`;
-  if (value.length > 16) return `最多 16 位字母、数字、下划线；当前仍是 ${current}`;
-  return `只能用 1–16 位字母、数字、下划线；当前仍是 ${current}`;
+  if ([...value].length > 16) return `最多 16 位字母、数字、下划线或汉字；当前仍是 ${current}`;
+  return `只能用 1–16 位字母、数字、下划线或汉字；当前仍是 ${current}`;
 }
 
 function OfflinePanel({ accounts }: { accounts: Account[] }) {
@@ -392,6 +402,15 @@ function OfflinePanel({ accounts }: { accounts: Account[] }) {
             </>
           )}
         </div>
+
+        {valid && hasNonAscii(value) ? (
+          <div className="mt-1.5 flex items-start gap-1.5 rounded-[7px] border border-amber/30 bg-amber/10 px-2.5 py-1.5 text-left text-[10.5px] leading-[15px] text-amber">
+            <TriangleAlert size={12} className="mt-[1.5px] shrink-0" />
+            <span>
+              原则上Minecraft任何版本都不接受使用中文ID，若出现问题后果自负
+            </span>
+          </div>
+        ) : null}
       </div>
     </div>
   );

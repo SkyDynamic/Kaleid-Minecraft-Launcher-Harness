@@ -223,8 +223,13 @@ fn default_skin_model() -> String {
     "default".to_string()
 }
 
-/// 离线档案名字规则：1–16 位，仅 `[A-Za-z0-9_]`。
-pub const OFFLINE_NAME_PATTERN: &str = "^[A-Za-z0-9_]{1,16}$";
+/// 离线档案名字规则：1–16 位，字母、数字、下划线或汉字。
+///
+/// 汉字是**故意放开**的：原版客户端只把名字拿去拼 `OfflinePlayer:<name>` 算
+/// uuid，本地正版校验根本不存在，所以中文名在离线启动里能用。但服务器端
+/// （尤其是正版校验插件 / 白名单 / 部分聊天组件）大概率不接受，界面必须
+/// 挂一条黄字警告，把后果讲在前面。
+pub const OFFLINE_NAME_PATTERN: &str = "^[A-Za-z0-9_\\u4e00-\\u9fa5]{1,16}$";
 
 /// 校验离线游戏名。
 pub fn validate_offline_name(name: &str) -> ApiResult<()> {
@@ -235,8 +240,11 @@ pub fn validate_offline_name(name: &str) -> ApiResult<()> {
     if len > 16 {
         return Err(ApiError::invalid("名字最多 16 位"));
     }
-    if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return Err(ApiError::invalid("只能用字母、数字、下划线"));
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '_' || ('\u{4e00}'..='\u{9fa5}').contains(&c))
+    {
+        return Err(ApiError::invalid("只能用字母、数字、下划线或汉字"));
     }
     Ok(())
 }
@@ -887,9 +895,16 @@ mod tests {
         assert!(validate_offline_name("a".repeat(16).as_str()).is_ok());
         assert!(validate_offline_name("").is_err());
         assert!(validate_offline_name(&"a".repeat(17)).is_err());
-        assert!(validate_offline_name("玩家名").is_err());
+        // 汉字放开：离线启动本身不校验，但服务器侧可能不认（界面会挂警告）。
+        assert!(validate_offline_name("玩家名").is_ok());
+        assert!(validate_offline_name("中文名ABC_1").is_ok());
+        assert!(validate_offline_name(&"玩".repeat(16)).is_ok());
+        assert!(validate_offline_name(&"玩".repeat(17)).is_err());
         assert!(validate_offline_name("bad name").is_err());
         assert!(validate_offline_name("bad-name").is_err());
+        assert!(validate_offline_name("名字 空格").is_err());
+        assert!(validate_offline_name("ひらがな").is_err(), "只放开汉字");
+        assert!(validate_offline_name("名字!").is_err());
     }
 
     #[test]

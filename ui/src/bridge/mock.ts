@@ -42,8 +42,9 @@ const clone = <T,>(value: T): T => structuredClone(value);
 const delay = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
 const nowIso = () => new Date().toISOString();
 
-const OFFLINE_NAME_RE = /^[A-Za-z0-9_]{1,16}$/;
-const OFFLINE_NAME_ERROR = '只能用 1–16 位字母、数字、下划线';
+// 与 rust 侧 OFFLINE_NAME_PATTERN 保持一致：汉字放开，但界面会挂黄字警告。
+const OFFLINE_NAME_RE = /^[A-Za-z0-9_\u4e00-\u9fa5]{1,16}$/;
+const OFFLINE_NAME_ERROR = '只能用 1–16 位字母、数字、下划线或汉字';
 
 /* ------------------------------------------------------------------ *
  * Fixtures

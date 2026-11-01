@@ -194,10 +194,18 @@ fn full_offline_flow_from_folder_to_command_line() {
 #[test]
 fn offline_name_rules_match_api_contract() {
     // CLI 与界面共用同一套规则，避免两边漂移
-    for ok in ["Player_123", "a", "abcdefghijklmnop"] {
+    for ok in ["Player_123", "a", "abcdefghijklmnop", "小明", "中文名ABC_1"] {
         assert!(validate_offline_name(ok).is_ok(), "{ok} 应合法");
     }
-    for bad in ["", "玩家名", "bad name", "bad-name", "abcdefghijklmnopq"] {
+    for bad in [
+        "",
+        "名字 空格",
+        "bad name",
+        "bad-name",
+        "abcdefghijklmnopq",
+        "ひらがな",
+        "名字!",
+    ] {
         assert!(validate_offline_name(bad).is_err(), "{bad} 应非法");
     }
 }

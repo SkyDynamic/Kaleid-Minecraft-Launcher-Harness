@@ -267,12 +267,31 @@ mod tests {
         let acc = Accounts::empty_at(dir.path()).unwrap();
         acc.apply_offline_name("Player_123").unwrap();
 
-        for bad in ["", "玩家名", "bad name", "bad-name"] {
+        for bad in ["", "名字 空格", "bad name", "bad-name", "名字!"] {
             assert!(acc.apply_offline_name(bad).is_err(), "应拒绝 {bad:?}");
             let active = acc.active().unwrap().unwrap();
             assert_eq!(active.name, "Player_123", "非法输入不得改动现状");
         }
         assert!(acc.apply_offline_name(&"a".repeat(17)).is_err());
+    }
+
+    /// 中文名可以设，uuid 仍按 `OfflinePlayer:<名字>` 算——离线启动走得通，
+    /// 但服务器侧不一定接受，界面上要挂黄字警告。
+    #[test]
+    fn chinese_offline_name_is_accepted_and_hashed_like_java() {
+        let dir = tempfile::tempdir().unwrap();
+        let acc = Accounts::empty_at(dir.path()).unwrap();
+
+        let a = acc.apply_offline_name("小明").unwrap();
+        assert_eq!(a.kind, AccountKind::Offline);
+        assert_eq!(a.name, "小明");
+        assert_eq!(a.uuid, offline_uuid("小明"));
+        assert_eq!(acc.active().unwrap().unwrap().name, "小明");
+
+        // 换成英文名仍复用同一个档案，不新开一个。
+        let b = acc.apply_offline_name("Player_123").unwrap();
+        assert_eq!(b.id, a.id);
+        assert_eq!(acc.list().unwrap().len(), 1);
     }
 
     #[test]
