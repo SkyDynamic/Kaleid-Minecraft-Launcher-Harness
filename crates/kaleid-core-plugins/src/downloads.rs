@@ -16,6 +16,7 @@ use kaleid_api::{
     PhaseStatus, SettingsServiceApi,
 };
 
+use crate::hostlimit::{HostLimits, HostState};
 use crate::settings::Settings;
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
@@ -538,6 +539,8 @@ pub struct DownloadManager {
     /// 界面上的「N/64 线程」读的就是它——旧实现只数线程池里忙碌的 worker，
     /// 分段起的连接完全看不见，于是只剩一个文件时永远显示「1/64」。
     connections: Arc<AtomicUsize>,
+    /// 按主机记账的并发上限与 AIMD 降速（见 [`crate::hostlimit`]）。
+    limits: Arc<HostLimits>,
 }
 
 impl DownloadManager {
@@ -553,7 +556,13 @@ impl DownloadManager {
             agent: Arc::new(download_agent()),
             last_snapshot: Arc::new(Mutex::new((Instant::now(), 0))),
             connections: Arc::new(AtomicUsize::new(0)),
+            limits: Arc::new(HostLimits::for_concurrency(concurrency)),
         }
+    }
+
+    /// 读一下各主机的记账状态（诊断/界面用）。
+    pub fn host_state(&self, host: &str) -> Option<HostState> {
+        self.limits.state_of(host)
     }
 
     pub fn register(&self, job: Arc<Job>) {
@@ -669,10 +678,11 @@ impl DownloadManager {
         let executor = self.executor.clone();
         let agent = self.agent.clone();
         let connections = self.connections.clone();
+        let limits = self.limits.clone();
         thread::Builder::new()
             .name("kaleid-download-sched".into())
             .spawn(move || {
-                let result = drive_session(job, executor, agent, connections, cmd_rx);
+                let result = drive_session(job, executor, agent, connections, limits, cmd_rx);
                 let _ = result_tx.send(result);
             })
             .expect("无法创建下载调度线程");
@@ -717,10 +727,14 @@ enum SessionCmd {
 enum WorkReport {
     SingleOk(u64),
     SingleErr(u64, String),
+    /// 被限流（429/503）：不是这个地址坏了，冷却后重试同一地址。
+    SingleThrottled(u64, String),
     DiscoveredSize(u64, u64),
     RangeOk(u64, u64, u64),
     RangeUnsupported(u64),
     RangeErr(u64, (u64, u64), String),
+    /// 某个分段被限流：区间放回队列，同样不换源。
+    RangeThrottled(u64, (u64, u64), String),
 }
 
 struct LiveFile {
@@ -738,6 +752,8 @@ struct LiveFile {
     finished: bool,
     failed: Option<String>,
     single_started: bool,
+    /// 同一个地址已经被限流过几轮。轮满了才认输换源，避免"限速 = 立刻换源"。
+    throttle_rounds: usize,
 }
 
 fn drive_session(
@@ -745,6 +761,7 @@ fn drive_session(
     executor: Arc<Executor>,
     agent: Arc<ureq::Agent>,
     connections: Arc<AtomicUsize>,
+    limits: Arc<HostLimits>,
     cmd_rx: Receiver<SessionCmd>,
 ) -> Result<(), String> {
     job.reset_speed_window();
@@ -804,7 +821,7 @@ fn drive_session(
                 recv(done_wait) -> report => {
                     if let Ok(report) = report {
                         connections.fetch_sub(1, Ordering::SeqCst);
-                        on_report(&job, &mut files, report, &mut first_error);
+                        on_report(&job, &mut files, report, &mut first_error, &limits);
                     }
                 }
                 recv(cmd_wait) -> cmd => {
@@ -890,6 +907,7 @@ fn accept_file(job: &Arc<Job>, item: DownloadItem, id: u64, desired: usize) -> L
         finished,
         failed: None,
         single_started: false,
+        throttle_rounds: 0,
     }
 }
 
@@ -1053,7 +1071,11 @@ fn run_single(
 ) -> WorkReport {
     match fetch_one(agent, job, item, url) {
         Ok(()) => WorkReport::SingleOk(id),
-        Err(error) => WorkReport::SingleErr(id, error),
+        // 限流单独走一条路：它不代表这个地址坏了，不能顺手就换源。
+        Err(error) if error.class == RetryClass::Throttle => {
+            WorkReport::SingleThrottled(id, explain_net_error(&error.raw))
+        }
+        Err(error) => WorkReport::SingleErr(id, explain_net_error(&error.raw)),
     }
 }
 
@@ -1077,7 +1099,12 @@ fn run_range(
         }
         Err(SegmentFail::Attempt(error)) => {
             let _ = std::fs::remove_file(&path);
-            WorkReport::RangeErr(id, range, explain_net_error(&error.raw))
+            let text = explain_net_error(&error.raw);
+            if error.class == RetryClass::Throttle {
+                WorkReport::RangeThrottled(id, range, text)
+            } else {
+                WorkReport::RangeErr(id, range, text)
+            }
         }
     }
 }
@@ -1087,14 +1114,17 @@ fn on_report(
     files: &mut [LiveFile],
     report: WorkReport,
     first_error: &mut Option<String>,
+    limits: &HostLimits,
 ) {
     let id = match &report {
         WorkReport::SingleOk(id)
         | WorkReport::SingleErr(id, _)
+        | WorkReport::SingleThrottled(id, _)
         | WorkReport::DiscoveredSize(id, _)
         | WorkReport::RangeOk(id, _, _)
         | WorkReport::RangeUnsupported(id)
-        | WorkReport::RangeErr(id, _, _) => *id,
+        | WorkReport::RangeErr(id, _, _)
+        | WorkReport::RangeThrottled(id, _, _) => *id,
     };
     let Some(file) = files.iter_mut().find(|file| file.id == id) else {
         return;
@@ -1154,6 +1184,16 @@ fn on_report(
             file.single_started = false;
             note_transfer_failure(job, file, first_error, error);
         }
+        // 被限流：这个地址本身没坏，只是让我们慢一点。把区间放回去、地址不动，
+        // 顺便让该主机的预算减半——绝不能像旧实现那样"429 就等于换源"。
+        WorkReport::RangeThrottled(_, range, error) => {
+            file.unassigned.push_front(range);
+            note_throttled(limits, job, file, first_error, &error);
+        }
+        WorkReport::SingleThrottled(_, error) => {
+            file.single_started = false;
+            note_throttled(limits, job, file, first_error, &error);
+        }
     }
     if file.unsupported && file.inflight == 0 && !file.finished && file.failed.is_none() {
         discard_segments(job, file);
@@ -1163,6 +1203,38 @@ fn on_report(
         file.finished = true;
         file.unassigned.clear();
     }
+}
+
+/// 同一个地址被限流几轮之后才认输换源。
+///
+/// 一轮 = [`fetch_one`] 内部已经把 800ms / 2s / 5s 三次退避用完。也就是说
+/// 单纯"慢"能扛住约 23 秒的持续限流；只有对方真的不给了才换下一个地址。
+const MAX_THROTTLE_ROUNDS: usize = 3;
+
+/// 处理"被限流"的报告：不换源、记一笔账、必要时才认输。
+fn note_throttled(
+    limits: &HostLimits,
+    job: &Arc<Job>,
+    file: &mut LiveFile,
+    first_error: &mut Option<String>,
+    error: &str,
+) {
+    let url = file
+        .urls
+        .get(file.url_index)
+        .cloned()
+        .unwrap_or_default();
+    limits.note_throttled(&crate::urlcache::host_of(&url), None);
+    if file.throttle_rounds < MAX_THROTTLE_ROUNDS {
+        file.throttle_rounds += 1;
+        job.set_current(format!(
+            "{}：服务器限速，稍后重试（{}）",
+            file.item.label, file.throttle_rounds
+        ));
+        return;
+    }
+    file.throttle_rounds = 0;
+    note_transfer_failure(job, file, first_error, error.to_string());
 }
 
 fn note_transfer_failure(
@@ -1178,6 +1250,8 @@ fn note_transfer_failure(
     if file.url_index + 1 < file.urls.len() {
         file.url_index += 1;
         file.single_started = false;
+        // 换了地址，限流计数也归零：新地址有它自己的脾气。
+        file.throttle_rounds = 0;
         return;
     }
     if file.inflight == 0 {
@@ -1351,6 +1425,25 @@ const RETRY_CONNECT_ATTEMPTS: usize = 1;
 const RETRY_CONNECT_BACKOFF_MS: u64 = 600;
 /// 连上后中断（读超时、连接重置、5xx）值得退避重试，这是抖动型失败。
 const RETRY_TRANSFER_BACKOFF_MS: [u64; 3] = [400, 1200, 3000];
+/// 被限流（429/503）时的退避。比传输中断更慢一些：对方是在明说"别这么快"。
+/// 对方给了 `Retry-After` / `X-RateLimit-Reset-short` 就用它的值。
+const RETRY_THROTTLE_BACKOFF_MS: [u64; 3] = [800, 2000, 5000];
+
+/// 限流退避的固定毫秒数，只给测试用（`KALEID_THROTTLE_BACKOFF_MS=20`）。
+/// 生产环境不设这个变量，走上面的退避表；测试要把"三轮认输"压缩到毫秒级才跑得动。
+fn throttle_backoff_ms(attempt: usize) -> u64 {
+    static OVERRIDE: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let fixed = *OVERRIDE.get_or_init(|| {
+        std::env::var("KALEID_THROTTLE_BACKOFF_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+            .unwrap_or(0)
+    });
+    if fixed > 0 {
+        return fixed;
+    }
+    RETRY_THROTTLE_BACKOFF_MS[attempt.saturating_sub(1).min(RETRY_THROTTLE_BACKOFF_MS.len() - 1)]
+}
 
 /// 一次请求失败的类型，决定「同一地址还试几次」和「要不要立刻换源」。
 ///
@@ -1358,12 +1451,14 @@ const RETRY_TRANSFER_BACKOFF_MS: [u64; 3] = [400, 1200, 3000];
 /// |---|---|---|
 /// | `Connect` 连不上 | 1 次（600ms） | 换下一个地址 |
 /// | `Transfer` 连上后中断 / 5xx | 3 次（0.4s / 1.2s / 3s） | 换下一个地址 |
+/// | `Throttle` 429 / 503 | 3 次（0.8s / 2s / 5s，或对方指定） | **同一地址再来一轮**，轮满才换源 |
 /// | `Content` 大小或 SHA-1 不符 | 0 次 | 换下一个地址（重试只会再拿到错内容） |
 /// | `Http` 404 / 403 / 地址非法 | 0 次 | 换下一个地址 |
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum RetryClass {
     Connect,
     Transfer,
+    Throttle,
     Content,
     Http,
 }
@@ -1374,6 +1469,7 @@ impl RetryClass {
         match self {
             RetryClass::Connect => "连接失败",
             RetryClass::Transfer => "传输中断",
+            RetryClass::Throttle => "服务器限速",
             RetryClass::Content => "内容校验失败",
             RetryClass::Http => "地址不可用",
         }
@@ -1384,15 +1480,38 @@ impl RetryClass {
         match self {
             RetryClass::Connect => RETRY_CONNECT_ATTEMPTS,
             RetryClass::Transfer => RETRY_TRANSFER_BACKOFF_MS.len(),
+            RetryClass::Throttle => RETRY_THROTTLE_BACKOFF_MS.len(),
             RetryClass::Content | RetryClass::Http => 0,
         }
     }
 }
 
 /// 一次尝试的失败：分类决定怎么重试，`raw` 是给排查用的原始信息。
+///
+/// `retry_after` 只在 `Throttle` 时出现，来自 `Retry-After` 或
+/// `X-RateLimit-Reset-short`：服务器自己说了等多久，就别再用我们拍的退避表。
 struct AttemptError {
     class: RetryClass,
     raw: String,
+    retry_after: Option<Duration>,
+}
+
+impl AttemptError {
+    fn new(class: RetryClass, raw: impl Into<String>) -> Self {
+        AttemptError {
+            class,
+            raw: raw.into(),
+            retry_after: None,
+        }
+    }
+
+    fn throttled(raw: impl Into<String>, retry_after: Option<Duration>) -> Self {
+        AttemptError {
+            class: RetryClass::Throttle,
+            raw: raw.into(),
+            retry_after,
+        }
+    }
 }
 
 /// 下载专用 agent：连接 10s / 读取 30s。
@@ -1410,7 +1529,12 @@ fn download_agent() -> ureq::Agent {
 fn classify_call_error(err: &ureq::Error) -> RetryClass {
     match err {
         ureq::Error::Status(code, _) => {
-            if *code >= 500 {
+            if *code == 429 || *code == 503 {
+                // 限流 / 过载：换源只会把同一个问题搬到另一个地址上。
+                RetryClass::Throttle
+            } else if *code == 408 {
+                RetryClass::Transfer
+            } else if *code >= 500 {
                 RetryClass::Transfer
             } else {
                 RetryClass::Http
@@ -1429,6 +1553,38 @@ fn classify_call_error(err: &ureq::Error) -> RetryClass {
             _ => RetryClass::Transfer,
         },
     }
+}
+
+/// 把 `ureq` 的错误连同"服务器要我们等多久"一起打包成 [`AttemptError`]。
+fn attempt_error(url: &str, err: &ureq::Error) -> AttemptError {
+    let class = classify_call_error(err);
+    let retry_after = match err {
+        ureq::Error::Status(_, response) => retry_after_of(response),
+        _ => None,
+    };
+    if class == RetryClass::Throttle {
+        AttemptError::throttled(format!("{url}: {err}"), retry_after)
+    } else {
+        AttemptError::new(class, format!("{url}: {err}"))
+    }
+}
+
+/// 服务器指定的等待时长。
+///
+/// `Retry-After` 支持秒数；`X-RateLimit-Reset-short`（BMCLAPI 每 60 秒一个窗口）
+/// 是"再过几秒重置"的意思，语义一致，一并认。
+fn retry_after_of(response: &ureq::Response) -> Option<Duration> {
+    if let Some(value) = response.header("retry-after") {
+        if let Some(seconds) = value.trim().parse::<u64>().ok() {
+            return Some(Duration::from_secs(seconds.clamp(1, 120)));
+        }
+    }
+    if let Some(value) = response.header("x-ratelimit-reset-short") {
+        if let Some(seconds) = value.trim().parse::<u64>().ok() {
+            return Some(Duration::from_secs(seconds.clamp(1, 300)));
+        }
+    }
+    None
 }
 
 /// 把底层网络错误翻成人话，并保留原始串（`os error 10060` 对用户毫无意义，
@@ -1454,11 +1610,17 @@ fn explain_net_error(raw: &str) -> String {
     }
 }
 
-fn sleep_backoff(class: RetryClass, attempt: usize) {
+/// 第 `attempt` 次失败后睡多久。服务器给了明确等待时长就用它，别自作聪明。
+fn sleep_backoff(class: RetryClass, attempt: usize, retry_after: Option<Duration>) {
+    if let Some(wait) = retry_after {
+        thread::sleep(wait);
+        return;
+    }
     let base = match class {
         RetryClass::Connect => RETRY_CONNECT_BACKOFF_MS,
         RetryClass::Transfer => RETRY_TRANSFER_BACKOFF_MS
             [attempt.saturating_sub(1).min(RETRY_TRANSFER_BACKOFF_MS.len() - 1)],
+        RetryClass::Throttle => throttle_backoff_ms(attempt),
         RetryClass::Content | RetryClass::Http => 0,
     };
     if base == 0 {
@@ -1700,22 +1862,25 @@ fn content_range_matches(header: Option<&str>, total_size: u64, range: (u64, u64
 
 
 /// 单流下载一个地址，按 [`RetryClass`] 的预算重试。
+///
+/// 返回的 [`AttemptError`] 保留分类：调用方要据此区分"这个地址坏了"和
+/// "服务器只是让我们慢一点"。
 fn fetch_one(
     agent: &Arc<ureq::Agent>,
     job: &Arc<Job>,
     item: &DownloadItem,
     url: &str,
-) -> Result<(), String> {
+) -> Result<(), AttemptError> {
     let mut attempt = 0usize;
     loop {
         if job.cancelled() {
-            return Err("任务已取消".into());
+            return Err(AttemptError::new(RetryClass::Content, "任务已取消"));
         }
         match stream_attempt(agent, job, item, url) {
             Ok(()) => return Ok(()),
             Err(err) => {
                 if attempt >= err.class.budget() {
-                    return Err(explain_net_error(&err.raw));
+                    return Err(err);
                 }
                 attempt += 1;
                 job.set_current(format!(
@@ -1723,7 +1888,7 @@ fn fetch_one(
                     item.label,
                     err.class.label()
                 ));
-                sleep_backoff(err.class, attempt);
+                sleep_backoff(err.class, attempt, err.retry_after);
             }
         }
     }
@@ -1759,38 +1924,23 @@ fn stream_body(
     part: &Path,
     total: &mut u64,
 ) -> Result<(), AttemptError> {
-    let response = agent.get(url).call().map_err(|e| AttemptError {
-        class: classify_call_error(&e),
-        raw: format!("{url}: {e}"),
-    })?;
+    let response = agent.get(url).call().map_err(|e| attempt_error(url, &e))?;
     let mut reader = response.into_reader();
-    let mut file = std::fs::File::create(part).map_err(|e| AttemptError {
-        class: RetryClass::Content,
-        raw: format!("{}: {e}", part.display()),
-    })?;
+    let mut file = std::fs::File::create(part).map_err(|e| AttemptError::new(RetryClass::Content, format!("{}: {e}", part.display())))?;
     let mut hasher = Sha1::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         if job.cancelled() {
-            return Err(AttemptError {
-                class: RetryClass::Content,
-                raw: "任务已取消".into(),
-            });
+            return Err(AttemptError::new(RetryClass::Content, "任务已取消"));
         }
         let n = match reader.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => {
-                return Err(AttemptError {
-                    class: RetryClass::Transfer,
-                    raw: format!("{url}: {e}"),
-                })
+                return Err(AttemptError::new(RetryClass::Transfer, format!("{url}: {e}")))
             }
         };
-        file.write_all(&buf[..n]).map_err(|e| AttemptError {
-            class: RetryClass::Content,
-            raw: format!("{}: {e}", part.display()),
-        })?;
+        file.write_all(&buf[..n]).map_err(|e| AttemptError::new(RetryClass::Content, format!("{}: {e}", part.display())))?;
         hasher.update(&buf[..n]);
         *total += n as u64;
         job.add_bytes(&item.phase, n as u64);
@@ -1806,27 +1956,18 @@ fn finish_file(
     digest: impl AsRef<[u8]>,
 ) -> Result<(), AttemptError> {
     if item.size > 0 && total != item.size {
-        return Err(AttemptError {
-            class: RetryClass::Content,
-            raw: format!("大小不符（期望 {}，实际 {} 字节）", item.size, total),
-        });
+        return Err(AttemptError::new(RetryClass::Content, format!("大小不符（期望 {}，实际 {} 字节）", item.size, total)));
     }
     if let Some(expected) = &item.sha1 {
         let actual = hex::encode(digest);
         if !actual.eq_ignore_ascii_case(expected) {
-            return Err(AttemptError {
-                class: RetryClass::Content,
-                raw: format!("SHA-1 校验失败（期望 {expected}，实际 {actual}）"),
-            });
+            return Err(AttemptError::new(RetryClass::Content, format!("SHA-1 校验失败（期望 {expected}，实际 {actual}）")));
         }
     }
     if item.dest.exists() {
         let _ = std::fs::remove_file(&item.dest);
     }
-    std::fs::rename(part, &item.dest).map_err(|e| AttemptError {
-        class: RetryClass::Content,
-        raw: format!("{}: {e}", item.dest.display()),
-    })
+    std::fs::rename(part, &item.dest).map_err(|e| AttemptError::new(RetryClass::Content, format!("{}: {e}", item.dest.display())))
 }
 
 
@@ -1852,12 +1993,7 @@ fn segment_attempt(
             .get(url)
             .set("Range", &format!("bytes={start}-{end}"))
             .call()
-            .map_err(|e| {
-                SegmentFail::Attempt(AttemptError {
-                    class: classify_call_error(&e),
-                    raw: format!("{url}: {e}"),
-                })
-            })?;
+            .map_err(|e| SegmentFail::Attempt(attempt_error(url, &e)))?;
         if response.status() != 206 {
             // 200 说明服务器把整个文件又给了一遍：再读下去就是重复下载。
             return Err(SegmentFail::Unsupported);
@@ -1867,34 +2003,22 @@ fn segment_attempt(
         }
         let mut reader = response.into_reader();
         let mut file = std::fs::File::create(file_path).map_err(|e| {
-            SegmentFail::Attempt(AttemptError {
-                class: RetryClass::Content,
-                raw: format!("{}: {e}", file_path.display()),
-            })
+            SegmentFail::Attempt(AttemptError::new(RetryClass::Content, format!("{}: {e}", file_path.display())))
         })?;
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             if job.cancelled() {
-                return Err(SegmentFail::Attempt(AttemptError {
-                    class: RetryClass::Content,
-                    raw: "任务已取消".into(),
-                }));
+                return Err(SegmentFail::Attempt(AttemptError::new(RetryClass::Content, "任务已取消")));
             }
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) => {
-                    return Err(SegmentFail::Attempt(AttemptError {
-                        class: RetryClass::Transfer,
-                        raw: format!("{url}: {e}"),
-                    }))
+                    return Err(SegmentFail::Attempt(AttemptError::new(RetryClass::Transfer, format!("{url}: {e}"))))
                 }
             };
             file.write_all(&buf[..n]).map_err(|e| {
-                SegmentFail::Attempt(AttemptError {
-                    class: RetryClass::Content,
-                    raw: format!("{}: {e}", file_path.display()),
-                })
+                SegmentFail::Attempt(AttemptError::new(RetryClass::Content, format!("{}: {e}", file_path.display())))
             })?;
             got += n as u64;
             counted.fetch_add(n as u64, Ordering::SeqCst);
@@ -1902,10 +2026,7 @@ fn segment_attempt(
         }
         let want = end - start + 1;
         if got != want {
-            return Err(SegmentFail::Attempt(AttemptError {
-                class: RetryClass::Transfer,
-                raw: format!("分段 {start}–{end} 只收到 {got} / {want} 字节"),
-            }));
+            return Err(SegmentFail::Attempt(AttemptError::new(RetryClass::Transfer, format!("分段 {start}–{end} 只收到 {got} / {want} 字节"))));
         }
         let _ = file.flush();
         Ok(())
@@ -1931,10 +2052,7 @@ fn fetch_segment(
     let mut attempt = 0usize;
     loop {
         if stop.load(Ordering::SeqCst) || job.cancelled() {
-            return Err(SegmentFail::Attempt(AttemptError {
-                class: RetryClass::Content,
-                raw: "任务已取消".into(),
-            }));
+            return Err(SegmentFail::Attempt(AttemptError::new(RetryClass::Content, "任务已取消")));
         }
         match segment_attempt(agent, job, item, url, range, file_path, counted) {
             Ok(()) => return Ok(()),
@@ -1944,7 +2062,7 @@ fn fetch_segment(
                     return Err(SegmentFail::Attempt(err));
                 }
                 attempt += 1;
-                sleep_backoff(err.class, attempt);
+                sleep_backoff(err.class, attempt, err.retry_after);
             }
         }
     }

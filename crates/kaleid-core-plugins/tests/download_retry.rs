@@ -35,6 +35,8 @@ enum Mode {
     RangeOk,
     /// 正常支持 `Range`，但按块慢速写：这样才观察得到"同时有几个连接在跑"。
     SlowRange { chunk: usize, delay_ms: u64 },
+    /// 前 n 个请求回 429（限流），可以带 `Retry-After`。
+    Throttle { times: usize, retry_after: Option<u64> },
 }
 
 struct TestServer {
@@ -119,6 +121,22 @@ fn serve(mut stream: TcpStream, body: &[u8], mode: Mode, index: usize) {
             let _ = stream.write_all(
                 b"HTTP/1.1 500 Internal Server Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
             );
+            return;
+        }
+    }
+    if let Mode::Throttle { times, retry_after } = mode {
+        if index < times {
+            // 真实的限流响应长这样：没有 body，可能带 Retry-After 或配额重置时间。
+            let extra = match retry_after {
+                Some(seconds) => format!(
+                    "Retry-After: {seconds}\r\nX-RateLimit-Reset-short: {seconds}\r\n"
+                ),
+                None => String::new(),
+            };
+            let response = format!(
+                "HTTP/1.1 429 Too Many Requests\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n"
+            );
+            let _ = stream.write_all(response.as_bytes());
             return;
         }
     }
@@ -273,6 +291,27 @@ fn item(label: &str, url: String, dest: &Path, body: &[u8]) -> DownloadItem {
     }
 }
 
+/// 官方 + 镜像两个地址的文件：用来验证"什么时候该换源、什么时候不该"。
+fn item_with_mirror(
+    label: &str,
+    official: String,
+    mirror: String,
+    dest: &Path,
+    body: &[u8],
+) -> DownloadItem {
+    DownloadItem {
+        label: label.into(),
+        phase: "vanilla".into(),
+        official_url: Some(official),
+        mirror_url: Some(mirror),
+        fallback_url: None,
+        prefer_mirror: false,
+        dest: dest.to_path_buf(),
+        size: body.len() as u64,
+        sha1: Some(sha1_hex(body)),
+    }
+}
+
 fn assert_no_leftovers(dest: &Path) {
     assert!(!dest.exists() || dest.is_file());
     let dir = dest.parent().unwrap();
@@ -375,6 +414,91 @@ fn downloads_large_file_with_several_connections() {
     assert!(
         server.requests.load(Ordering::SeqCst) >= 2,
         "分段应当拆成多次 Range 请求"
+    );
+}
+
+#[test]
+fn honors_retry_after_and_keeps_downloading_the_same_url() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = body_of(16 * 1024);
+    // 第一个请求 429 + Retry-After: 1，之后恢复正常。
+    let official = TestServer::start(body.clone(), Mode::Throttle { times: 1, retry_after: Some(1) });
+    let mirror = TestServer::start(body.clone(), Mode::RangeOk);
+    let manager = manager(dir.path());
+    let dest = dir.path().join("client.jar");
+
+    let started = std::time::Instant::now();
+    manager
+        .run_batch(
+            job("throttle-429"),
+            vec![item_with_mirror(
+                "客户端",
+                format!("{}/client.jar", official.base),
+                format!("{}/client.jar", mirror.base),
+                &dest,
+                &body,
+            )],
+        )
+        .expect("限流应当退避重试后成功");
+
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+    assert_no_leftovers(&dest);
+    assert!(
+        started.elapsed() >= Duration::from_millis(900),
+        "应当按 Retry-After 等够 1 秒（实测 {:?}）",
+        started.elapsed()
+    );
+    // 关键：429 ≠ 换源。镜像一次都不该被访问。
+    assert_eq!(
+        mirror.requests.load(Ordering::SeqCst),
+        0,
+        "限流时不应换源，镜像被访问了 {} 次",
+        mirror.requests.load(Ordering::SeqCst)
+    );
+    assert!(official.requests.load(Ordering::SeqCst) >= 2);
+}
+
+#[test]
+fn gives_up_on_a_persistently_throttled_source_and_switches() {
+    // 让退避缩到毫秒级，否则"三轮 × 三次退避"要跑二十多秒。
+    std::env::set_var("KALEID_THROTTLE_BACKOFF_MS", "20");
+    let dir = tempfile::tempdir().unwrap();
+    let body = body_of(32 * 1024);
+    // 官方源永久限流，镜像正常。
+    let official = TestServer::start(
+        body.clone(),
+        Mode::Throttle {
+            times: usize::MAX,
+            retry_after: None,
+        },
+    );
+    let mirror = TestServer::start(body.clone(), Mode::RangeOk);
+    let manager = manager(dir.path());
+    let dest = dir.path().join("client.jar");
+
+    manager
+        .run_batch(
+            job("throttle-forever"),
+            vec![item_with_mirror(
+                "客户端",
+                format!("{}/client.jar", official.base),
+                format!("{}/client.jar", mirror.base),
+                &dest,
+                &body,
+            )],
+        )
+        .expect("官方源被限死之后应当换到镜像并成功");
+
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+    assert_no_leftovers(&dest);
+    assert!(
+        official.requests.load(Ordering::SeqCst) >= 3,
+        "换源前应当先在官方源上重试过（实测 {} 次）",
+        official.requests.load(Ordering::SeqCst)
+    );
+    assert!(
+        mirror.requests.load(Ordering::SeqCst) >= 1,
+        "官方源彻底限流后应当改用镜像"
     );
 }
 
