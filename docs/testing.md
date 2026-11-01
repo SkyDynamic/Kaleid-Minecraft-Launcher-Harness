@@ -14,7 +14,7 @@ cargo test --workspace
 |---|---|
 | `kaleid-kernel` | 29 |
 | `kaleid-api` | 20 |
-| `kaleid-core-plugins` | 333（308 单元 + 25 集成；其中 11 个手动真机 / 联网用例标了 `#[ignore]`，默认跳过） |
+| `kaleid-core-plugins` | 334（309 单元 + 25 集成；其中 11 个手动真机 / 联网用例标了 `#[ignore]`，默认跳过） |
 | `kaleid-host` | 23 |
 | `kaleid-cli`（`tests/flow.rs` 集成） | 7 |
 

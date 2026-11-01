@@ -1422,6 +1422,12 @@ fn on_report(
             job.item_done(&file.item.phase);
         }
         WorkReport::DiscoveredSize(_, size) => {
+            // 清单里没给大小的文件（安装器那类）计划时按 0 字节入账，真下起来就会
+            // 出现「123.6 MB / 123.3 MB」这种超过 100% 的怪相。学到真实大小就补进去。
+            let extra = size.saturating_sub(file.item.size);
+            if extra > 0 {
+                job.add_total(&file.item.phase, extra, 0);
+            }
             file.size = size;
             file.item.size = size;
             file.single_started = false;
@@ -2530,7 +2536,7 @@ mod tests {
             item,
             urls: vec![url.to_string()],
             url_index: 0,
-            unassigned: VecDeque::from(vec![(0, size - 1)]),
+            unassigned: VecDeque::from(vec![(0, size.saturating_sub(1))]),
             inflight: 0,
             size,
             multi: true,
@@ -2584,6 +2590,36 @@ mod tests {
             file.can_progress(),
             "既没有在途连接、也没有可派的区间、还没下完 —— 调度器会算出 0 个任务，队列永远卡住"
         );
+    }
+
+    /// 学到真实大小之后，总数要跟着修正——否则进度条会跑到 100% 以上。
+    ///
+    /// 安装器这类文件在清单里 `size: 0`，旧实现只在文件级补了大小，批次总字节仍是
+    /// 0，于是界面上出现「123.6 MB / 123.3 MB」：明明显示 100%，文件却是 0/1。
+    #[test]
+    fn learning_the_real_size_keeps_the_total_honest() {
+        let url = "https://node.example/installer.jar";
+        let job = plan_job("official-first");
+        let mut file = segmented_file(1, 0, url, None);
+        file.multi = false;
+        file.unassigned.clear();
+        job.add_total("client", 0, 1);
+        let limits = HostLimits::for_concurrency(8);
+        let mut files = vec![file];
+        let mut first_error = None;
+
+        on_report(
+            &job,
+            &mut files,
+            WorkReport::DiscoveredSize(1, 2_500_000),
+            &mut first_error,
+            &limits,
+        );
+
+        let snapshot = job.snapshot();
+        assert_eq!(snapshot.total_bytes, 2_500_000, "总数要补上现学的大小");
+        assert_eq!(snapshot.files_total, 1, "文件数不能被重复计");
+        assert_eq!(files[0].unassigned.len(), 1, "学到了大小就该开始分段");
     }
 
     /// 缺口计算：一段一段补回来，不能重叠、也不能漏。
