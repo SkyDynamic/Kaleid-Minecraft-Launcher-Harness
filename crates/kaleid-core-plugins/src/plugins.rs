@@ -311,6 +311,8 @@ impl Plugin for VersionManagerPlugin {
         let downloads = Arc::new(
             DownloadManager::new(settings.clone()).with_data_root(&self.data_root),
         );
+        // 上次被强杀留下的安装现场（几百 MB 的 jar）顺手清掉，别越攒越多。
+        crate::install::sweep_staging(&self.data_root);
         let install = Arc::new(InstallService::new(
             settings,
             versions.clone(),

@@ -3,7 +3,7 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use serde_json::{json, Value};
 use sha1::{Digest, Sha1};
@@ -325,6 +325,13 @@ impl InstallService {
         job.start_phase("prepare");
         job.set_current("读取版本 JSON…");
         let policy = job.policy().to_string();
+        // 失败时要把这次新建的版本目录收干净（见 `InstallGuard`）。
+        let mut guard = InstallGuard::new();
+        guard.track(&loader_version_dir(root, &req.version_name));
+        // 官方安装器的临时工作区也要收：里面可能躺着几百 MB 的 jar。
+        if let Some(slug) = modded_staging_slug(&req.loader) {
+            guard.track(&self.data_root.join("staging").join(format!("{slug}-{}", job.id)));
+        }
         let value = self.game_version_json(&req.game_version, &policy)?;
         let mut core = self.vanilla_core_items(root, &req.version_name, &req.game_version, &value)?;
 
@@ -460,6 +467,8 @@ impl InstallService {
             }
             job.complete_phase("optifine");
         }
+        // 走到这里才算装完：上面的任何一步失败都会让守卫把半成品删掉。
+        guard.commit();
         job.complete();
         Ok(())
     }
@@ -1476,6 +1485,97 @@ fn write_version_json(root: &Root, name: &str, value: &Value) -> ApiResult<()> {
     Ok(())
 }
 
+/// 一次安装的"施工现场"清理器。
+///
+/// 安装失败时最烦的不是那句报错，而是 `versions/<名字>/` 里剩下半个版本：版本列表
+/// 里看得见、点启动就炸，用户还得自己翻目录去删。这个守卫只登记**本次新建**的
+/// 目录（已经存在的一律不碰，绝不删用户的东西），失败或取消时把它们整个删掉，
+/// 成功之后才放手。
+struct InstallGuard {
+    dirs: Vec<PathBuf>,
+    keep: bool,
+}
+
+impl InstallGuard {
+    fn new() -> Self {
+        InstallGuard {
+            dirs: Vec::new(),
+            keep: false,
+        }
+    }
+
+    /// 登记一个目录。必须在创建它**之前**调用，否则会误判成"原本就有"。
+    fn track(&mut self, dir: &Path) {
+        if !dir.exists() && !self.dirs.iter().any(|tracked| tracked == dir) {
+            self.dirs.push(dir.to_path_buf());
+        }
+    }
+
+    /// 安装成功：从外到内保留所有痕迹。
+    fn commit(mut self) {
+        self.keep = true;
+    }
+}
+
+impl Drop for InstallGuard {
+    fn drop(&mut self) {
+        if self.keep {
+            return;
+        }
+        for dir in &self.dirs {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+/// 清扫上次崩溃/被杀留下的 staging 目录。
+///
+/// `<data_root>/staging` 是安装器和资源索引的临时工作区，正常结束会自己删掉；但
+/// 进程被强杀或断电时留下的目录会一直堆着（里面可能有几百 MB 的 jar）。启动时顺手
+/// 清掉超过 24 小时的。
+pub fn sweep_staging(data_root: &Path) {
+    sweep_staging_at(
+        data_root,
+        SystemTime::now(),
+        Duration::from_secs(STAGING_MAX_AGE_SECS),
+    );
+}
+
+fn sweep_staging_at(data_root: &Path, now: SystemTime, max_age: Duration) {
+    let base = data_root.join("staging");
+    let Ok(entries) = std::fs::read_dir(&base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let stale = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .map(|at| {
+                now.duration_since(at)
+                    .map(|age| age > max_age)
+                    .unwrap_or(false)
+            })
+            // 读不到时间就不动它：宁可留一堆目录，也不能删掉正在跑的安装。
+            .unwrap_or(false);
+        if stale {
+            let _ = std::fs::remove_dir_all(&path);
+        }
+    }
+}
+
+/// staging 目录最多留一天。
+const STAGING_MAX_AGE_SECS: u64 = 24 * 3600;
+
+/// Forge / NeoForge 的 staging 目录名（`staging/<slug>-<job>`）；原版和 Fabric 没有。
+fn modded_staging_slug(loader: &InstallLoader) -> Option<&'static str> {
+    match loader {
+        InstallLoader::Forge { .. } => Some("forge"),
+        InstallLoader::Neoforge { .. } => Some("neoforge"),
+        _ => None,
+    }
+}
+
 /// 自包含布局的版本目录：`<游戏目录>/versions/<版本名>/`。
 ///
 /// 装加载器时把 JSON、客户端 jar、加载器库、`.fabric` 之类的标记全放进来，
@@ -1703,6 +1803,96 @@ fn rule_matches(rule: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "kaleid-install-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// 安装失败（下载到一半、安装器退出码非 0、用户取消……）之后，不能留下一个
+    /// "版本列表里看得见、点启动就炸"的半成品目录。
+    #[test]
+    fn failed_install_leaves_no_version_dir() {
+        let root = scratch("failed");
+        let version_dir = root.join("versions").join("1.21.4-fabric");
+        {
+            let mut guard = InstallGuard::new();
+            guard.track(&version_dir);
+            // 模拟「版本 JSON 已写盘、client.jar 还没下完就失败了」。
+            std::fs::create_dir_all(&version_dir).unwrap();
+            std::fs::write(version_dir.join("1.21.4-fabric.json"), "{}").unwrap();
+            std::fs::create_dir_all(version_dir.join("libraries")).unwrap();
+        }
+        assert!(
+            !version_dir.exists(),
+            "失败后整个版本目录都该消失：{}",
+            version_dir.display()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 已经存在的版本目录一个字节都不能动——用户自己的存档式安装不能被守卫误删。
+    #[test]
+    fn guard_never_touches_a_directory_that_already_existed() {
+        let root = scratch("existing");
+        let version_dir = root.join("versions").join("1.21.4");
+        std::fs::create_dir_all(&version_dir).unwrap();
+        std::fs::write(version_dir.join("keep.txt"), "用户的文件").unwrap();
+        {
+            let mut guard = InstallGuard::new();
+            guard.track(&version_dir);
+            std::fs::write(version_dir.join("ours.json"), "{}").unwrap();
+        }
+        assert!(version_dir.join("keep.txt").is_file(), "原有文件必须还在");
+        assert!(version_dir.join("ours.json").is_file(), "原有目录不会被整体删除");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn successful_install_keeps_everything() {
+        let root = scratch("ok");
+        let version_dir = root.join("versions").join("1.21.4");
+        {
+            let mut guard = InstallGuard::new();
+            guard.track(&version_dir);
+            std::fs::create_dir_all(&version_dir).unwrap();
+            std::fs::write(version_dir.join("1.21.4.json"), "{}").unwrap();
+            guard.commit();
+        }
+        assert!(version_dir.join("1.21.4.json").is_file());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// 进程被强杀留下的 staging 要在下次启动时清掉，但正在跑的那次不能碰。
+    #[test]
+    fn sweep_staging_removes_only_old_dirs() {
+        let data_root = scratch("sweep");
+        let staging = data_root.join("staging");
+        let old_dir = staging.join("forge-oldjob");
+        std::fs::create_dir_all(&old_dir).unwrap();
+        std::fs::write(old_dir.join("installer.jar"), b"jar").unwrap();
+        // 目录的修改时间就是"这次安装最后一次动它"的时刻，睡觉来制造新旧差异。
+        std::thread::sleep(Duration::from_millis(700));
+        let fresh_dir = staging.join("neoforge-running");
+        std::fs::create_dir_all(&fresh_dir).unwrap();
+        sweep_staging_at(
+            &data_root,
+            SystemTime::now(),
+            Duration::from_millis(500),
+        );
+        assert!(!old_dir.exists(), "超过阈值的空壳要删掉");
+        assert!(fresh_dir.exists(), "刚建的不能碰");
+        let _ = std::fs::remove_dir_all(&data_root);
+    }
 
     /// 真机：BMCLAPI 的 OptiFine 列表与直链（老版本单装 / 高版本 mod 两条路都要通）。
     ///
