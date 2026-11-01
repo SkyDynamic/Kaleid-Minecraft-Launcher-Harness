@@ -22,8 +22,8 @@ pub use content::{
 };
 pub use download::{
     DownloadJob, DownloadPhase, DownloadSnapshot, DownloadStatus, FabricApiInfo, InstallLoader,
-    InstallQueued, InstallRequest, LoaderVersion, LoaderVersionTimes, LoaderVersions, PhaseStatus,
-    RemoteVersion, RemoteVersions, VersionNameCheck,
+    InstallQueued, InstallRequest, LoaderVersion, LoaderVersionTimes, LoaderVersions, OptifineRef,
+    PhaseStatus, RemoteVersion, RemoteVersions, VersionNameCheck,
 };
 pub use error::{ApiError, ApiResult};
 pub use java::{JavaRuntime, JavaServiceApi, JavaSource};

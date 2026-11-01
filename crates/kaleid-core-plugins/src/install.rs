@@ -61,7 +61,10 @@ impl InstallService {
             "fabric" => loaders::fabric_loaders(&self.remote, game),
             "forge" => loaders::forge_loaders(&self.remote, game),
             "neoforge" => loaders::neoforge_loaders(&self.remote, game),
-            _ => Err(ApiError::invalid("加载器只能是 fabric / forge / neoforge")),
+            "optifine" => loaders::optifine_versions(&self.remote, game),
+            _ => Err(ApiError::invalid(
+                "加载器只能是 fabric / forge / neoforge / optifine",
+            )),
         }
     }
 
@@ -227,6 +230,13 @@ impl InstallService {
                         LoaderKind::NeoForge => {
                             this.neoforge_items(&job_for_thread, &game, &loader_for_thread)?
                         }
+                        // OptiFine 换版本要同时改画像或 mods 里的 jar，走"重新安装"，
+                        // 不走这里的原地更新。
+                        LoaderKind::OptiFine => {
+                            return Err(ApiError::invalid(
+                                "OptiFine 不支持原地更新，请重新安装一个版本",
+                            ))
+                        }
                         _ => return Err(ApiError::invalid("这个版本没有可更新的加载器")),
                     };
                     items.retain(|i| !(i.dest.exists() && i.size > 0));
@@ -290,6 +300,7 @@ impl InstallService {
         if requested == LoaderKind::Vanilla {
             return Ok(());
         }
+        let requested_family = loader_family(requested);
         let list = self.versions.scan(Path::new(&root.path))?;
         for v in list {
             if v.inherits_from.as_deref() != Some(game) {
@@ -298,7 +309,7 @@ impl InstallService {
             if v.loader == LoaderKind::Vanilla {
                 continue;
             }
-            if v.loader != requested {
+            if loader_family(v.loader) != requested_family {
                 return Err(ApiError::invalid(format!(
                     "该游戏版本已安装 {} {}，不能同时安装 {}；请换一个游戏版本或先移除旧版本。",
                     v.loader.label_zh(),
@@ -374,6 +385,18 @@ impl InstallService {
             }
         }
 
+        if let Some(optifine) = &req.optifine {
+            validate_optifine(req, optifine)?;
+            let with_forge = matches!(req.loader, InstallLoader::Forge { .. });
+            core.extend(self.optifine_items(
+                root,
+                &req.version_name,
+                &req.game_version,
+                optifine,
+                with_forge,
+            )?);
+        }
+
         job.complete_phase("prepare");
         for item in &core {
             job.add_total(&item.phase, item.size, 1);
@@ -423,6 +446,19 @@ impl InstallService {
                 &staging,
             )?;
             job.complete_phase("installer");
+        }
+
+        // OptiFine 的收尾：单独装要改画像（launchwrapper + tweaker），配合 Forge
+        // 只记一笔版本号（jar 已经在 mods/ 里，画像仍是 Forge）。
+        if let Some(optifine) = &req.optifine {
+            job.start_phase("optifine");
+            job.set_current(format!("配置 OptiFine {}…", optifine.version()));
+            if matches!(req.loader, InstallLoader::Vanilla) {
+                apply_optifine_standalone(root, &req.version_name, &req.game_version, optifine)?;
+            } else {
+                record_optifine_mod(root, &req.version_name, optifine)?;
+            }
+            job.complete_phase("optifine");
         }
         job.complete();
         Ok(())
@@ -793,6 +829,90 @@ impl InstallService {
         }])
     }
 
+    /// OptiFine 的下载条目。
+    ///
+    /// 两种形态完全不一样：
+    /// - **配合 Forge**：OptiFine 就是个普通 mod，扔进 `mods/` 即可（1.8 起都这样，
+    ///   不管游戏版本）。NeoForge / Fabric 都不行。
+    /// - **单独装（只有 1.12.2 及更早）**：OptiFine 是"打了补丁的 jar"，靠
+    ///   launchwrapper 的 `optifine.OptiFineTweaker` 注入，还要
+    ///   `net.minecraft:launchwrapper:1.12` 与 `org.ow2.asm:asm-all:5.2` 两条库，
+    ///   画像（mainClass / tweakClass）也得单独写。
+    ///
+    /// 无论哪种，文件都从 BMCLAPI 的 `/optifine/<游戏版本>/<类型>/<补丁号>` 取
+    /// （官网要过 adfocus 跳转，抓不动），官方 `optifine.net` 只做兜底。
+    fn optifine_items(
+        &self,
+        root: &Root,
+        name: &str,
+        game: &str,
+        optifine: &kaleid_api::OptifineRef,
+        with_forge: bool,
+    ) -> ApiResult<Vec<DownloadItem>> {
+        let version = optifine.version();
+        let jar_name = loaders::optifine_jar_name(game, &version);
+        let mirror = loaders::optifine_download_url(game, &optifine.kind, &optifine.patch);
+        let official = loaders::optifine_official_url(&jar_name);
+        let mut items = Vec::new();
+
+        if with_forge {
+            let global = self.settings.global()?;
+            let isolated = kaleid_api::resolve_isolation(root.isolation, global.isolation_default);
+            let mods = root.game_dir(name, isolated).join("mods");
+            items.push(DownloadItem {
+                label: format!("OptiFine {version}"),
+                phase: "optifine".into(),
+                official_url: Some(official),
+                mirror_url: Some(mirror),
+                fallback_url: None,
+                // 官方那条要过跳转、还常常 404，直接先试 BMCLAPI。
+                prefer_mirror: true,
+                dest: mods.join(&jar_name),
+                size: 0,
+                sha1: None,
+            });
+            return Ok(items);
+        }
+
+        // 低版本：OptiFine 自己当一条库放进版本目录的 libraries/。
+        let libraries = loader_version_dir(root, name).join("libraries");
+        let relative = format!(
+            "optifine/OptiFine/{}_{}/OptiFine-{}_{}.jar",
+            game, version, game, version
+        );
+        items.push(DownloadItem {
+            label: format!("OptiFine {version}"),
+            phase: "optifine".into(),
+            official_url: Some(official),
+            mirror_url: Some(mirror),
+            fallback_url: None,
+            prefer_mirror: true,
+            dest: libraries.join(&relative),
+            size: 0,
+            sha1: None,
+        });
+        // launchwrapper + asm-all：OptiFineTweaker 的运行时依赖，和 OptiFine 自己
+        // 生成的 profile 里那两条一字不差。
+        for dependency in ["net.minecraft:launchwrapper:1.12", "org.ow2.asm:asm-all:5.2"] {
+            let Some(path) = library_path_from_name(dependency) else {
+                continue;
+            };
+            items.push(DownloadItem {
+                label: dependency.to_string(),
+                phase: "optifine".into(),
+                official_url: Some(format!("https://libraries.minecraft.net/{path}")),
+                // 这两条在 MC 官方库上，BMCLAPI 的 /maven/ 同样镜像。
+                mirror_url: Some(loaders::bmclapi_maven_url(&path)),
+                fallback_url: None,
+                prefer_mirror: false,
+                dest: libraries.join(&path),
+                size: 0,
+                sha1: None,
+            });
+        }
+        Ok(items)
+    }
+
     fn finish_modded_installer(
         &self,
         job: &Arc<Job>,
@@ -1131,6 +1251,160 @@ pub(crate) fn artifact_key(name: &str) -> String {
     }
 }
 
+/// OptiFine 从 1.13 起改成"普通 mod"投放（必须配合 Forge）；1.12.2 及更早是
+/// 打了补丁的 jar + launchwrapper tweaker。这个分界线决定了文件放哪、画像怎么写。
+pub fn is_modern_optifine(game: &str) -> bool {
+    let mut parts = game.split('.');
+    let major = parts.next().and_then(|s| s.parse::<u32>().ok());
+    let minor = parts.next().and_then(|s| s.parse::<u32>().ok());
+    match (major, minor) {
+        // 1.12.2 及以前的 1.x 一律算老版本；1.13+ 是新形态。
+        (Some(1), Some(minor)) => minor >= 13,
+        // 26.x 这类新编号（理论上没有 OptiFine）按新形态处理。
+        (Some(major), Some(_)) if major >= 2 => true,
+        _ => false,
+    }
+}
+
+/// 「同一个游戏版本只能有一个加载器画像」按**家族**判定：
+/// Forge 与 OptiFine 算一家——高版本里 OptiFine 本来就得挂在 Forge 上，
+/// 低版本也常见「先装 Forge 再放 OptiFine」。
+fn loader_family(kind: LoaderKind) -> LoaderKind {
+    match kind {
+        LoaderKind::OptiFine => LoaderKind::Forge,
+        other => other,
+    }
+}
+
+/// OptiFine 只能这么装：
+/// - 和 **Forge** 一起（1.8 起的常规玩法，jar 进 `mods/`）；
+/// - 或者 1.12.2 及更早**单独**装（launchwrapper + tweaker）。
+///
+/// Fabric / NeoForge 都不兼容 OptiFine；1.13+ 也没有"单独装"这条路（那会儿
+/// OptiFine 已经完全是 mod 了）。
+fn validate_optifine(req: &InstallRequest, optifine: &kaleid_api::OptifineRef) -> ApiResult<()> {
+    if optifine.kind.trim().is_empty() || optifine.patch.trim().is_empty() {
+        return Err(ApiError::invalid("OptiFine 版本不完整"));
+    }
+    match &req.loader {
+        InstallLoader::Forge { .. } => Ok(()),
+        InstallLoader::Fabric { .. } | InstallLoader::Neoforge { .. } => Err(ApiError::invalid(
+            "OptiFine 只能和 Forge 一起安装（Fabric / NeoForge 不支持 OptiFine）",
+        )),
+        InstallLoader::Vanilla => {
+            if is_modern_optifine(&req.game_version) {
+                Err(ApiError::invalid(format!(
+                    "{} 的 OptiFine 是 mod，必须和 Forge 一起安装；请先选择 Forge 再加 OptiFine。",
+                    req.game_version
+                )))
+            } else {
+                Ok(())
+            }
+        }
+    }
+}
+
+/// 低版本单独装 OptiFine 时要把画像改成 launchwrapper + tweaker。
+///
+/// OptiFine 自己的安装器产出的 profile 就是这个形状：`mainClass` 换成
+/// `net.minecraft.launchwrapper.Launch`，末尾加一条
+/// `--tweakClass optifine.OptiFineTweaker`，再把 OptiFine / launchwrapper /
+/// asm-all 三条库挂进去。
+fn apply_optifine_standalone(
+    root: &Root,
+    name: &str,
+    game: &str,
+    optifine: &kaleid_api::OptifineRef,
+) -> ApiResult<()> {
+    let dir = loader_version_dir(root, name);
+    let mut value = read_version_json(&dir, name)?;
+    let version = optifine.version();
+    value["mainClass"] = json!("net.minecraft.launchwrapper.Launch");
+
+    // legacy 版本用 `minecraftArguments` 字符串；少数版本用 `arguments.game` 数组。
+    let tweak = "optifine.OptiFineTweaker";
+    if let Some(args) = value.get("minecraftArguments").and_then(|v| v.as_str()) {
+        if !args.contains("--tweakClass") {
+            value["minecraftArguments"] = json!(format!("{args} --tweakClass {tweak}"));
+        }
+    } else {
+        let game_args = value
+            .get_mut("arguments")
+            .and_then(|a| a.get_mut("game"))
+            .and_then(|g| g.as_array_mut());
+        match game_args {
+            Some(list) => {
+                if !list.iter().any(|v| v == "--tweakClass") {
+                    list.push(json!("--tweakClass"));
+                    list.push(json!(tweak));
+                }
+            }
+            None => {
+                value["minecraftArguments"] = json!(format!(
+                    "--username ${{auth_player_name}} --version ${{version_name}} \
+                     --gameDir ${{game_directory}} --assetsDir ${{assets_root}} \
+                     --assetIndex ${{assets_index_name}} --uuid ${{auth_uuid}} \
+                     --userProperties ${{user_properties}} --userType ${{user_type}} \
+                     --tweakClass {tweak}"
+                ));
+            }
+        }
+    }
+
+    // 三条库：OptiFine 本体（我们自己的路径）+ launchwrapper + asm-all。
+    let libraries = value
+        .get_mut("libraries")
+        .and_then(|v| v.as_array_mut())
+        .ok_or_else(|| ApiError::Format(format!("{name} 的版本 JSON 没有 libraries")))?;
+    let mut push_lib = |entry: Value| {
+        let name = entry.get("name").and_then(|v| v.as_str()).unwrap_or_default();
+        if !libraries
+            .iter()
+            .any(|l| l.get("name").and_then(|v| v.as_str()) == Some(name))
+        {
+            libraries.push(entry);
+        }
+    };
+    push_lib(json!({
+        "name": loaders::optifine_library_coordinate(game, &version),
+        "downloads": { "artifact": {
+            "path": format!("optifine/OptiFine/{game}_{version}/OptiFine-{game}_{version}.jar"),
+            "size": 0,
+            "url": loaders::optifine_download_url(game, &optifine.kind, &optifine.patch),
+        }},
+    }));
+    push_lib(json!({"name": "net.minecraft:launchwrapper:1.12"}));
+    push_lib(json!({"name": "org.ow2.asm:asm-all:5.2"}));
+
+    // 记录 OptiFine 版本，侧栏/更新检查都要读它。
+    value["kaleidOptifine"] = json!({
+        "version": version,
+        "kind": optifine.kind,
+        "patch": optifine.patch,
+        "mode": "standalone",
+    });
+    write_version_json(root, name, &value)?;
+    write_loader_marker(&dir, "optifine", &version, game)?;
+    Ok(())
+}
+
+/// 配合 Forge 装 OptiFine 时只记一笔版本号：jar 在 `mods/` 里，画像仍是 Forge。
+fn record_optifine_mod(
+    root: &Root,
+    name: &str,
+    optifine: &kaleid_api::OptifineRef,
+) -> ApiResult<()> {
+    let dir = loader_version_dir(root, name);
+    let mut value = read_version_json(&dir, name)?;
+    value["kaleidOptifine"] = json!({
+        "version": optifine.version(),
+        "kind": optifine.kind,
+        "patch": optifine.patch,
+        "mode": "mod",
+    });
+    write_version_json(root, name, &value)
+}
+
 fn tail_lines(path: &Path, n: usize) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
     let lines: Vec<&str> = text.lines().collect();
@@ -1422,6 +1696,213 @@ fn rule_matches(rule: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 真机：BMCLAPI 的 OptiFine 列表与直链（老版本单装 / 高版本 mod 两条路都要通）。
+    ///
+    /// `cargo test -p kaleid-core-plugins real_optifine -- --ignored --nocapture`
+    #[test]
+    #[ignore = "联网，验证 BMCLAPI 的 OptiFine 列表与 jar 直链"]
+    fn real_optifine_list_and_jar_are_reachable() {
+        use std::io::Read;
+
+        let client = crate::remote::RemoteClient::new();
+        for game in ["1.12.2", "1.21.4"] {
+            let list = loaders::optifine_versions(&client, game)
+                .unwrap_or_else(|e| panic!("{game} 取不到 OptiFine 列表：{e}"));
+            assert!(!list.versions.is_empty(), "{game} 的 OptiFine 列表是空的");
+            let chosen = list
+                .versions
+                .iter()
+                .find(|v| v.stable)
+                .or_else(|| list.versions.first())
+                .unwrap();
+            let parsed = kaleid_api::OptifineRef::from_version(&chosen.version)
+                .unwrap_or_else(|| panic!("版本号解析不了：{}", chosen.version));
+            let url = loaders::optifine_download_url(game, &parsed.kind, &parsed.patch);
+            let response = client
+                .agent()
+                .get(&url)
+                .call()
+                .unwrap_or_else(|e| panic!("{url} 打不开：{e}"));
+            let mut bytes = Vec::new();
+            response.into_reader().read_to_end(&mut bytes).unwrap();
+            assert!(
+                bytes.starts_with(b"PK\x03\x04"),
+                "{url} 返回的不是 jar（{} 字节）",
+                bytes.len()
+            );
+            eprintln!("{} {} → {} 字节", game, chosen.version, bytes.len());
+        }
+    }
+
+    /// 一个最小可用的服务 + 根目录，给需要 `optifine_items` / 画像写盘的单测用。
+    fn service_with_root() -> (tempfile::TempDir, Root, InstallService) {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = Root {
+            id: "r".into(),
+            path: tmp.path().to_string_lossy().to_string(),
+            kind: kaleid_api::RootKind::BareMinecraft,
+            alias: "本地".into(),
+            added_at: "0".into(),
+            isolation: kaleid_api::IsolationMode::Off,
+            auto: false,
+            last_used: None,
+        };
+        let settings = Arc::new(Settings::open(tmp.path()));
+        let versions = Arc::new(VersionStore::new());
+        let roots = Arc::new(RootRegistry::open(tmp.path(), None).unwrap());
+        let downloads = Arc::new(DownloadManager::new(settings.clone()));
+        let service = InstallService::new(settings, versions, roots, downloads, tmp.path());
+        (tmp, root, service)
+    }
+
+    fn optifine_request(loader: InstallLoader, game: &str) -> InstallRequest {
+        InstallRequest {
+            root_id: "r".into(),
+            game_version: game.into(),
+            version_name: format!("{game}-optifine"),
+            loader,
+            install_fabric_api: false,
+            optifine: Some(kaleid_api::OptifineRef {
+                kind: "HD_U".into(),
+                patch: "J3".into(),
+            }),
+        }
+    }
+
+    /// OptiFine 的分界线：1.13 起是 mod，1.12.2 及更早靠 launchwrapper。
+    #[test]
+    fn optifine_modern_boundary() {
+        for old in ["1.7.10", "1.8.9", "1.12.2", "1.12", "1.6.4"] {
+            assert!(!is_modern_optifine(old), "{old} 应该是老形态");
+        }
+        for modern in ["1.13", "1.16.5", "1.20.1", "1.21.4", "26.1.2"] {
+            assert!(is_modern_optifine(modern), "{modern} 应该是 mod 形态");
+        }
+        assert!(!is_modern_optifine("nonsense"));
+    }
+
+    /// 高版本 OptiFine 只能和 Forge 一起装；低版本可以单独装。
+    #[test]
+    fn optifine_requires_forge_on_modern_versions() {
+        let of = kaleid_api::OptifineRef {
+            kind: "HD_U".into(),
+            patch: "J3".into(),
+        };
+        // Fabric / NeoForge 一律不行。
+        for loader in [
+            InstallLoader::Fabric {
+                version: "0.16.9".into(),
+            },
+            InstallLoader::Neoforge {
+                version: "21.1.72".into(),
+            },
+        ] {
+            let req = optifine_request(loader, "1.21.4");
+            assert!(validate_optifine(&req, &of).is_err());
+        }
+        // 1.21.4 单独装 OptiFine：不行，提示要先选 Forge。
+        let req = optifine_request(InstallLoader::Vanilla, "1.21.4");
+        let err = validate_optifine(&req, &of).unwrap_err().to_string();
+        assert!(err.contains("Forge"), "{err}");
+        // 1.21.4 + Forge：可以。
+        let req = optifine_request(
+            InstallLoader::Forge {
+                version: "54.1.22".into(),
+            },
+            "1.21.4",
+        );
+        assert!(validate_optifine(&req, &of).is_ok());
+        // 1.12.2 单独装：可以。
+        let req = optifine_request(InstallLoader::Vanilla, "1.12.2");
+        assert!(validate_optifine(&req, &of).is_ok());
+    }
+
+    /// 配合 Forge 时 OptiFine 只进 `mods/`，不碰画像。
+    #[test]
+    fn optifine_goes_to_mods_when_forge_is_present() {
+        let (_tmp, root, service) = service_with_root();
+        let of = kaleid_api::OptifineRef {
+            kind: "HD_U".into(),
+            patch: "J3".into(),
+        };
+        let items = service
+            .optifine_items(&root, "1.21.4-forge-optifine", "1.21.4", &of, true)
+            .unwrap();
+        assert_eq!(items.len(), 1, "Forge 路线只该有一条 OptiFine");
+        let item = &items[0];
+        assert!(item
+            .dest
+            .to_string_lossy()
+            .replace('\\', "/")
+            .ends_with("mods/OptiFine_1.21.4_HD_U_J3.jar"));
+        assert_eq!(
+            item.mirror_url.as_deref(),
+            Some("https://bmclapi2.bangbang93.com/optifine/1.21.4/HD_U/J3")
+        );
+        assert!(item.prefer_mirror, "官网那条要过跳转，应该先试 BMCLAPI");
+    }
+
+    /// 单独装（1.12.2）时要带上 launchwrapper 与 asm-all，并且画像改成 tweaker。
+    #[test]
+    fn optifine_standalone_writes_a_launchwrapper_profile() {
+        let (_tmp, root, service) = service_with_root();
+        let of = kaleid_api::OptifineRef {
+            kind: "HD_U".into(),
+            patch: "G5".into(),
+        };
+        // 先铺一份 1.12.2 形状的版本 JSON（vanilla_core_items 就是这么写的）。
+        let dir = loader_version_dir(&root, "1.12.2-optifine");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("1.12.2-optifine.json"),
+            serde_json::to_string_pretty(&json!({
+                "id": "1.12.2-optifine",
+                "mainClass": "net.minecraft.client.main.Main",
+                "minecraftArguments": "--username ${auth_player_name} --gameDir ${game_directory}",
+                "libraries": [{"name": "com.mojang:logging:1.12.2"}]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let items = service
+            .optifine_items(&root, "1.12.2-optifine", "1.12.2", &of, false)
+            .unwrap();
+        // OptiFine 本体 + launchwrapper + asm-all
+        assert_eq!(items.len(), 3, "{:?}", items.iter().map(|i| &i.label).collect::<Vec<_>>());
+        assert!(items
+            .iter()
+            .any(|i| i.dest.to_string_lossy().replace('\\', "/")
+                .ends_with("libraries/optifine/OptiFine/1.12.2_HD_U_G5/OptiFine-1.12.2_HD_U_G5.jar")));
+        assert!(items
+            .iter()
+            .any(|i| i.dest.to_string_lossy().replace('\\', "/")
+                .ends_with("launchwrapper-1.12.jar")));
+        assert!(items
+            .iter()
+            .any(|i| i.dest.to_string_lossy().replace('\\', "/").ends_with("asm-all-5.2.jar")));
+
+        apply_optifine_standalone(&root, "1.12.2-optifine", "1.12.2", &of).unwrap();
+        let value: Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("1.12.2-optifine.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(value["mainClass"], "net.minecraft.launchwrapper.Launch");
+        let args = value["minecraftArguments"].as_str().unwrap();
+        assert!(args.contains("--tweakClass optifine.OptiFineTweaker"), "{args}");
+        let names: Vec<String> = value["libraries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["name"].as_str().unwrap_or_default().to_string())
+            .collect();
+        assert!(names.iter().any(|n| n == "optifine:OptiFine:1.12.2_HD_U_G5"), "{names:?}");
+        assert!(names.iter().any(|n| n == "net.minecraft:launchwrapper:1.12"), "{names:?}");
+        assert!(names.iter().any(|n| n == "org.ow2.asm:asm-all:5.2"), "{names:?}");
+        assert_eq!(value["kaleidOptifine"]["mode"], "standalone");
+        assert!(dir.join(".optifine/loader.json").is_file(), "要留标记目录");
+    }
 
     /// 版本 JSON 一到手，客户端与依赖库就该先排进下载队列，不用等整份资源索引。
     ///

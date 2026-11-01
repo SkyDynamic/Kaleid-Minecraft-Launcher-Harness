@@ -4,6 +4,7 @@
 //! - 版本 JSON 里出现 `net.fabricmc` → **Fabric**
 //! - 出现 `net.neoforged` / `neoforge` → **NeoForge**
 //! - 出现 `net.minecraftforge` → **Forge**
+//! - 出现 `optifine` 且上面都不匹配 → **OptiFine**（低版本单独装的那种）
 //! - 否则若没有 `inheritsFrom` → **原版**
 //! - 其余（Quilt / 残缺）→ **未识别**，v1 只提供「打开目录」
 
@@ -146,6 +147,12 @@ fn classify(value: &Value) -> LoaderKind {
     if blob.contains("fabric-loader") || blob.contains("net.fabricmc") {
         return LoaderKind::Fabric;
     }
+    // OptiFine 排在 Forge / NeoForge 之后：高版本「Forge + OptiFine」仍然是 Forge
+    // 版本（模组筛选、更新检查照旧按 Forge 走），只有低版本单独装 OptiFine 的
+    // 画像才该归到 OptiFine 组。
+    if blob.contains("optifine") {
+        return LoaderKind::OptiFine;
+    }
     let has_parent = value
         .get("inheritsFrom")
         .and_then(|v| v.as_str())
@@ -243,6 +250,9 @@ fn loader_version(value: &Value, loader: LoaderKind) -> Option<String> {
         LoaderKind::Fabric => "net.fabricmc:fabric-loader:",
         LoaderKind::Forge => "net.minecraftforge:forge:",
         LoaderKind::NeoForge => "net.neoforged:neoforge:",
+        // 单独装的 OptiFine：坐标是 `optifine:OptiFine:1.12.2_HD_U_G5`，
+        // 去掉游戏版本前缀就是 OptiFine 自己的版本号。
+        LoaderKind::OptiFine => "optifine:OptiFine:",
         _ => return None,
     };
     let libs = value.get("libraries").and_then(|v| v.as_array())?;
@@ -250,7 +260,14 @@ fn loader_version(value: &Value, loader: LoaderKind) -> Option<String> {
         let name = lib.get("name").and_then(|v| v.as_str())?;
         if let Some(rest) = name.strip_prefix(prefix) {
             // Forge 的坐标带 classifier：`net.minecraftforge:forge:1.21.4-54.1.22:universal`。
-            return Some(rest.split(':').next().unwrap_or(rest).to_string());
+            let version = rest.split(':').next().unwrap_or(rest);
+            if loader == LoaderKind::OptiFine {
+                // `1.12.2_HD_U_G5` → `HD_U_G5`
+                if let Some((_, tail)) = version.split_once('_') {
+                    return Some(tail.to_string());
+                }
+            }
+            return Some(version.to_string());
         }
     }
     // NeoForge 早期命名 `net.neoforged:forge:`
@@ -670,6 +687,37 @@ mod tests {
             false,
             &[],
         );
+        // 1.12.2 单独装 OptiFine：有 optifine 坐标、没有 Forge。
+        write_version(
+            &f.root,
+            "1.12.2-optifine",
+            json!({
+                "id": "1.12.2-optifine",
+                "inheritsFrom": "1.12.2",
+                "mainClass": "net.minecraft.launchwrapper.Launch",
+                "libraries": [
+                    {"name": "optifine:OptiFine:1.12.2_HD_U_G5"},
+                    {"name": "net.minecraft:launchwrapper:1.12"}
+                ]
+            }),
+            false,
+            &[],
+        );
+        // 高版本 Forge + OptiFine：OptiFine 只是 mods 里的一个 jar，画像仍是 Forge。
+        write_version(
+            &f.root,
+            "1.20.1-forge-optifine",
+            json!({
+                "id": "1.20.1-forge-optifine",
+                "inheritsFrom": "1.20.1",
+                "libraries": [
+                    {"name": "net.minecraftforge:forge:1.20.1-47.2.0:universal"},
+                    {"name": "optifine:OptiFine:1.20.1_HD_U_I6"}
+                ]
+            }),
+            false,
+            &[],
+        );
 
         let store = VersionStore::new();
         let mut list = store.scan(&f.root).unwrap();
@@ -693,6 +741,14 @@ mod tests {
             by_id("1.20.1-forge").loader_version.as_deref(),
             Some("47.2.0")
         );
+        // 单独装 OptiFine 的低版本归到 OptiFine 组，版本号去掉游戏版本前缀。
+        assert_eq!(by_id("1.12.2-optifine").loader, LoaderKind::OptiFine);
+        assert_eq!(
+            by_id("1.12.2-optifine").loader_version.as_deref(),
+            Some("HD_U_G5")
+        );
+        // Forge + OptiFine 仍然是 Forge：模组筛选、更新检查都照旧。
+        assert_eq!(by_id("1.20.1-forge-optifine").loader, LoaderKind::Forge);
     }
 
     #[test]

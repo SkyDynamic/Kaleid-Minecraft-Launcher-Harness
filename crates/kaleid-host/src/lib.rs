@@ -439,6 +439,8 @@ struct InstallArgs {
     loader: kaleid_api::InstallLoader,
     #[serde(default)]
     install_fabric_api: bool,
+    #[serde(default)]
+    optifine: Option<kaleid_api::OptifineRef>,
 }
 
 #[derive(Deserialize)]
@@ -736,6 +738,7 @@ pub fn dispatch(kernel: &Kernel, cmd: &str, args: Value) -> Result<Value, String
                 version_name: a.version_name,
                 loader: a.loader,
                 install_fabric_api: a.install_fabric_api,
+                optifine: a.optifine,
             };
             to_value(
                 install(kernel)?

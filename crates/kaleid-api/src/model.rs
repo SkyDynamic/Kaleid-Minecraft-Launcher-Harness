@@ -100,7 +100,7 @@ pub fn resolve_isolation(folder: IsolationMode, global_default: bool) -> bool {
 // 版本
 // ---------------------------------------------------------------------------
 
-/// 侧栏按原版 / Fabric / Forge / NeoForge 分组，其余进「未识别」折叠组。
+/// 侧栏按原版 / Fabric / Forge / NeoForge / OptiFine 分组，其余进「未识别」折叠组。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LoaderKind {
@@ -108,6 +108,8 @@ pub enum LoaderKind {
     Fabric,
     Forge,
     NeoForge,
+    /// 1.8.9 / 1.12.2 这类低版本单独装 OptiFine：没有别的加载器，靠 tweaker 起。
+    OptiFine,
     /// Quilt / 结构损坏等：v1 只允许「打开目录」。
     Unrecognized,
 }
@@ -119,11 +121,12 @@ impl LoaderKind {
             LoaderKind::Fabric => "Fabric",
             LoaderKind::Forge => "Forge",
             LoaderKind::NeoForge => "NeoForge",
+            LoaderKind::OptiFine => "OptiFine",
             LoaderKind::Unrecognized => "未识别",
         }
     }
 
-    /// 稳定的英文标识：写标记目录（`.fabric` / `.forge` / `.neoforge`）、
+    /// 稳定的英文标识：写标记目录（`.fabric` / `.forge` / `.neoforge` / `.optifine`）、
     /// 命令行参数和缓存键都用它，避免和中文展示名绑在一起。
     pub fn slug(self) -> &'static str {
         match self {
@@ -131,6 +134,7 @@ impl LoaderKind {
             LoaderKind::Fabric => "fabric",
             LoaderKind::Forge => "forge",
             LoaderKind::NeoForge => "neoforge",
+            LoaderKind::OptiFine => "optifine",
             LoaderKind::Unrecognized => "unrecognized",
         }
     }

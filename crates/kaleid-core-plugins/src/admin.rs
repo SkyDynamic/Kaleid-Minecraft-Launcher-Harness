@@ -114,6 +114,12 @@ impl VersionAdmin {
         if loader == LoaderKind::Vanilla {
             return Ok(status);
         }
+        // OptiFine 没有"原地换版本"这条路：配合 Forge 时它只是 mods 里的一个 jar，
+        // 单独装时画像（tweakClass / libraries）也要一起改。所以这里不给更新提示，
+        // 免得界面显示「有新版」、点下去却失败。
+        if loader == LoaderKind::OptiFine {
+            return Ok(status);
+        }
         let Some(game) = game else {
             return Ok(status);
         };
@@ -157,6 +163,7 @@ impl VersionAdmin {
             LoaderKind::Fabric => loaders::fabric_loaders(&self.remote, game),
             LoaderKind::Forge => loaders::forge_loaders(&self.remote, game),
             LoaderKind::NeoForge => loaders::neoforge_loaders(&self.remote, game),
+            LoaderKind::OptiFine => loaders::optifine_versions(&self.remote, game),
             LoaderKind::Vanilla | LoaderKind::Unrecognized => Ok(kaleid_api::LoaderVersions {
                 game_version: game.to_string(),
                 loader: loader.slug().to_string(),

@@ -20,6 +20,8 @@ const NEOFORGE_MAVEN: &str = "https://maven.neoforged.net";
 const NEOFORGE_API: &str =
     "https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge";
 const BMCLAPI_MAVEN: &str = "https://bmclapi2.bangbang93.com/maven";
+/// OptiFine 的列表与直链都在 BMCLAPI 上（官网要过 adfocus 跳转，抓不动）。
+const BMCLAPI_OPTIFINE: &str = "https://bmclapi2.bangbang93.com/optifine";
 const MODRINTH: &str = "https://api.modrinth.com/v2";
 
 pub fn fabric_loaders(client: &RemoteClient, game: &str) -> ApiResult<LoaderVersions> {
@@ -316,6 +318,93 @@ pub fn bmclapi_maven_url(path: &str) -> String {
     )
 }
 
+// ---------------------------------------------------------------------------
+// OptiFine
+// ---------------------------------------------------------------------------
+
+/// OptiFine 的 `version` 形如 `HD_U_J3`（类型 + 补丁号），目录列表就是这个形状。
+///
+/// BMCLAPI 的 `/optifine/<游戏版本>` 直接给出 OptiFine 官网那份列表：
+/// `[{mcversion, type, patch, filename, forge}]`。它比 OptiFine 官网好抓
+/// （官网要过 adfocus 跳转），也不依赖 Forge/NeoForge 那套 Maven。
+pub fn optifine_versions(client: &RemoteClient, game: &str) -> ApiResult<LoaderVersions> {
+    let value = client.get_json(&format!(
+        "{BMCLAPI_OPTIFINE}/{}",
+        url_encode(game)
+    ))?;
+    parse_optifine_list(game, &value)
+}
+
+/// 把 BMCLAPI 的 OptiFine 列表解析成 [`LoaderVersions`]（不碰网络，单测用）。
+pub fn parse_optifine_list(game: &str, value: &Value) -> ApiResult<LoaderVersions> {
+    let rows = value
+        .as_array()
+        .ok_or_else(|| ApiError::Format("OptiFine 版本列表格式不认识".into()))?;
+    let mut versions = Vec::with_capacity(rows.len());
+    for row in rows {
+        let patch = row
+            .get("patch")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        let kind = row.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        if patch.is_empty() || kind.is_empty() {
+            continue;
+        }
+        // `HD_U_J4_pre1` 这种预览版标记成 unstable，但仍列出来——老版本玩家经常
+        // 就得靠预览版才能配合特定 Forge。
+        let stable = !patch.to_ascii_lowercase().contains("pre");
+        versions.push(LoaderVersion {
+            version: format!("{kind}_{patch}"),
+            stable,
+            recommended: false,
+            time: None,
+        });
+    }
+    // BMCLAPI 的列表是**由旧到新**（1.12.2 第一条是 HD_U_C5）。和 Forge / NeoForge
+    // 那几份保持一致，统一翻成"由新到旧"，界面默认选中第一条就是最新稳定版。
+    versions.reverse();
+    let recommended = versions
+        .iter()
+        .find(|v| v.stable)
+        .map(|v| v.version.clone())
+        .or_else(|| versions.first().map(|v| v.version.clone()));
+    for v in &mut versions {
+        v.recommended = recommended.as_deref() == Some(v.version.as_str());
+    }
+    Ok(LoaderVersions {
+        game_version: game.to_string(),
+        loader: "optifine".into(),
+        versions,
+        recommended,
+        fetched_at: now_secs(),
+    })
+}
+
+/// BMCLAPI 的 OptiFine 直链：`/optifine/<游戏版本>/<类型>/<补丁号>` 直接返回 jar。
+pub fn optifine_download_url(game: &str, kind: &str, patch: &str) -> String {
+    format!(
+        "{BMCLAPI_OPTIFINE}/{}/{}/{}",
+        url_encode(game),
+        url_encode(kind),
+        url_encode(patch)
+    )
+}
+
+/// OptiFine 官网的备用地址（`download?f=<文件名>` 会 302 到镜像站）。
+pub fn optifine_official_url(file_name: &str) -> String {
+    format!("https://optifine.net/download?f={}", url_encode(file_name))
+}
+
+/// OptiFine jar 的文件名，官方/BMCLAPI 共用这一份命名。
+pub fn optifine_jar_name(game: &str, version: &str) -> String {
+    format!("OptiFine_{game}_{version}.jar")
+}
+
+/// OptiFine 在低版本单装时的库坐标（与 OptiFine 自己 build 出来的 profile 一致）。
+pub fn optifine_library_coordinate(game: &str, version: &str) -> String {
+    format!("optifine:OptiFine:{game}_{version}")
+}
+
 pub fn fabric_api_latest(client: &RemoteClient, game: &str) -> ApiResult<Option<FabricApiInfo>> {
     let query = format!(
         "{MODRINTH}/project/fabric-api/version?game_versions=%5B%22{}%22%5D&loaders=%5B%22fabric%22%5D",
@@ -492,6 +581,44 @@ fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// BMCLAPI 的 OptiFine 列表形状：类型与补丁号分开给，拼成 `HD_U_J3`。
+    #[test]
+    fn optifine_list_parses_bmclapi_shape() {
+        let rows = serde_json::json!([
+            {"mcversion": "1.21.4", "type": "HD_U", "patch": "J3",
+             "filename": "OptiFine_1.21.4_HD_U_J3.jar", "forge": "Forge 54.0.34"},
+            {"mcversion": "1.21.4", "type": "HD_U", "patch": "J4_pre1",
+             "filename": "OptiFine_1.21.4_HD_U_J4_pre1.jar", "forge": ""}
+        ]);
+        let list = parse_optifine_list("1.21.4", &rows).unwrap();
+
+        assert_eq!(list.loader, "optifine");
+        assert_eq!(list.game_version, "1.21.4");
+        let ids: Vec<&str> = list.versions.iter().map(|v| v.version.as_str()).collect();
+        // BMCLAPI 给的是由旧到新，返回给界面的统一是由新到旧。
+        assert_eq!(ids, vec!["HD_U_J4_pre1", "HD_U_J3"]);
+        assert!(!list.versions[0].stable, "预览版不能标成稳定版");
+        assert!(list.versions[1].stable);
+        assert_eq!(list.recommended.as_deref(), Some("HD_U_J3"));
+        assert!(list.versions[1].recommended);
+
+        // 地址与文件名要和上面拼出来的 version 对得上。
+        assert_eq!(
+            optifine_download_url("1.12.2", "HD_U", "G5"),
+            "https://bmclapi2.bangbang93.com/optifine/1.12.2/HD_U/G5"
+        );
+        assert_eq!(
+            optifine_jar_name("1.12.2", "HD_U_G5"),
+            "OptiFine_1.12.2_HD_U_G5.jar"
+        );
+        assert_eq!(
+            optifine_library_coordinate("1.12.2", "HD_U_G5"),
+            "optifine:OptiFine:1.12.2_HD_U_G5"
+        );
+        assert!(optifine_official_url("OptiFine_1.12.2_HD_U_G5.jar")
+            .starts_with("https://optifine.net/download?f="));
+    }
 
     #[test]
     fn parses_forge_maven_versions_and_builds_installer_url() {
