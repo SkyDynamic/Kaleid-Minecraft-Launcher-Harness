@@ -1754,29 +1754,53 @@ fn fair_targets(consumers: &[ShareConsumer], budget: usize) -> Vec<usize> {
             .then(consumers[b].remaining_bytes.cmp(&consumers[a].remaining_bytes))
             .then(a.cmp(&b))
     });
-    let mut slots = budget;
-    for &index in &active {
+    let multi: Vec<usize> = active
+        .iter()
+        .copied()
+        .filter(|&index| consumers[index].multi)
+        .collect();
+    let singles: Vec<usize> = active
+        .iter()
+        .copied()
+        .filter(|&index| !consumers[index].multi)
+        .collect();
+    // 可分段文件优先拿预算；但只要还有单流文件，就至少留一半给分段文件。
+    //
+    // 没有这条保底时，一个原版安装里几千个小资源会把连接预算占满——排序虽然把 multi
+    // 排在前面，可"每人 1 条"之后就再没有余量，于是 28 MB 的客户端 jar 只能用一条
+    // 连接慢慢爬，看起来就是"下载客户端只用了一个线程"。
+    let mut multi_pot = budget;
+    if !singles.is_empty() && budget >= 2 {
+        multi_pot = (budget / 2).max(multi.len()).min(budget);
+    }
+    if !multi.is_empty() {
+        // 分段文件之间公平分，余数按剩余字节从多到少发。
+        let share = multi_pot / multi.len();
+        let rem = multi_pot % multi.len();
+        let mut ordered = multi.clone();
+        ordered.sort_by(|&a, &b| {
+            consumers[b]
+                .remaining_bytes
+                .cmp(&consumers[a].remaining_bytes)
+                .then(a.cmp(&b))
+        });
+        for (rank, index) in ordered.into_iter().enumerate() {
+            targets[index] = share + usize::from(rank < rem);
+        }
+    }
+    let mut slots = budget.saturating_sub(targets.iter().sum::<usize>());
+    // 剩下的给单流文件各 1 条。
+    for &index in &singles {
         if slots == 0 {
             break;
         }
         targets[index] = 1;
         slots -= 1;
     }
-    let mut large: Vec<usize> = active
-        .into_iter()
-        .filter(|&index| consumers[index].multi && targets[index] >= 1)
-        .collect();
-    if !large.is_empty() && slots > 0 {
-        let share = slots / large.len();
-        let rem = slots % large.len();
-        large.sort_by(|&a, &b| {
-            consumers[b]
-                .remaining_bytes
-                .cmp(&consumers[a].remaining_bytes)
-                .then(a.cmp(&b))
-        });
-        for (rank, index) in large.into_iter().enumerate() {
-            targets[index] += share + usize::from(rank < rem);
+    // 还有空位就补给第一个分段文件（它最吃得到连接）。
+    if slots > 0 {
+        if let Some(&big) = multi.first() {
+            targets[big] += slots;
         }
     }
     for (index, consumer) in consumers.iter().enumerate() {

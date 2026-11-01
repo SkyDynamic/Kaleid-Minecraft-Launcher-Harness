@@ -517,6 +517,50 @@ fn gives_up_on_a_persistently_throttled_source_and_switches() {
 }
 
 #[test]
+fn biggest_file_keeps_at_least_half_the_budget() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = manager_with_concurrency(dir.path(), 8);
+
+    // 一个大文件：慢写，这样"同时有几个连接"才观察得到。
+    let big_body = body_of(4 * 1024 * 1024);
+    let big = TestServer::start(
+        big_body.clone(),
+        Mode::SlowRange {
+            chunk: 32 * 1024,
+            delay_ms: 5,
+        },
+    );
+    // 一大堆小文件：它们最容易把连接预算吃干净。
+    let small_body = body_of(4 * 1024);
+    let smalls = TestServer::start(small_body.clone(), Mode::RangeOk);
+
+    let mut items = vec![item(
+        "客户端",
+        format!("{}/client.jar", big.base),
+        &dir.path().join("client.jar"),
+        &big_body,
+    )];
+    for index in 0..120 {
+        items.push(item(
+            &format!("资源 {index}"),
+            format!("{}/assets/{index}", smalls.base),
+            &dir.path().join(format!("asset-{index}.bin")),
+            &small_body,
+        ));
+    }
+
+    manager.run_batch(job("floor"), items).expect("批量下载应当成功");
+
+    // 回归点：小文件排队时，大文件必须还能吃到预算的一半。
+    assert!(
+        big.peak.load(Ordering::SeqCst) >= 4,
+        "大文件应当至少占用一半连接（实测峰值 {}）",
+        big.peak.load(Ordering::SeqCst)
+    );
+    assert_eq!(std::fs::read(dir.path().join("client.jar")).unwrap(), big_body);
+}
+
+#[test]
 fn reprobes_ranges_after_switching_source() {
     let dir = tempfile::tempdir().unwrap();
     // 超过 1 MiB 才会尝试分段。
