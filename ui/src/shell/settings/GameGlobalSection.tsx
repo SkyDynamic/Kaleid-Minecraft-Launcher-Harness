@@ -26,6 +26,7 @@ const HIGH_CONCURRENCY_WARNING =
   '如果设置过多的下载线程，可能会导致下载时出现非常严重的卡顿。建议设置到最大64线程即可满足下载需求，除非你知道你自己在做什么。';
 
 const SOURCE_OPTIONS: Array<{ value: string; label: string }> = [
+  { value: 'auto', label: '自动（推荐）' },
   { value: 'official-first', label: '官方优先' },
   { value: 'mirror-first', label: '镜像优先' },
   { value: 'official-only', label: '仅官方' },
@@ -324,13 +325,15 @@ export function GameGlobalSection() {
         <Row
           label="下载源"
           hint={
-            global.downloadSource === 'mirror-first'
-              ? '镜像优先：先走 BMCLAPI，失败再回官方源。'
-              : global.downloadSource === 'mirror-only'
-                ? '仅镜像：只走 BMCLAPI，官方源不会被访问。'
-                : global.downloadSource === 'official-only'
-                  ? '仅官方：只走官方源，不会自动切换到镜像。'
-                  : '官方优先：先走 Mojang，连续两个 3 秒窗口低于 512 KB/s 自动切 BMCLAPI。'
+            global.downloadSource === 'auto'
+              ? '自动：逐个文件探测镜像的去向——镜像只是把文件转回官方的（比如客户端 jar）就直连官方，真的跳到国内节点的就走镜像。'
+              : global.downloadSource === 'mirror-first'
+                ? '镜像优先：先走 BMCLAPI，失败再回官方源。'
+                : global.downloadSource === 'mirror-only'
+                  ? '仅镜像：只走 BMCLAPI，官方源不会被访问。'
+                  : global.downloadSource === 'official-only'
+                    ? '仅官方：只走官方源，不会自动切换到镜像。'
+                    : '官方优先：先走 Mojang，连续两个 3 秒窗口低于 512 KB/s 自动切 BMCLAPI。'
           }
         >
           <SegmentedControl

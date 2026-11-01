@@ -214,7 +214,7 @@ function seedGlobal(): GlobalSettings {
     language: 'zh-CN',
     theme: 'dark',
     downloadConcurrency: 8,
-    downloadSource: 'official-first',
+    downloadSource: 'auto',
     modSource: 'official-first',
     modDescription: 'original',
     checkBeforeLaunch: true,

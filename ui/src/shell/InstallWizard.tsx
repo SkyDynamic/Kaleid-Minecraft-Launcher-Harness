@@ -716,23 +716,27 @@ export function InstallWizard() {
 
   const selectedIcon = versionIcon(selected, loaderChoice);
   const nameOk = Boolean(name.trim()) && !nameError && !checkingName;
-  const downloadSource = globalSettings?.downloadSource ?? 'official-first';
+  const downloadSource = globalSettings?.downloadSource ?? 'auto';
   const sourceLabel =
-    downloadSource === 'mirror-first'
-      ? 'BMCLAPI → 官方'
-      : downloadSource === 'mirror-only'
-        ? '仅 BMCLAPI'
-        : downloadSource === 'official-only'
-          ? '仅官方源'
-          : '官方优先 → BMCLAPI';
+    downloadSource === 'auto'
+      ? '自动选源'
+      : downloadSource === 'mirror-first'
+        ? 'BMCLAPI → 官方'
+        : downloadSource === 'mirror-only'
+          ? '仅 BMCLAPI'
+          : downloadSource === 'official-only'
+            ? '仅官方源'
+            : '官方优先 → BMCLAPI';
   const sourceHint =
-    downloadSource === 'mirror-first'
-      ? 'BMCLAPI 优先；文件失败时回退官方源'
-      : downloadSource === 'mirror-only'
-        ? '只使用 BMCLAPI 镜像；官方源不会被访问'
-        : downloadSource === 'official-only'
-          ? '仅使用官方源；文件失败时不会自动切换镜像'
-          : '官方源优先；连续两个测速窗口低于 512 KB/s 时自动切换 BMCLAPI';
+    downloadSource === 'auto'
+      ? '逐个文件判断：镜像只是转回官方的就直连官方，真跳到国内节点的走镜像'
+      : downloadSource === 'mirror-first'
+        ? 'BMCLAPI 优先；文件失败时回退官方源'
+        : downloadSource === 'mirror-only'
+          ? '只使用 BMCLAPI 镜像；官方源不会被访问'
+          : downloadSource === 'official-only'
+            ? '仅使用官方源；文件失败时不会自动切换镜像'
+            : '官方源优先；连续两个测速窗口低于 512 KB/s 时自动切换 BMCLAPI';
 
   return (
     <Dialog

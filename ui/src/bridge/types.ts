@@ -212,6 +212,7 @@ export interface GlobalSettings {
   language: string;
   theme: string;
   downloadConcurrency: number;
+  /** 下载源：auto（自动，推荐）/ official-first / mirror-first / official-only / mirror-only。 */
   downloadSource: string;
   /** Mod 数据源：official-first（官方优先）/ mirror-first（镜像优先）/ official-only（仅官方）。 */
   modSource: string;
