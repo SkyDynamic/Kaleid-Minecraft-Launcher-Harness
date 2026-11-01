@@ -808,5 +808,8 @@ export interface MsaAccountState {
   accountId: string;
   hasRefreshToken: boolean;
   expiresAt: number | null;
+  /** 这次登录还能用（访问令牌没过期，或者能自动续期）。 */
   usable: boolean;
+  /** 微软已经作废了刷新令牌：只能重新登录。 */
+  reloginRequired: boolean;
 }

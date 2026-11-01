@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Plus, TriangleAlert } from 'lucide-react';
+import { LogIn, Plus, TriangleAlert } from 'lucide-react';
 import { getBridge } from '../bridge';
 import type { Account, AccountKind, MsaAccountState, MsaConfig } from '../bridge/types';
 import { Button, Card, Label, PillTabs, TextLink } from '../primitives';
@@ -222,9 +222,13 @@ function MsaPanel({ accounts, active }: { accounts: Account[]; active: Account |
             {hero?.name ?? '未登录'}
           </div>
           <div className="mt-[3px] text-[11px] leading-[14px] text-ink4">
-            {hero && stateOf(hero.id)?.usable === false
-              ? '正版账号 · 登录已过期'
-              : '正版账号'}
+            {hero && stateOf(hero.id)?.reloginRequired
+              ? '正版账号 · 需要重新登录'
+              : hero && stateOf(hero.id)?.usable === false
+                ? '正版账号 · 登录已过期'
+                : hero
+                  ? '正版账号 · 登录有效 · 自动续期'
+                  : '正版账号'}
           </div>
         </div>
       </div>
@@ -278,12 +282,26 @@ function MsaPanel({ accounts, active }: { accounts: Account[]; active: Account |
         >
           添加正版账号
         </Button>
+        {hero && stateOf(hero.id)?.reloginRequired ? (
+          <Button
+            variant="primary"
+            size="sm"
+            icon={<LogIn size={12} />}
+            onClick={() => setLoginOpen(true)}
+          >
+            重新登录
+          </Button>
+        ) : null}
         {config?.configured === false ? (
           <p className="m-0 max-w-[320px] text-center text-[10.5px] leading-[14px] text-ink4">
             还没配置微软 client_id（build.env 的 KALEID_MSA_CLIENT_ID），配好重新编译即可登录。
           </p>
         ) : null}
-        {hero && stateOf(hero.id)?.usable === false ? (
+        {hero && stateOf(hero.id)?.reloginRequired ? (
+          <p className="m-0 max-w-[320px] text-center text-[10.5px] leading-[14px] text-ink4">
+            微软已经不再认可这个账号的登录状态（可能改过密码或太久没用），请重新登录一次。
+          </p>
+        ) : hero && stateOf(hero.id)?.usable === false ? (
           <p className="m-0 max-w-[320px] text-center text-[10.5px] leading-[14px] text-ink4">
             访问令牌已过期，启动时会自动用刷新令牌续期；续不上就重新添加一次账号。
           </p>

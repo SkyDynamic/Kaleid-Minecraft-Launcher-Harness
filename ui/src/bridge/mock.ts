@@ -1736,6 +1736,7 @@ async function dispatch(cmd: string, args?: unknown): Promise<unknown> {
           hasRefreshToken: msaTokens.has(a.id),
           expiresAt: msaTokens.has(a.id) ? now + 3600 : null,
           usable: msaTokens.has(a.id),
+          reloginRequired: false,
         }));
     }
 
