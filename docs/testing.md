@@ -14,11 +14,11 @@ cargo test --workspace
 |---|---|
 | `kaleid-kernel` | 29 |
 | `kaleid-api` | 20 |
-| `kaleid-core-plugins` | 271（258 单元 + 13 集成；另有 9 个手动真机 / 联网用例标了 `#[ignore]`） |
+| `kaleid-core-plugins` | 304（288 单元 + 16 集成；其中 11 个手动真机 / 联网用例标了 `#[ignore]`，默认跳过） |
 | `kaleid-host` | 23 |
 | `kaleid-cli`（`tests/flow.rs` 集成） | 7 |
 
-> `kaleid-core-plugins` 的 245 个单元里，几块值得单独记一笔：4 个 NBT、7 个 Java 运行时、
+> `kaleid-core-plugins` 的 288 个单元里，几块值得单独记一笔：4 个 NBT、7 个 Java 运行时、
 > 21 个本地内容、19 个微软登录（响应解析、XErr 翻译、DPAPI 令牌存储）、
 > 6 个下载重试/分段/阶段，以及两个「校验只看 `.minecraft` 根目录」的回归用例。
 >
@@ -71,6 +71,27 @@ cargo test --workspace
 > 之后拿到非零码也不算），`game.rs` 3 条（「结束进程」不算崩溃、真崩了窗口那步仍保持
 > 完成、上一次留下的 crash-reports 不挂到这一次上）。
 >
+> 2026-11-01 这一轮（老版本启动 / NeoForge 安装 / OptiFine / 离线中文名）新增 18 条，
+> 另有 2 条联网用例标了 `#[ignore]`：
+> - `natives.rs` 5 条：classifier 按当前系统挑选、`rules` 过滤掉别的平台、
+>   坐标 → `libraries` 路径、同一库的多个 classifier 不互相覆盖、
+>   64 位下 32 位 natives 不算。
+> - `launch.rs` 4 条：legacy 画像能拼出完整命令行、`${auth_session}` /
+>   `${user_properties}` 不残留占位符、natives 目录落在 `versions/<id>/natives`、
+>   classifier 的 natives jar 只解压不进 classpath。
+> - `install.rs` 4 条 + 1 条画像用例：安装器必须是 zip（不是 HTML 错误页）、
+>   安装器失败提示指向下载源、OptiFine 的现代 / legacy 分界（1.13 起是 mod）、
+>   Fabric 与 NeoForge 不能配 OptiFine、配 Forge 时只往 `mods/` 放一条、
+>   单装时画像换成 `launchwrapper` + `OptiFineTweaker` 并留 `.optifine` 标记。
+> - `downloads.rs` 1 条：`prefer_mirror` 把 BMCLAPI 排前面，且不破坏「仅官方」。
+> - `loaders.rs` 1 条：BMCLAPI 的 OptiFine 列表被翻成由新到旧，`pre` 版不算稳定版。
+> - `versions.rs` 在既有的分类用例里加了三条断言：单装 OptiFine 归到 OptiFine 组、
+>   版本号去掉游戏版本前缀、Forge + OptiFine 仍算 Forge。
+> - `accounts.rs` 1 条：中文名可设、uuid 按 Java 规则算、改回英文名仍复用同一档案。
+> - `kaleid-api` 的 `offline_name_rules` 与 `kaleid-cli` 的
+>   `offline_name_rules_match_api_contract` 一起钉住 16/17 位边界、混合中英、
+>   假名与空格：**汉字放开、其它非 ASCII 仍拒绝**。
+>
 > 8 个集成用例在 `tests/download_retry.rs`：进程内起一个最小 HTTP/1.1 服务，验证
 > 「连接被掐断后重试」「连续 5xx 后重试」「服务器忽略 `Range` 时退回单流」
 > 「支持 `Range` 时并发多连接且拼接后 SHA-1 一致」「SHA-1 不符不重试」
@@ -111,6 +132,17 @@ cargo test -p kaleid-core-plugins --test mods_live -- --ignored --nocapture
 
 它会打印 `ranking / search / groups / files / warnings`，并顺带走一遍 CurseForge
 分支（官方接口无 API Key → 镜像 + 前置解析）。**需要外网**，所以不进默认套件。
+
+OptiFine 与 NeoForge 安装器各有一条「源到底通不通」的用例（都是真的发请求）：
+
+```powershell
+# BMCLAPI 的 OptiFine 列表 + jar 直链：1.12.2 → HD_U_G5，1.21.4 → HD_U_J3
+cargo test -p kaleid-core-plugins --lib real_optifine -- --ignored --nocapture
+# NeoForge 安装器在官方 Maven 不可达时能否从 BMCLAPI 拿到完整 jar（约 3.5 MiB）
+cargo test -p kaleid-core-plugins --lib real_neoforge_installer_downloads_via_bmclapi -- --ignored --nocapture
+```
+
+这两条打印的是真实字节数，用来确认「官网抓不动、镜像有同样的文件」这个前提还成立。
 
 ## 2. 只跑一部分
 
@@ -334,6 +366,10 @@ cd src-tauri; npx --yes @tauri-apps/cli@^2 build
 | 存档页 → 数据包 | 点数据包图标打开弹窗：列出 zip 与目录包、显示 `pack_format`、简介、大小；启用状态标注「已启用/未启用/未知」并说明**只读**（来自 `level.dat`） |
 | 存档页 → 数据包导入 | 「导入 zip」走原生多选，重名落盘成 `name-1.zip`/`name-2.zip`；导入后列表立刻刷新 |
 | 展开动画 | 侧栏版本分组、安装向导的四组版本列表、下载 Mod 的文件分组、设置分区都是高度过渡展开/收起（`0fr → 1fr`），开关动效或系统「减少动态效果」时动画归零 |
+| 安装向导 → OptiFine 分组 | 第二步原版 / Fabric / Forge / NeoForge 下面多出「OptiFine」一组，能读出 `HD_U_*` 版本（`pre` 版标「预览版」、稳定版标「正式版」）；选一个后 Fabric 与 NeoForge 立刻变灰，OptiFine 卡片下方写明「会放进 mods/」还是「作为独立版本安装」 |
+| 安装向导 → OptiFine 与 Forge | 高版本（如 `26.1.2`）点 OptiFine 版本：加载器**自动切到 Forge** 并挑推荐版本，确认页多一行 `OptiFine HD_U_J3（放进 mods/，配合 Forge）`；再把加载器改回原版时「下一步」变灰并提示「必须和 Forge 一起安装」 |
+| 安装向导 → OptiFine 与 Fabric 互斥 | 先选 Fabric 再展开 OptiFine：整组灰掉并提示「Fabric / NeoForge 不支持 OptiFine」；先选 OptiFine 再点 Fabric 版本：OptiFine 的选择被清掉，确认页那一行随之消失 |
+| 概览 → 离线名用中文 | 输入「小明」：名字保存生效、头像照常；输入框下方出现琥珀色警告「原则上Minecraft任何版本都不接受使用中文ID，若出现问题后果自负」；改回 `Player_123` 后警告消失；输「名字 空格」「ひらがな」「名字!」当场报红且不改动当前名字 |
 
 > 新闻仍是界面层直接 `fetch` 官方 feed（`ui/src/store/news.ts`），内置 `news`
 > 插件只负责默认开启与槽位开关；宿主另有版本清单/皮肤解析的 HTTP 依赖。
@@ -470,6 +506,19 @@ cargo test -p kaleid-core-plugins --lib crash::tests::real_log_is_judged_by_evid
 .\target\debug\kaleid.exe --data-dir "$env:LOCALAPPDATA\Kaleid" launch "FriendServer-1.21.10-All-online"
 taskkill /PID <上面打印的 pid>     # 期望输出：游戏已退出（退出码 Some(0)），不是崩溃
 ```
+
+### 6.9 这一轮 4 项需求的手工验收
+
+| 需求 | 操作 | 期望 |
+|---|---|---|
+| ① 低版本能启动 | 装一个 `1.12.2`（或 `1.7.10`）原版，启动 | 不再出现 `no lwjgl in java.library.path`；`versions/1.12.2/natives/` 里能看到 `lwjgl.dll` / `lwjgl64.dll` / `OpenAL64.dll` 等解压出来的文件；启动脚本里 `-Djava.library.path` 指向这个目录；换成 1.21.4 启动，两边的 natives 目录**互不覆盖** |
+| ① 老版本命令行没有占位符 | 装 `1.7.10` 后看 `logs/<版本>-<时间>-<会话>/launch-script.txt` | 没有残留的 `${auth_session}` / `${user_properties}`（分别是 `0` 和 `{}`）；客户端不再因为 `user_properties` 解析失败而闪退 |
+| ② NeoForge 装得上 | 设置 → 下载选「官方优先」，装 `26.1.2` + NeoForge `26.1.2.125`；官方 Maven 不通也没关系 | 队列不会卡在「安装器」；如果下载到的确实是 HTML 错误页，报错是「安装器不是有效的 jar…请到「设置 → 下载」换一个下载源（推荐「BMCLAPI 优先」）后重试」，而不是一句「安装器失败」；换「BMCLAPI 优先」后能装完并出现启动按钮 |
+| ③ OptiFine 装得上（高版本） | 装 `26.1.2` + Forge `64.1.5` + OptiFine `HD_U_J3` | `mods/` 下出现 `OptiFine_26.1.2_HD_U_J3.jar`；版本 JSON 里 `kaleidOptifine.mode == "mod"`；启动后在游戏里能打开 OptiFine 设置（视频设置里多出 OptiFine 页） |
+| ③ OptiFine 装得上（老版本） | 装 `1.12.2` 原版 + OptiFine `HD_U_G5`（不选 Forge） | 版本 JSON 的 `mainClass` 是 `net.minecraft.launchwrapper.Launch`，`minecraftArguments` 末尾有 `--tweakClass optifine.OptiFineTweaker`，`libraries` 里有 OptiFine 本体、`launchwrapper:1.12`、`asm-all:5.2`；侧栏该版本落在 **OptiFine** 分组；启动后游戏正常进主界面 |
+| ③ OptiFine 的安全网 | 尝试「`1.21.4` + Fabric + OptiFine」「`1.21.4` 原版 + OptiFine（不选 Forge）」两组合 | 界面就不让选：Fabric / NeoForge 组变灰；原版 + OptiFine 时「下一步」禁用并提示要先选 Forge；若绕过界面直接调 `versions_install`，后端返回「OptiFine 只能和 Forge 一起安装」或「…必须和 Forge 一起安装」 |
+| ④ 中文离线名 | 概览 → 离线登录，输入「小明」 | 立即生效（停笔 300 ms 后落盘），`accounts.json` 里名字是「小明」，uuid 与 `OfflinePlayer:小明` 的 Java 算法一致；输入框下方出现琥珀色警告「原则上Minecraft任何版本都不接受使用中文ID，若出现问题后果自负」；进单人游戏名字显示正常（进正版服务器可能被踢，属预期） |
+| ④ 中文名不越界 | 输入「名字 空格」「ひらがな」「名字!」「玩」×17 | 全部当场报红、当前名字不变；提示语是「只能用 1–16 位字母、数字、下划线或汉字」 |
 
 
 ## 7. 可能会撞到的问题
