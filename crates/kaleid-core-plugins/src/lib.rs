@@ -40,6 +40,7 @@ pub mod roots;
 pub mod saves;
 pub mod settings;
 pub mod skin;
+pub mod urlcache;
 pub mod versions;
 
 pub use accounts::Accounts;
@@ -76,4 +77,5 @@ pub use remote::{parse_manifest, RemoteClient};
 pub use roots::RootRegistry;
 pub use saves::{SaveManager, SaveSummary};
 pub use settings::Settings;
+pub use urlcache::{Resolved, UrlCache};
 pub use versions::VersionStore;
