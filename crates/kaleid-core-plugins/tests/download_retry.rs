@@ -39,6 +39,16 @@ enum Mode {
     Throttle { times: usize, retry_after: Option<u64> },
     /// 既不支持 `Range`，整个文件也给不完（发一半就掐）：逼出"换源"。
     TruncateFull,
+    /// **只有第 n 个请求**忽略 `Range`（回 200 整文件，慢写），其余正常支持。
+    ///
+    /// 真实场景：镜像前面挂着好几台节点，种子/负载均衡把某一条连接打到了"不认
+    /// Range"的节点上。分段跑到一半能力翻转，就是 NeoForge 安装卡在「安装器」的
+    /// 那次故障。
+    IgnoreRangeOn {
+        index: usize,
+        chunk: usize,
+        delay_ms: u64,
+    },
 }
 
 struct TestServer {
@@ -143,10 +153,10 @@ fn serve(mut stream: TcpStream, body: &[u8], mode: Mode, index: usize) {
         }
     }
 
-    let range = if mode == Mode::IgnoreRange {
-        None
-    } else {
-        parse_range(&head)
+    let range = match mode {
+        Mode::IgnoreRange => None,
+        Mode::IgnoreRangeOn { index: only, .. } if index == only => None,
+        _ => parse_range(&head),
     };
     if mode == Mode::TruncateFull {
         // 先按"不支持 Range"回 200（于是客户端会退回单流），再只给一半就断开，
@@ -162,6 +172,7 @@ fn serve(mut stream: TcpStream, body: &[u8], mode: Mode, index: usize) {
     }
     let throttle = match mode {
         Mode::SlowRange { chunk, delay_ms } => Some((chunk, delay_ms)),
+        Mode::IgnoreRangeOn { chunk, delay_ms, .. } => Some((chunk, delay_ms)),
         _ => None,
     };
     match range {
@@ -724,4 +735,175 @@ fn spare_threads_are_used_for_one_large_file() {
         peak > 8,
         "并发 32 只剩一个文件时不该再停在 8 段上限，实测峰值 {peak}"
     );
+}
+
+/* --------------------- 安装器（清单里没有大小） --------------------- */
+
+/// 跑一批下载，但**不允许卡死**：超过 `limit` 就判失败。
+///
+/// 这个套件是"卡住"类故障的回归测试，`run_batch` 卡住时不能把整个 `cargo test`
+/// 也一起挂住——那样 CI 只会显示超时，看不出是哪个用例。
+fn run_batch_or_timeout(
+    manager: kaleid_core_plugins::DownloadManager,
+    job: Arc<Job>,
+    items: Vec<DownloadItem>,
+    label: &str,
+    limit: Duration,
+) -> Result<(), String> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(manager.run_batch(job, items).map_err(|e| e.to_string()));
+    });
+    match rx.recv_timeout(limit) {
+        Ok(result) => result,
+        Err(_) => panic!("{label} 卡住了：{limit:?} 之内没有结束（下载队列停在那里不动）"),
+    }
+}
+
+fn unknown_size_item(label: &str, url: String, dest: &Path, body: &[u8]) -> DownloadItem {
+    DownloadItem {
+        label: label.into(),
+        phase: "installer".into(),
+        official_url: Some(url),
+        mirror_url: None,
+        fallback_url: None,
+        prefer_mirror: false,
+        dest: dest.to_path_buf(),
+        // 安装器在版本清单里没有 `size`，只能靠响应头现学。
+        size: 0,
+        sha1: Some(sha1_hex(body)),
+    }
+}
+
+/// NeoForge / Forge 的安装器 jar 在清单里 `size: 0`，真机表现是**卡在「安装器」不动**。
+///
+/// 怀疑点：先在 `discover_size` 里学到真实大小，转成分段下载；这中间要是调度器
+/// 认为"这个文件既不该单流、也没区间可分"，任务就永远停在那里（线程 0、文件 0/1）。
+#[test]
+fn unknown_size_installer_finishes_instead_of_hanging() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = body_of(2 * 1024 * 1024 + 12_345);
+    let server = TestServer::start(body.clone(), Mode::RangeOk);
+    let manager = manager(dir.path());
+    let dest = dir.path().join("installer.jar");
+
+    run_batch_or_timeout(
+        manager,
+        job("installer-size"),
+        vec![unknown_size_item(
+            "NeoForge 安装器",
+            format!("{}/installer.jar", server.base),
+            &dest,
+            &body,
+        )],
+        "未知大小的安装器",
+        Duration::from_secs(30),
+    )
+    .expect("未知大小的安装器应当能下完");
+
+    assert_eq!(std::fs::read(&dest).unwrap(), body, "内容必须完整");
+    assert_no_leftovers(&dest);
+}
+
+/// 同样的未知大小文件，但服务器**不认 Range**（BMCLAPI 的 jar 直链经常这样）：
+/// 学到大小 → 分段探测失败 → 必须退回单流并成功地结束。
+#[test]
+fn unknown_size_installer_survives_a_server_without_range() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = body_of(1_600_000);
+    let server = TestServer::start(body.clone(), Mode::IgnoreRange);
+    let manager = manager(dir.path());
+    let dest = dir.path().join("installer.jar");
+
+    run_batch_or_timeout(
+        manager,
+        job("installer-norange"),
+        vec![unknown_size_item(
+            "NeoForge 安装器",
+            format!("{}/installer.jar", server.base),
+            &dest,
+            &body,
+        )],
+        "不支持 Range 的安装器",
+        Duration::from_secs(30),
+    )
+    .expect("不支持 Range 时应当退回单流并成功");
+
+    assert_eq!(std::fs::read(&dest).unwrap(), body, "内容必须完整");
+    assert_no_leftovers(&dest);
+}
+
+/// 未知大小的文件走镜像（NeoForge 安装器的真实配置：`prefer_mirror = true`）。
+///
+/// 镜像地址是 BMCLAPI 那种**跳转服务**：第一次请求先 302 到真身。跳转 + 未知大小 +
+/// 分段三件事凑在一起时，最容易出现"线程 0、进度不动"。
+#[test]
+fn unknown_size_installer_through_a_redirecting_mirror() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = body_of(1_300_000);
+    let server = TestServer::start(body.clone(), Mode::RangeOk);
+    let manager = manager(dir.path());
+    let dest = dir.path().join("installer.jar");
+    let mut it = unknown_size_item(
+        "NeoForge 安装器",
+        format!("{}/real/installer.jar", server.base),
+        &dest,
+        &body,
+    );
+    it.mirror_url = Some(format!("{}/jump/installer.jar", server.base));
+    it.prefer_mirror = true;
+
+    run_batch_or_timeout(
+        manager,
+        job("installer-mirror"),
+        vec![it],
+        "镜像跳转的安装器",
+        Duration::from_secs(30),
+    )
+    .expect("镜像跳转的安装器应当能下完");
+
+    assert_eq!(std::fs::read(&dest).unwrap(), body, "内容必须完整");
+}
+
+/// 分段跑到一半，其中一条连接被路由到"不认 Range"的节点上（回 200 整文件）。
+///
+/// 这是 NeoForge 安装卡在「安装器」不动的**真凶**：能力被翻成"不支持"之后待办区间
+/// 被清空，紧接着另一条正常的 206 又把能力翻回"支持"，于是文件停在
+/// 「没有在途连接、也没有可派区间、还没下完」——调度器每轮算出 0 个任务，永远等。
+#[test]
+fn a_mid_flight_range_flip_does_not_stall_the_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let body = body_of(8 * 1024 * 1024);
+    let server = TestServer::start(
+        body.clone(),
+        Mode::IgnoreRangeOn {
+            // 第 3 个请求（探测之后、分段并发之中）落到不认 Range 的节点上。
+            index: 3,
+            chunk: 96 * 1024,
+            delay_ms: 4,
+        },
+    );
+    let manager = manager_with_concurrency(dir.path(), 8);
+    let dest = dir.path().join("installer.jar");
+
+    run_batch_or_timeout(
+        manager,
+        job("range-flip"),
+        vec![unknown_size_item(
+            "NeoForge 安装器",
+            format!("{}/installer.jar", server.base),
+            &dest,
+            &body,
+        )],
+        "能力中途翻转",
+        Duration::from_secs(60),
+    )
+    .expect("能力翻转之后应当继续把文件下完");
+
+    assert_eq!(std::fs::read(&dest).unwrap(), body, "内容必须完整（SHA-1 已校验）");
+    assert!(
+        server.requests.load(Ordering::SeqCst) > 2,
+        "应当真的并发取过分段"
+    );
+    assert_no_leftovers(&dest);
 }

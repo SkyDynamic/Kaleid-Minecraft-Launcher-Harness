@@ -752,6 +752,69 @@ enum WorkReport {
     RangeThrottled(u64, (u64, u64), String),
 }
 
+/// 保证每个下载任务**一定**回一份报告（panic 时由 `Drop` 兜底）。
+///
+/// [`Executor`] 用 `catch_unwind` 吞掉了任务里的 panic：线程活着，但那条任务的
+/// 报告永远发不出来。于是 `inflight` 和连接计数都下不去，整个任务会停在
+/// 「0 线程 / 文件 0/N / 进度不动」。这里把"还配额 + 发报告"绑在 Drop 上，
+/// panic 也照样收尾。
+struct ReportGuard {
+    tx: Option<Sender<WorkReport>>,
+    limits: Arc<HostLimits>,
+    host: String,
+    id: u64,
+    /// 分段任务的区间：panic 时要按区间把活放回去，不能当成整个文件失败。
+    range: Option<(u64, u64)>,
+}
+
+impl ReportGuard {
+    fn new(
+        tx: Sender<WorkReport>,
+        limits: Arc<HostLimits>,
+        host: String,
+        id: u64,
+        range: Option<(u64, u64)>,
+    ) -> Self {
+        ReportGuard {
+            tx: Some(tx),
+            limits,
+            host,
+            id,
+            range,
+        }
+    }
+
+    /// 正常收尾：先还主机配额，再发报告。
+    fn finish(mut self, report: WorkReport, ok: bool) {
+        self.limits.release(&self.host);
+        if ok {
+            self.limits.note_ok(&self.host);
+        }
+        self.send(report);
+    }
+
+    fn send(&mut self, report: WorkReport) {
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(report);
+        }
+    }
+}
+
+impl Drop for ReportGuard {
+    fn drop(&mut self) {
+        if self.tx.is_none() {
+            return;
+        }
+        self.limits.release(&self.host);
+        let message = "下载线程异常退出（内部错误）".to_string();
+        let report = match self.range {
+            Some(range) => WorkReport::RangeErr(self.id, range, message),
+            None => WorkReport::SingleErr(self.id, message),
+        };
+        self.send(report);
+    }
+}
+
 struct LiveFile {
     id: u64,
     item: DownloadItem,
@@ -797,6 +860,25 @@ impl LiveFile {
     /// 大文件但还没探测过 Range：先只放 1 条连接试探。
     fn needs_probe(&self) -> bool {
         self.multi && self.range_known().is_none()
+    }
+
+    /// 这个文件现在**还有活可干**吗（能再派一条连接出去）。
+    ///
+    /// 调度器每轮都靠它决定要不要给这个文件排任务。一个没下完的文件如果在这里
+    /// 返回 `false`，那就再也没人管它了——队列会永远停在"0 线程、文件 0/1"。
+    /// 所以这个函数同时也是"状态机有没有把活弄丢"的判据（见 [`drive_session`]）。
+    fn can_progress(&self) -> bool {
+        if self.finished || self.failed.is_some() {
+            return true;
+        }
+        if self.inflight > 0 || self.pending_switch {
+            return true;
+        }
+        if self.multi_active() {
+            return !self.unassigned.is_empty();
+        }
+        // 单流：只要还没开过车就能重来一次。
+        !self.single_started
     }
 }
 
@@ -861,6 +943,19 @@ fn drive_session(
             );
             if job.cancelled() && files.iter().all(|f| f.inflight == 0) {
                 return Err("任务已取消".into());
+            }
+            // 既没有在途连接、也没有任何一个文件还能再派活 → 状态机把活弄丢了。
+            // 再等下去就是永远等下去（界面表现：线程 0、文件 0/1、进度一动不动），
+            // 宁可报一个能重试的错，也不能把整个安装挂在这里。
+            if files.iter().all(|file| file.inflight == 0)
+                && files
+                    .iter()
+                    .any(|file| !file.finished && file.failed.is_none())
+                && !files.iter().any(LiveFile::can_progress)
+            {
+                return Err(
+                    "下载线程卡住了：没有任何可继续的任务（请重试，通常会直接成功）".into(),
+                );
             }
             if closed
                 && files.iter().all(|f| f.finished || f.failed.is_some())
@@ -1180,14 +1275,11 @@ fn start_file_work(
             let task_job = job.clone();
             let limits = limits.clone();
             let task_host = host.clone();
+            let guard = ReportGuard::new(done_tx, limits, task_host, id, Some(range));
             executor.submit(Box::new(move || {
                 let report = run_range(&agent, &task_job, &item, &url, range, id);
                 let ok = matches!(report, WorkReport::RangeOk(..));
-                limits.release(&task_host);
-                if ok {
-                    limits.note_ok(&task_host);
-                }
-                let _ = done_tx.send(report);
+                guard.finish(report, ok);
             }));
             file.inflight += 1;
             started += 1;
@@ -1214,6 +1306,7 @@ fn start_file_work(
     let task_job = job.clone();
     let limits = limits.clone();
     let task_host = host.clone();
+    let guard = ReportGuard::new(done_tx, limits, task_host, id, None);
     executor.submit(Box::new(move || {
         let report = if discover {
             match discover_size(&agent, &task_job, &url) {
@@ -1227,11 +1320,7 @@ fn start_file_work(
             run_single(&agent, &task_job, &item, &url, id)
         };
         let ok = matches!(report, WorkReport::SingleOk(_) | WorkReport::DiscoveredSize(..));
-        limits.release(&task_host);
-        if ok {
-            limits.note_ok(&task_host);
-        }
-        let _ = done_tx.send(report);
+        guard.finish(report, ok);
     }));
     file.inflight = 1;
     file.single_started = true;
@@ -1371,8 +1460,10 @@ fn on_report(
             if let Some(url) = file.current_url().cloned() {
                 file.capability.insert(url, false);
             }
-            file.unassigned.clear();
+            // 还有别的连接在跑时**不能**清空待办区间：它们是按这些区间派出去的，
+            // 回来时总要有个地方落账。等它们都收尾了再统一改单流。
             if file.inflight == 0 {
+                file.unassigned.clear();
                 discard_segments(job, file);
                 file.single_started = false;
             }
@@ -1415,6 +1506,71 @@ fn on_report(
         file.finished = true;
         file.unassigned.clear();
     }
+    // 兜底：文件没下完，却已经"没活可干"了。
+    //
+    // 真实故障（NeoForge 安装卡在「安装器」不动）：几条连接同时在跑，其中一条回了
+    // 200 把待办区间清空，另一条紧接着回 206 又把"认 Range"标了回来。结果既没有
+    // 在途连接、也没有可派的区间，调度器每轮算出 0 个任务，队列永远停住。这里按
+    // 已经下好的区段**重新算出缺口**，一有活就继续跑；实在算不出就退回单流重下。
+    if !file.can_progress() && file.inflight == 0 {
+        replan_missing_ranges(job, file, first_error);
+    }
+}
+
+/// 把"丢掉的活"重新算出来：按 `segments` 里已经下好的区段求缺口。
+///
+/// 缺口算得出来就塞回待办队列（已下好的字节不浪费）；一个字节都不缺就直接拼文件；
+/// 拼不上或者本来就是单流，就退回从头单流下载——**宁可多下一次，也不能永远卡住**。
+fn replan_missing_ranges(job: &Arc<Job>, file: &mut LiveFile, first_error: &mut Option<String>) {
+    if file.size == 0 || !file.multi_active() {
+        // 单流：`single_started` 还立着但连接已经没了 → 允许重新开一趟。
+        file.single_started = false;
+        return;
+    }
+    let gaps = missing_ranges(file.size, &file.segments);
+    if gaps.is_empty() {
+        match join_spans(&file.item, &file.segments) {
+            Ok(()) => {
+                file.finished = true;
+                job.item_done(&file.item.phase);
+            }
+            Err(error) => fail_file(job, file, first_error, error),
+        }
+        return;
+    }
+    if file.segments.is_empty() {
+        // 一点都没下成：没必要再分段试探，直接单流（服务端大概率不认 Range）。
+        file.multi = false;
+        file.unassigned.clear();
+        file.single_started = false;
+        return;
+    }
+    file.unassigned = gaps;
+    file.single_started = false;
+}
+
+/// 还剩哪些字节没拿到：`[0, size)` 减去 `segments` 里已完成的区段。
+fn missing_ranges(size: u64, segments: &[(u64, u64)]) -> VecDeque<(u64, u64)> {
+    let mut spans = segments.to_vec();
+    spans.sort_unstable();
+    let mut out = VecDeque::new();
+    let mut cursor = 0u64;
+    for (start, end) in spans {
+        if end < start {
+            continue;
+        }
+        if start > cursor {
+            out.push_back((cursor, start - 1));
+        }
+        cursor = cursor.max(end.saturating_add(1));
+        if size > 0 && cursor >= size {
+            break;
+        }
+    }
+    if size > 0 && cursor < size {
+        out.push_back((cursor, size - 1));
+    }
+    out
 }
 
 /// 同一个地址被限流几轮之后才认输换源。
@@ -2360,6 +2516,99 @@ mod tests {
             size,
             sha1: None,
         }
+    }
+
+    /// 一个正在分段下载、且已经有 4 条连接在跑的 LiveFile（测试里直接用，不起线程）。
+    fn segmented_file(id: u64, size: u64, url: &str, capability: Option<bool>) -> LiveFile {
+        let item = plan_item(size);
+        let mut capability_map = HashMap::new();
+        if let Some(known) = capability {
+            capability_map.insert(url.to_string(), known);
+        }
+        LiveFile {
+            id,
+            item,
+            urls: vec![url.to_string()],
+            url_index: 0,
+            unassigned: VecDeque::from(vec![(0, size - 1)]),
+            inflight: 0,
+            size,
+            multi: true,
+            capability: capability_map,
+            segments: Vec::new(),
+            finished: false,
+            failed: None,
+            single_started: false,
+            throttle_rounds: 0,
+            pending_switch: false,
+        }
+    }
+
+    /// 真机故障：NeoForge 安装卡在「安装器」不动，线程 0、文件 0/1、永远不结束。
+    ///
+    /// 分段下载时几条连接同时在跑，其中一条回了 200（那台节点不认 Range）把整个
+    /// 待办区间清空了；紧跟着另一条正常回 206，又把「这台主机认 Range」标了回去。
+    /// 于是状态变成：**没有在途连接、也没有可派的区间、文件却没下完**——调度器每轮
+    /// 都算出 0 个任务，队列就永远停在那里。
+    #[test]
+    fn a_late_range_ok_must_not_leave_the_file_without_any_work() {
+        let url = "https://node.example/client.jar";
+        let size = 4 * 1024 * 1024;
+        let mut file = segmented_file(1, size, url, Some(true));
+        file.inflight = 4;
+        let mut files = vec![file];
+        let job = plan_job("official-first");
+        let limits = HostLimits::for_concurrency(8);
+        let mut first_error = None;
+
+        // 一条连接拿回了 200：这个地址被标记成"不认 Range"，待办区间被清空。
+        on_report(
+            &job,
+            &mut files,
+            WorkReport::RangeUnsupported(1),
+            &mut first_error,
+            &limits,
+        );
+        // 另一条连接正常拿回 206：能力又被标回"认 Range"，但待办区间还是空的。
+        on_report(
+            &job,
+            &mut files,
+            WorkReport::RangeOk(1, 0, size / 4 - 1),
+            &mut first_error,
+            &limits,
+        );
+
+        let file = &files[0];
+        assert!(file.failed.is_none(), "不该判失败：{:?}", file.failed);
+        assert!(
+            file.can_progress(),
+            "既没有在途连接、也没有可派的区间、还没下完 —— 调度器会算出 0 个任务，队列永远卡住"
+        );
+    }
+
+    /// 缺口计算：一段一段补回来，不能重叠、也不能漏。
+    #[test]
+    fn missing_ranges_cover_everything_that_is_still_needed() {
+        let size = 100;
+        assert_eq!(
+            missing_ranges(size, &[]).into_iter().collect::<Vec<_>>(),
+            vec![(0, 99)]
+        );
+        // 中间有一个洞 + 尾巴没下
+        assert_eq!(
+            missing_ranges(size, &[(10, 19), (0, 9)])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![(20, 99)]
+        );
+        assert_eq!(
+            missing_ranges(size, &[(0, 49), (60, 99)])
+                .into_iter()
+                .collect::<Vec<_>>(),
+            vec![(50, 59)]
+        );
+        // 已经下满了
+        assert!(missing_ranges(size, &[(60, 99), (0, 59)]).is_empty());
     }
 
     fn seeded_cache(mirror_final: &str) -> UrlCache {

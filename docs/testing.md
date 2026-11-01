@@ -14,7 +14,7 @@ cargo test --workspace
 |---|---|
 | `kaleid-kernel` | 29 |
 | `kaleid-api` | 20 |
-| `kaleid-core-plugins` | 326（305 单元 + 21 集成；其中 11 个手动真机 / 联网用例标了 `#[ignore]`，默认跳过） |
+| `kaleid-core-plugins` | 333（308 单元 + 25 集成；其中 11 个手动真机 / 联网用例标了 `#[ignore]`，默认跳过） |
 | `kaleid-host` | 23 |
 | `kaleid-cli`（`tests/flow.rs` 集成） | 7 |
 
@@ -93,13 +93,16 @@ cargo test --workspace
 >   `offline_name_rules_match_api_contract` 一起钉住 16/17 位边界、混合中英、
 >   假名与空格：**汉字放开、其它非 ASCII 仍拒绝**。
 >
-> `tests/download_retry.rs` 有 12 个集成用例：进程内起一个最小 HTTP/1.1 服务，验证
+> `tests/download_retry.rs` 有 16 个集成用例：进程内起一个最小 HTTP/1.1 服务，验证
 > 「连接被掐断后重试」「连续 5xx 后重试」「服务器忽略 `Range` 时退回单流」
 > 「支持 `Range` 时并发多连接且拼接后 SHA-1 一致」「SHA-1 不符不重试」
 > 「连不上时给出人话错误」，另外几条钉住调度与限流：快照里的连接数必须等于
 > 真实连接数（不能一边跑着 8 条连接、一边显示 1/64）、并发 32 只剩一个文件时
 > 要开出 8 条连接（旧实现写死 4 条）、429 带 `Retry-After` 时等够再重试同一个地址、
-> 一直被限流才换源、最大的文件至少占一半连接预算、换源后重新探测 `Range`。
+> 一直被限流才换源、最大的文件至少占一半连接预算、换源后重新探测 `Range`；
+> 另外 4 条钉住「安装器」那类**未知大小**的文件（清单里 `size: 0`）：学到大小后转分段、
+> 服务器不认 `Range` 就退回单流、走跳转镜像也能下完、以及**分段跑到一半某条连接
+> 落到不认 `Range` 的节点上（能力中途翻转）不能把任务卡死**。
 > **不联网**，所以留在默认套件里。
 >
 > `tests/remote_metadata.rs` 有 4 个：镜像返回「200 + HTML 错误页」时必须换地址并
@@ -304,6 +307,8 @@ cd src-tauri; npx --yes @tauri-apps/cli@^2 build
 | 第三方清单安装 | `kaleid plugins install plugins/example-mirror --allow-unsigned` 打印落点并提示「下次启动生效」；重启后 `kaleid sources` 多出 `campus-mirror(prio=20)`，`mojang` / `bmclapi` 仍在；概览页底部出现只读说明卡片 |
 | 第三方清单卸载 | `kaleid plugins remove example-mirror` 后重启：源与卡片一起消失，内置插件与内置源不受影响 |
 | Fabric API 备用地址 | 装 Fabric 勾选 Fabric API：官方 `cdn.modrinth.com` 连不上时自动换 MCIM 镜像完成安装（两处地址来自同一条 `mirror_url_for` 规则） |
+| NeoForge / Forge 安装器不再卡住 | 装 NeoForge（或 Forge）：队列走到「安装器」时要么字节条在动、要么那一行显示安装器自己吐出的最后一行日志（「… 安装器：Downloading libraries…」），15 分钟内一定收尾；万一内部状态出错，报的是「下载线程卡住了：没有任何可继续的任务（请重试）」这种能重试的错，而不是永远停在 0/1、0 线程 |
+| 安装器阶段看得见 | 找个装得慢的 NeoForge 版本（或把 `maven.neoforged.net` 指到不存在的地址）：从点开队列到弹出「安装完成」，界面上一直在刷新安装器的输出，不会出现"进度条不动、也不知道它是不是死了"的那十几分钟 |
 | APP 设置 → 界面字体 | 默认跟随系统；下拉可搜索系统字体、显示真实系统 UI 字体；可导入 ttf/otf/ttc，应用后全局字体改变 |
 | APP 设置 → 界面字号 | 「−」「+」每次 1 px（范围 11–20），中间实时显示当前 px；改动立刻生效——文字、行距、按钮一起**等比**缩放（等同浏览器缩放），不会出现「字大了但行高没变」的错位；到 11 / 20 时对应按钮变灰；不是默认值时出现「恢复默认」回到 13 px |
 | 界面字号 → 持久化 | 调到 16 px 后刷新页面、重开窗口都还是 16 px（存在 `kaleid.prefs.v1`）；数据目录里的 `settings.json` 不因此变化（界面偏好不进游戏设置） |

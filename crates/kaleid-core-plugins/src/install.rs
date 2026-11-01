@@ -979,6 +979,11 @@ impl InstallService {
             .spawn()
             .map_err(|e| ApiError::io(format!("无法启动 Java（{java}）：{e}")))?;
         let start = Instant::now();
+        // 安装器跑起来之后**一点下载进度都没有**（它自己在下载/校验），界面只有一行
+        // 不动的「安装器」，看起来和卡死一模一样。PCL2 / HMCL 都会把安装器的输出
+        // 摆给玩家看，这里照做：每秒把安装器日志的最后一行放进当前状态。
+        let mut shown = String::new();
+        let mut last_poll = Instant::now();
         loop {
             if let Some(status) = child.try_wait().map_err(ApiError::io)? {
                 if !status.success() {
@@ -993,6 +998,15 @@ impl InstallService {
             if start.elapsed() > Duration::from_secs(900) {
                 let _ = child.kill();
                 return Err(ApiError::Network(format!("{label} 安装器超时")));
+            }
+            if last_poll.elapsed() >= Duration::from_millis(1000) {
+                last_poll = Instant::now();
+                if let Some(line) = installer_progress_line(&log) {
+                    if line != shown {
+                        job.set_current(format!("{label} 安装器：{line}"));
+                        shown = line;
+                    }
+                }
             }
             std::thread::sleep(Duration::from_millis(250));
         }
@@ -1427,6 +1441,26 @@ fn tail_lines(path: &Path, n: usize) -> String {
     lines[lines.len().saturating_sub(n)..].join("\n")
 }
 
+/// 安装器日志里**最值得一提**的最后一行，用来当"它还在干活"的证据。
+///
+/// 安装器的输出里混着进度条刷新（`\r`）和空行，直接取最后一行经常只能拿到空白；
+/// 这里从后往前找第一条有内容的，顺便把进度条刷新的 `\r` 尾巴切掉、长度截断。
+fn installer_progress_line(path: &Path) -> Option<String> {
+    let text = std::fs::read_to_string(path).ok()?;
+    for raw in text.rsplit(['\n', '\r']) {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut out: String = line.chars().take(120).collect();
+        if line.chars().count() > 120 {
+            out.push('…');
+        }
+        return Some(out);
+    }
+    None
+}
+
 /// 安装器落盘后确认它真的是个 jar（ZIP 开头 `PK\x03\x04`）。
 ///
 /// 镜像或 CDN 出错时经常回一页 HTML、或者只留个 0 字节文件；直接交给 Java 会
@@ -1803,6 +1837,32 @@ fn rule_matches(rule: &Value) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn installer_progress_line_picks_the_last_meaningful_line() {
+        let dir = scratch("installer-log");
+        let log = dir.join("installer.log");
+        std::fs::write(
+            &log,
+            "Downloading libraries\r\nDownloading libraries\r\n[ 30%] net.neoforged:foo:1.0\r\n\r\n",
+        )
+        .unwrap();
+        // 进度条刷新会留下空的 `\r\n` 尾巴：不能把它当成"最后一行"显示出去。
+        assert_eq!(
+            installer_progress_line(&log).unwrap(),
+            "[ 30%] net.neoforged:foo:1.0"
+        );
+
+        std::fs::write(&log, "   \r\n\r\n").unwrap();
+        assert!(installer_progress_line(&log).is_none(), "只有空白就没有进度可说");
+
+        std::fs::write(&log, "a".repeat(200)).unwrap();
+        let long = installer_progress_line(&log).unwrap();
+        assert!(long.ends_with('…'), "过长的行要截断：{long}");
+        assert_eq!(long.chars().count(), 121);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
