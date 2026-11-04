@@ -1469,6 +1469,15 @@ fn installer_library_item(lib: &Value, libraries_dir: &Path) -> Option<DownloadI
         return None;
     }
     let artifact = lib.get("downloads").and_then(|d| d.get("artifact"));
+    // 显式空 URL 表示安装器内置的库或 processor 产物，不是远程 Maven 依赖。
+    // 交给官方安装器提取/生成；仅缺少 URL 的旧式坐标库仍沿用下面的兜底。
+    if artifact
+        .and_then(|a| a.get("url"))
+        .and_then(|v| v.as_str())
+        .is_some_and(|url| url.trim().is_empty())
+    {
+        return None;
+    }
     let official = artifact
         .and_then(|a| a.get("url"))
         .and_then(|v| v.as_str())
@@ -2374,6 +2383,7 @@ fn rule_matches(rule: &Value) -> bool {
 mod tests {
     use super::*;
     include!("install_diagnostics_tests.rs");
+    include!("install_forge_tests.rs");
     include!("install_correction_tests.rs");
 
     #[test]
