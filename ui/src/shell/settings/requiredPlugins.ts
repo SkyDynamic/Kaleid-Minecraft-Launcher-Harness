@@ -17,6 +17,7 @@
  * 字段或这张表命中），宁可多拦一个，也不要出现"点了没反应"。
  */
 export const REQUIRED_PLUGINS: Record<string, string> = {
+  'launcher-logger': '记录启动器、游戏启动、下载与插件调用的诊断日志，是始终启用的内置插件',
   'core-lists': '侧栏文件夹列表由它提供，停用后无法收录或选择文件夹',
   'version-store': '版本扫描由它提供，停用后版本列表为空，也就没有可启动的目标',
   settings: '分层设置解析由它提供，停用后无法生成启动参数',

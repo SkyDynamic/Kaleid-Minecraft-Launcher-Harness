@@ -136,6 +136,9 @@ pub fn apply_patches(
                     crate::context::merge_json(&mut target.config, cfg);
                 }
                 if let Some(when) = &update.when {
+                    if target.required && !when.is_empty() {
+                        return Err(PatchError::Required(update.id.clone()));
+                    }
                     target.when = when.clone();
                 }
             }
@@ -150,8 +153,12 @@ pub fn apply_patches(
                 target.enabled = false;
             }
             PatchOp::Remove { id } => {
-                if !out.iter().any(|s| &s.id == id) {
-                    return Err(PatchError::UnknownTarget(id.clone()));
+                let target = out
+                    .iter()
+                    .find(|s| &s.id == id)
+                    .ok_or_else(|| PatchError::UnknownTarget(id.clone()))?;
+                if target.required {
+                    return Err(PatchError::Required(id.clone()));
                 }
                 out.retain(|s| &s.id != id);
             }
@@ -197,14 +204,47 @@ mod tests {
         ] {
             let ops = parse_patch(yaml).unwrap();
             let err = apply_patches(&base, &ops).unwrap_err();
-            assert!(
-                err.to_string().contains("必需插件"),
-                "补丁也要拦：{err}"
-            );
+            assert!(err.to_string().contains("必需插件"), "补丁也要拦：{err}");
         }
         // 只改配置、不在 enabled 上动手的 update 仍然放行。
         let ops = parse_patch("- update:\n    id: settings\n    config:\n      x: 1\n").unwrap();
         assert!(apply_patches(&base, &ops).is_ok());
+    }
+
+    #[test]
+    fn patches_cannot_remove_required_plugins() {
+        let base = vec![PluginSpec::new("settings").required()];
+        let ops = parse_patch("- remove:\n    id: settings\n").unwrap();
+        assert!(matches!(
+            apply_patches(&base, &ops),
+            Err(PatchError::Required(id)) if id == "settings"
+        ));
+        assert_eq!(base.len(), 1);
+        assert!(base[0].enabled);
+    }
+
+    #[test]
+    fn required_condition_updates_reject_even_currently_true_predicates() {
+        let base = vec![PluginSpec::new("settings").required()];
+        for platform in [std::env::consts::OS, "never-a-platform"] {
+            let update = PatchOp::Update(UpdateOp {
+                id: "settings".into(),
+                enabled: None,
+                config: None,
+                when: Some(vec![Predicate::Platform {
+                    platform: platform.into(),
+                }]),
+            });
+            assert!(matches!(
+                apply_patches(&base, &[update]),
+                Err(PatchError::Required(id)) if id == "settings"
+            ));
+        }
+        let ops =
+            parse_patch("- update:\n    id: settings\n    when: []\n    config: {x: 1}\n").unwrap();
+        let result = apply_patches(&base, &ops).unwrap();
+        assert!(result[0].when.is_empty());
+        assert_eq!(result[0].config["x"], 1);
     }
 
     #[test]

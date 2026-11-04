@@ -7,7 +7,7 @@
 use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use serde_json::Value;
@@ -127,7 +127,20 @@ impl Context {
         value: T,
         priority: i32,
     ) -> u64 {
-        let owner = self.owner_now();
+        self.provide_owned(self.owner_now(), service, value, priority)
+    }
+
+    /// Register a kernel-lifetime service without inheriting or changing the ambient owner.
+    /// Root registrations are reclaimed by Kernel shutdown/Drop, not plugin disposal.
+    pub fn provide_root<T: Any + Send + Sync>(
+        &self, service: ServiceKey, value: T, priority: i32,
+    ) -> u64 {
+        self.provide_owned(String::new(), service, value, priority)
+    }
+
+    fn provide_owned<T: Any + Send + Sync>(
+        &self, owner: PluginId, service: ServiceKey, value: T, priority: i32,
+    ) -> u64 {
         let seq = self.inner.next_seq();
         {
             let mut g = self.inner.services.write().unwrap();
@@ -208,6 +221,30 @@ impl Context {
     /// 广播事件。
     pub fn emit<E: 'static>(&self, event: E) {
         self.inner.events.emit(&event);
+    }
+
+    /// Publish an explicit diagnostic without letting observer panics fail the command.
+    ///
+    /// Ordinary [`Context::emit`] keeps its existing panic behavior. The bus stops
+    /// this publication at a panicking observer; writer subscribers should also
+    /// isolate their own work so subsequent diagnostic observers can still run.
+    pub fn diagnostic(&self, mut record: crate::DiagnosticRecord) {
+        record.mark_emitted();
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.inner.events.emit(&record);
+        }));
+    }
+
+    /// Register cleanup under the current owner, run once in reverse effect order.
+    pub fn on_dispose(&self, cleanup: impl FnOnce() + Send + Sync + 'static) {
+        let owner = self.owner_now();
+        self.inner
+            .effects
+            .lock()
+            .unwrap()
+            .entry(owner)
+            .or_default()
+            .push(Effect::new(cleanup));
     }
 
     /// 全部服务清单，用于诊断面板与测试。
@@ -298,11 +335,18 @@ pub struct Kernel {
     factories: RwLock<HashMap<String, PluginFactory>>,
     plugins: RwLock<HashMap<PluginId, Arc<dyn Plugin>>>,
     specs: RwLock<Vec<PluginSpec>>,
+    shut_down: AtomicBool,
 }
 
 impl Default for Kernel {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Kernel {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -313,6 +357,7 @@ impl Kernel {
             factories: RwLock::new(HashMap::new()),
             plugins: RwLock::new(HashMap::new()),
             specs: RwLock::new(Vec::new()),
+            shut_down: AtomicBool::new(false),
         }
     }
 
@@ -345,32 +390,78 @@ impl Kernel {
         self.specs.read().unwrap().clone()
     }
 
+    fn lifecycle_outcome(&self, event: &str, plugin: Option<&str>, outcome: &str) {
+        let mut record = crate::DiagnosticRecord::new("kernel", event, crate::Severity::Info)
+            .with_field("outcome", outcome);
+        if let Some(plugin) = plugin {
+            record = record.with_field("plugin_id", plugin);
+        }
+        self.ctx.diagnostic(record);
+    }
+
+    fn lifecycle_failure(&self, event: &str, plugin_hint: Option<&str>, error: &KernelError) {
+        let (category, plugin, rejected) = match error {
+            KernelError::UnknownFactory(_) => ("factory", plugin_hint, false),
+            KernelError::Cycle(_) => ("dependency", None, false),
+            KernelError::MissingDependency { plugin, .. } => {
+                ("dependency", Some(plugin.as_str()), false)
+            }
+            KernelError::Config { plugin, .. } => ("config", Some(plugin.as_str()), false),
+            KernelError::Apply { plugin, .. } => ("apply", Some(plugin.as_str()), false),
+            // An unloaded target is caller text, not an actual registered plugin identity.
+            KernelError::NotLoaded(_) => ("not_loaded", None, true),
+            KernelError::Required(plugin) => ("required", Some(plugin.as_str()), true),
+        };
+        let level = if rejected {
+            crate::Severity::Warn
+        } else {
+            crate::Severity::Error
+        };
+        let mut record = crate::DiagnosticRecord::new("kernel", event, level)
+            .with_field("outcome", if rejected { "rejected" } else { "failed" })
+            .with_field("category", category);
+        if let Some(plugin) = plugin {
+            record = record.with_field("plugin_id", plugin);
+        }
+        self.ctx.diagnostic(record);
+    }
+
     /// 按规格装载全部启用的插件。
     pub fn load(&self, specs: &[PluginSpec]) -> Result<(), KernelError> {
+        for spec in specs {
+            if spec.required && (!spec.enabled || !spec.when.iter().all(|p| p.evaluate())) {
+                let error = KernelError::Required(spec.id.clone());
+                self.lifecycle_failure("plugin.load", Some(&spec.id), &error);
+                return Err(error);
+            }
+        }
         let active: Vec<PluginSpec> = specs
             .iter()
             .filter(|s| s.enabled && s.when.iter().all(|p| p.evaluate()))
             .cloned()
             .collect();
+        self.shut_down.store(false, Ordering::SeqCst);
         // 记住**全部**规格（含被停用的），插件管理页需要把它们列出来
         *self.specs.write().unwrap() = specs.to_vec();
 
         // 1) 实例化
         let mut instances: HashMap<PluginId, Arc<dyn Plugin>> = HashMap::new();
         for spec in &active {
-            let factory = self
-                .factories
-                .read()
-                .unwrap()
-                .get(&spec.name)
-                .cloned()
-                .ok_or_else(|| KernelError::UnknownFactory(spec.name.clone()))?;
+            let factory = { self.factories.read().unwrap().get(&spec.name).cloned() };
+            let factory = factory.ok_or_else(|| {
+                let error = KernelError::UnknownFactory(spec.name.clone());
+                self.lifecycle_failure("plugin.load", Some(&spec.id), &error);
+                error
+            })?;
             let plugin = factory();
             instances.insert(spec.id.clone(), plugin);
         }
 
         // 2) 拓扑排序（依赖用插件 id 表达）
-        let order = topological_order(&active, &instances)?;
+        let order = topological_order(&active, &instances).map_err(|error| {
+            self.lifecycle_failure("plugin.load", None, &error);
+            error
+        })?;
 
         // 3) 逐个启动
         self.plugins.write().unwrap().extend(instances.clone());
@@ -385,22 +476,31 @@ impl Kernel {
             let mut cfg = plugin.default_config();
             merge_json(&mut cfg, &spec.config);
             if let Some(schema) = plugin.schema() {
-                schema::validate(&schema, &cfg).map_err(|e| KernelError::Config {
-                    plugin: id.clone(),
-                    reason: e.to_string(),
+                schema::validate(&schema, &cfg).map_err(|e| {
+                    let error = KernelError::Config {
+                        plugin: id.clone(),
+                        reason: e.to_string(),
+                    };
+                    self.lifecycle_failure("plugin.apply", Some(id), &error);
+                    error
                 })?;
             }
 
             let result: PluginResult = self.ctx.with_owner(id, |ctx| plugin.apply(ctx, cfg));
             match result {
-                Ok(()) => self.ctx.set_plugin_state(id, PluginState::Ready),
+                Ok(()) => {
+                    self.ctx.set_plugin_state(id, PluginState::Ready);
+                    self.lifecycle_outcome("plugin.apply", Some(id), "succeeded");
+                }
                 Err(e) => {
                     self.ctx.set_plugin_state(id, PluginState::Failed);
                     self.ctx.dispose_owner(id);
-                    return Err(KernelError::Apply {
+                    let error = KernelError::Apply {
                         plugin: id.clone(),
                         reason: e.to_string(),
-                    });
+                    };
+                    self.lifecycle_failure("plugin.apply", Some(id), &error);
+                    return Err(error);
                 }
             }
         }
@@ -413,16 +513,21 @@ impl Kernel {
     /// 的地基（版本扫描、设置解析、Java 运行时、本地内容……），停掉之后界面
     /// 还在但满屏「服务不可用」，属于比直接报错更糟的半残状态。
     pub fn disable(&self, id: &str) -> Result<(), KernelError> {
-        if !self.plugins.read().unwrap().contains_key(id) {
-            return Err(KernelError::NotLoaded(id.to_string()));
+        let loaded = self.plugins.read().unwrap().contains_key(id);
+        if !loaded {
+            let error = KernelError::NotLoaded(id.to_string());
+            self.lifecycle_failure("plugin.disable", Some(id), &error);
+            return Err(error);
         }
-        if self
+        let required = self
             .specs
             .read()
             .map(|specs| specs.iter().any(|s| s.id == id && s.required))
-            .unwrap_or(false)
-        {
-            return Err(KernelError::Required(id.to_string()));
+            .unwrap_or(false);
+        if required {
+            let error = KernelError::Required(id.to_string());
+            self.lifecycle_failure("plugin.disable", Some(id), &error);
+            return Err(error);
         }
         self.ctx.dispose_owner(id);
         self.ctx.set_plugin_state(id, PluginState::Disabled);
@@ -432,27 +537,36 @@ impl Kernel {
                 spec.enabled = false;
             }
         }
+        self.lifecycle_outcome("plugin.disable", Some(id), "succeeded");
         Ok(())
     }
 
     /// 重新启用（等价于再次 apply）。
     pub fn enable(&self, id: &str) -> Result<(), KernelError> {
-        let plugin = self
-            .plugin(id)
-            .ok_or_else(|| KernelError::NotLoaded(id.to_string()))?;
+        let not_loaded = || {
+            let error = KernelError::NotLoaded(id.to_string());
+            self.lifecycle_failure("plugin.enable", Some(id), &error);
+            error
+        };
+        let plugin = self.plugin(id).ok_or_else(not_loaded)?;
         let spec = self
             .specs()
             .into_iter()
             .find(|s| s.id == id)
-            .ok_or_else(|| KernelError::NotLoaded(id.to_string()))?;
+            .ok_or_else(not_loaded)?;
         let mut cfg = plugin.default_config();
         merge_json(&mut cfg, &spec.config);
         if let Some(schema) = plugin.schema() {
-            schema::validate(&schema, &cfg).map_err(|e| KernelError::Config {
-                plugin: id.to_string(),
-                reason: e.to_string(),
+            schema::validate(&schema, &cfg).map_err(|e| {
+                let error = KernelError::Config {
+                    plugin: id.to_string(),
+                    reason: e.to_string(),
+                };
+                self.lifecycle_failure("plugin.enable", Some(id), &error);
+                error
             })?;
         }
+        self.shut_down.store(false, Ordering::SeqCst);
         self.ctx.set_plugin_state(id, PluginState::Starting);
         let result = self.ctx.with_owner(id, |ctx| plugin.apply(ctx, cfg));
         match result {
@@ -463,21 +577,28 @@ impl Kernel {
                         spec.enabled = true;
                     }
                 }
+                self.lifecycle_outcome("plugin.enable", Some(id), "succeeded");
                 Ok(())
             }
             Err(e) => {
                 self.ctx.set_plugin_state(id, PluginState::Failed);
                 self.ctx.dispose_owner(id);
-                Err(KernelError::Apply {
+                let error = KernelError::Apply {
                     plugin: id.to_string(),
                     reason: e.to_string(),
-                })
+                };
+                self.lifecycle_failure("plugin.enable", Some(id), &error);
+                Err(error)
             }
         }
     }
 
     /// 关闭：撤销所有插件的注册。
     pub fn shutdown(&self) {
+        let publish = !self.shut_down.swap(true, Ordering::SeqCst);
+        if publish {
+            self.lifecycle_outcome("kernel.shutdown", None, "started");
+        }
         let ids: Vec<PluginId> = {
             let g = self.plugins.read().unwrap();
             g.keys().cloned().collect()
@@ -489,6 +610,26 @@ impl Kernel {
             if ids.contains(&id) {
                 self.ctx.set_plugin_state(&id, PluginState::Disabled);
             }
+        }
+        // Bootstrap can register owners before specs exist (or before load fails).
+        // Snapshot owner names, then invoke cleanup only after releasing the lock.
+        let mut remaining: Vec<PluginId> = {
+            self.ctx
+                .inner
+                .effects
+                .lock()
+                .unwrap()
+                .keys()
+                .filter(|owner| !owner.is_empty())
+                .cloned()
+                .collect()
+        };
+        remaining.sort();
+        for owner in remaining.into_iter().rev() {
+            self.ctx.dispose_owner(&owner);
+        }
+        if publish {
+            self.lifecycle_outcome("kernel.shutdown", None, "succeeded");
         }
         self.ctx.dispose_owner("");
     }
@@ -648,6 +789,39 @@ mod tests {
     }
 
     #[test]
+    fn root_service_outlives_ambient_owner_and_is_removed_by_kernel_cleanup() {
+        struct RootService(Arc<AtomicUsize>);
+        impl Drop for RootService {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        for explicit_shutdown in [false, true] {
+            let kernel = Kernel::new();
+            let retained = kernel.context().clone();
+            let dropped = Arc::new(AtomicUsize::new(0));
+            retained.with_owner("news", |ctx| {
+                ctx.provide_root("root-service", RootService(dropped.clone()), 0);
+                ctx.provide("ordinary-service", SettingsSvc { locale: "zh-CN" }, 0);
+            });
+            let registry = retained.registry_snapshot();
+            assert!(registry.iter().any(|(key, owner, _)| *key == "root-service" && owner.is_empty()));
+            assert!(registry.iter().any(|(key, owner, _)| *key == "ordinary-service" && owner == "news"));
+            retained.dispose_owner("news");
+            assert!(retained.service::<SettingsSvc>().is_none());
+            assert!(retained.service::<RootService>().is_some());
+            assert_eq!(dropped.load(Ordering::SeqCst), 0);
+            if explicit_shutdown {
+                kernel.shutdown();
+                kernel.shutdown();
+                assert!(retained.service::<RootService>().is_none());
+                assert_eq!(dropped.load(Ordering::SeqCst), 1);
+            }
+            drop(kernel);
+            assert!(retained.service::<RootService>().is_none());
+            assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[test]
     fn service_handle_follows_shadowing() {
         let ctx = Context::new();
         let handle = ctx.service_handle::<SettingsSvc>();
@@ -701,9 +875,7 @@ mod tests {
                 order: Arc::new(Mutex::new(Vec::new())),
             }) as Arc<dyn Plugin>
         });
-        kernel
-            .load(&[PluginSpec::new("l10n").required()])
-            .unwrap();
+        kernel.load(&[PluginSpec::new("l10n").required()]).unwrap();
 
         // 先记下状态：被拒绝的停用不能有副作用（不能先拆服务再报错）。
         let err = kernel.disable("l10n").unwrap_err();
@@ -830,6 +1002,610 @@ mod tests {
         kernel.load(&[PluginSpec::new("l10n").disabled()]).unwrap();
         assert!(kernel.loaded_ids().is_empty());
         assert!(kernel.context().service::<SettingsSvc>().is_none());
+    }
+
+    #[test]
+    fn required_load_rejection_preserves_existing_kernel_before_any_factory_runs() {
+        let kernel = Kernel::new();
+        let hits = Arc::new(AtomicUsize::new(0));
+        kernel.register_factory("l10n", {
+            let hits = hits.clone();
+            move || {
+                hits.fetch_add(1, Ordering::SeqCst);
+                Arc::new(L10n {
+                    hits: Arc::new(AtomicUsize::new(0)),
+                    order: Arc::new(Mutex::new(Vec::new())),
+                }) as Arc<dyn Plugin>
+            }
+        });
+        kernel.load(&[PluginSpec::new("l10n")]).unwrap();
+        let original_specs = serde_json::to_value(kernel.specs()).unwrap();
+        let original_states = kernel.context().plugin_states();
+        let original_registry = kernel.context().registry_snapshot();
+        let original_effects = kernel.context().effect_count("l10n");
+        let original_service = kernel.context().service::<SettingsSvc>().unwrap();
+        let mut conditional = PluginSpec::new("l10n").with_id("required").required();
+        conditional.when.push(crate::Predicate::Platform {
+            platform: "never-a-platform".into(),
+        });
+        for invalid in [
+            PluginSpec::new("l10n")
+                .with_id("required")
+                .required()
+                .disabled(),
+            conditional,
+        ] {
+            assert!(matches!(
+                kernel.load(&[PluginSpec::new("l10n"), invalid]),
+                Err(KernelError::Required(id)) if id == "required"
+            ));
+            assert_eq!(hits.load(Ordering::SeqCst), 1);
+            assert_eq!(
+                serde_json::to_value(kernel.specs()).unwrap(),
+                original_specs
+            );
+            assert_eq!(kernel.context().plugin_states(), original_states);
+            assert_eq!(kernel.context().registry_snapshot(), original_registry);
+            assert_eq!(kernel.context().effect_count("l10n"), original_effects);
+            assert!(Arc::ptr_eq(
+                &kernel.context().service::<SettingsSvc>().unwrap(),
+                &original_service
+            ));
+        }
+    }
+
+    #[test]
+    fn optional_conditions_still_filter_specs_and_true_required_conditions_load() {
+        let kernel = Kernel::new();
+        kernel.register_factory("l10n", || {
+            Arc::new(L10n {
+                hits: Arc::new(AtomicUsize::new(0)),
+                order: Arc::new(Mutex::new(Vec::new())),
+            }) as Arc<dyn Plugin>
+        });
+        let mut skipped = PluginSpec::new("missing");
+        skipped.when.push(crate::Predicate::Platform {
+            platform: "never-a-platform".into(),
+        });
+        let mut required = PluginSpec::new("l10n").required();
+        required.when.push(crate::Predicate::Platform {
+            platform: std::env::consts::OS.into(),
+        });
+        kernel.load(&[skipped, required]).unwrap();
+        assert_eq!(kernel.loaded_ids(), vec!["l10n"]);
+        assert_eq!(kernel.specs().len(), 2);
+    }
+
+    #[test]
+    fn diagnostics_publish_explicit_safe_fields_and_correlations() {
+        use crate::{DiagnosticRecord, Severity};
+        let ctx = Context::new();
+        let records = Arc::new(Mutex::new(Vec::new()));
+        ctx.on::<DiagnosticRecord>({
+            let records = records.clone();
+            move |record| records.lock().unwrap().push(record.clone())
+        });
+        let before = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        ctx.with_owner("not-the-component", |ctx| {
+            ctx.diagnostic(
+                DiagnosticRecord::new("downloads", "batch.finished", Severity::Info)
+                    .with_field("completed", 3_u64)
+                    .with_operation_id("operation-1")
+                    .with_session_id("session-1")
+                    .with_job_id("job-1")
+                    .with_batch_id("batch-1"),
+            );
+        });
+        let after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let records = records.lock().unwrap();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert_eq!(record.component, "downloads");
+        assert_eq!(record.event, "batch.finished");
+        assert_eq!(record.level, Severity::Info);
+        assert_eq!(
+            record.fields,
+            std::collections::BTreeMap::from([("completed".into(), serde_json::json!(3))])
+        );
+        assert_eq!(record.operation_id.as_deref(), Some("operation-1"));
+        assert_eq!(record.session_id.as_deref(), Some("session-1"));
+        assert_eq!(record.job_id.as_deref(), Some("job-1"));
+        assert_eq!(record.batch_id.as_deref(), Some("batch-1"));
+        assert!((before..=after).contains(&record.timestamp_at_emission_ms));
+        assert_eq!(serde_json::to_value(record).unwrap()["level"], "info");
+        drop(records);
+        ctx.dispose_owner("");
+    }
+
+    #[test]
+    fn diagnostic_observer_panics_are_isolated_but_ordinary_event_panics_propagate() {
+        use crate::{DiagnosticRecord, Severity};
+        let ctx = Context::new();
+        ctx.on::<DiagnosticRecord>(|_| panic!("broken diagnostic observer"));
+        ctx.diagnostic(DiagnosticRecord::new("test", "safe", Severity::Warn));
+        ctx.on::<Greeting>(|_| panic!("ordinary observer"));
+        assert!(std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.emit(Greeting("hello".into()));
+        }))
+        .is_err());
+        ctx.dispose_owner("");
+    }
+
+    #[test]
+    fn on_dispose_runs_once_in_reverse_registration_order_outside_locks() {
+        let ctx = Context::new();
+        let order = Arc::new(Mutex::new(Vec::new()));
+        ctx.with_owner("worker", |ctx| {
+            for i in 0..3 {
+                let order = order.clone();
+                let callback_ctx = ctx.clone();
+                ctx.on_dispose(move || {
+                    assert_eq!(callback_ctx.effect_count("worker"), 0);
+                    callback_ctx.set_plugin_state("cleanup", PluginState::Disabled);
+                    order.lock().unwrap().push(i);
+                });
+            }
+        });
+        assert_eq!(ctx.effect_count("worker"), 3);
+        assert!(order.lock().unwrap().is_empty());
+        ctx.dispose_owner("worker");
+        ctx.dispose_owner("worker");
+        assert_eq!(*order.lock().unwrap(), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn kernel_drop_disposes_effects_even_when_context_is_retained() {
+        let retained;
+        let calls = Arc::new(AtomicUsize::new(0));
+        {
+            let kernel = Kernel::new();
+            kernel.register_factory("l10n", || {
+                Arc::new(L10n {
+                    hits: Arc::new(AtomicUsize::new(0)),
+                    order: Arc::new(Mutex::new(Vec::new())),
+                }) as Arc<dyn Plugin>
+            });
+            kernel.load(&[PluginSpec::new("l10n")]).unwrap();
+            retained = kernel.context().clone();
+            retained.with_owner("l10n", |ctx| {
+                let calls = calls.clone();
+                ctx.on_dispose(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                });
+            });
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(retained.service::<SettingsSvc>().is_none());
+        assert_eq!(retained.effect_count("l10n"), 0);
+    }
+
+    fn capture_diagnostics(ctx: &Context) -> Arc<Mutex<Vec<crate::DiagnosticRecord>>> {
+        let records = Arc::new(Mutex::new(Vec::new()));
+        let sink = records.clone();
+        let callback_ctx = ctx.clone();
+        ctx.on::<crate::DiagnosticRecord>(move |record| {
+            // Lifecycle observers must be able to query state/services without deadlock.
+            let _ = callback_ctx.registry_snapshot();
+            let _ = callback_ctx.plugin_states();
+            sink.lock().unwrap().push(record.clone());
+        });
+        records
+    }
+
+    fn diagnostic_summaries(records: &Arc<Mutex<Vec<crate::DiagnosticRecord>>>) -> Value {
+        Value::Array(
+            records
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|record| {
+                    assert_eq!(record.component, "kernel");
+                    assert!(record.timestamp_at_emission_ms > 0);
+                    serde_json::json!({
+                        "event": record.event,
+                        "level": record.level,
+                        "fields": record.fields,
+                    })
+                })
+                .collect(),
+        )
+    }
+
+    struct DiagnosticPlugin {
+        dependencies: &'static [&'static str],
+        attempts: Arc<AtomicUsize>,
+        fail_on: usize,
+        invalid_config: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl Default for DiagnosticPlugin {
+        fn default() -> Self {
+            Self {
+                dependencies: &[],
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_on: 0,
+                invalid_config: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            }
+        }
+    }
+
+    impl Plugin for DiagnosticPlugin {
+        fn id(&self) -> &str {
+            "worker"
+        }
+        fn inject(&self) -> &'static [&'static str] {
+            self.dependencies
+        }
+        fn schema(&self) -> Option<Value> {
+            self.invalid_config.load(Ordering::SeqCst).then(|| {
+                serde_json::json!({
+                    "type": "object", "required": ["private-schema-field"]
+                })
+            })
+        }
+        fn apply(&self, ctx: &Context, _cfg: Value) -> PluginResult {
+            ctx.provide("worker", SettingsSvc { locale: "en-US" }, 0);
+            ctx.on::<Greeting>(|_| {});
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst) + 1;
+            if attempt == self.fail_on {
+                Err("private-token=https://user:password@example.invalid/?token=secret".into())
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn lifecycle_records_are_finite_and_shutdown_is_idempotent() {
+        let kernel = Kernel::new();
+        let records = capture_diagnostics(kernel.context());
+        kernel.register_factory("worker", || Arc::new(DiagnosticPlugin::default()));
+        kernel
+            .load(&[
+                PluginSpec::new("worker"),
+                PluginSpec::new("skipped").disabled(),
+            ])
+            .unwrap();
+        kernel.disable("worker").unwrap();
+        kernel.enable("worker").unwrap();
+        kernel.shutdown();
+        let after_shutdown = capture_diagnostics(kernel.context());
+        kernel.shutdown();
+        drop(kernel);
+        assert_eq!(diagnostic_summaries(&after_shutdown), serde_json::json!([]));
+        assert_eq!(
+            diagnostic_summaries(&records),
+            serde_json::json!([
+                {"event":"plugin.apply", "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}},
+                {"event":"plugin.disable", "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}},
+                {"event":"plugin.enable", "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}},
+                {"event":"kernel.shutdown", "level":"info", "fields":{"outcome":"started"}},
+                {"event":"kernel.shutdown", "level":"info", "fields":{"outcome":"succeeded"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn lifecycle_shutdown_resets_after_subsequent_load_or_enable() {
+        for reload in [false, true] {
+            let kernel = Kernel::new();
+            kernel.register_factory("worker", || Arc::new(DiagnosticPlugin::default()));
+            kernel.load(&[PluginSpec::new("worker")]).unwrap();
+            kernel.shutdown();
+            let records = capture_diagnostics(kernel.context());
+            if reload {
+                kernel.load(&[PluginSpec::new("worker")]).unwrap();
+            } else {
+                kernel.enable("worker").unwrap();
+            }
+            kernel.shutdown();
+            assert_eq!(
+                diagnostic_summaries(&records),
+                serde_json::json!([
+                    {"event":if reload {"plugin.apply"} else {"plugin.enable"}, "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}},
+                    {"event":"kernel.shutdown", "level":"info", "fields":{"outcome":"started"}},
+                    {"event":"kernel.shutdown", "level":"info", "fields":{"outcome":"succeeded"}}
+                ])
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_drop_cleans_bootstrap_owners_even_before_load() {
+        let retained;
+        let order = Arc::new(Mutex::new(Vec::new()));
+        {
+            let kernel = Kernel::new();
+            retained = kernel.context().clone();
+            retained.with_owner("bootstrap", |ctx| {
+                ctx.provide("bootstrap", SettingsSvc { locale: "en-US" }, 0);
+                for i in 0..2 {
+                    let order = order.clone();
+                    let callback_ctx = ctx.clone();
+                    ctx.on_dispose(move || {
+                        assert_eq!(callback_ctx.effect_count("bootstrap"), 0);
+                        order.lock().unwrap().push(i);
+                    });
+                }
+            });
+        }
+        assert_eq!(*order.lock().unwrap(), vec![1, 0]);
+        assert!(retained.service::<SettingsSvc>().is_none());
+        assert_eq!(retained.effect_count("bootstrap"), 0);
+    }
+
+    #[test]
+    fn lifecycle_factory_graph_and_config_failures_emit_one_safe_record() {
+        for (case, event, category, plugin_id) in [
+            ("factory", "plugin.load", "factory", Some("requested")),
+            ("missing", "plugin.load", "dependency", Some("requested")),
+            ("cycle", "plugin.load", "dependency", None),
+            ("config", "plugin.apply", "config", Some("requested")),
+        ] {
+            let kernel = Kernel::new();
+            let records = capture_diagnostics(kernel.context());
+            if case != "factory" {
+                let case = case.to_string();
+                kernel.register_factory("worker", move || {
+                    Arc::new(DiagnosticPlugin {
+                        dependencies: match case.as_str() {
+                            "missing" => &["absent"],
+                            "cycle" => &["requested"],
+                            _ => &[],
+                        },
+                        invalid_config: Arc::new(std::sync::atomic::AtomicBool::new(
+                            case == "config",
+                        )),
+                        ..Default::default()
+                    })
+                });
+            }
+            let err = kernel
+                .load(&[PluginSpec::new("worker")
+                    .with_id("requested")
+                    .with_config(serde_json::json!({"private-config": "secret"}))])
+                .unwrap_err();
+            assert!(match case {
+                "factory" => matches!(err, KernelError::UnknownFactory(_)),
+                "missing" => matches!(err, KernelError::MissingDependency { .. }),
+                "cycle" => matches!(err, KernelError::Cycle(_)),
+                "config" => matches!(err, KernelError::Config { .. }),
+                _ => unreachable!(),
+            });
+            assert!(kernel.context().service::<SettingsSvc>().is_none());
+            let mut fields = serde_json::json!({"outcome":"failed", "category":category});
+            if let Some(plugin_id) = plugin_id {
+                fields["plugin_id"] = plugin_id.into();
+            }
+            assert_eq!(
+                diagnostic_summaries(&records),
+                serde_json::json!([
+                    {"event":event, "level":"error", "fields":fields}
+                ]),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn lifecycle_initial_apply_failure_keeps_original_error_and_rolls_back() {
+        let kernel = Kernel::new();
+        let records = capture_diagnostics(kernel.context());
+        kernel.register_factory("worker", || {
+            Arc::new(DiagnosticPlugin {
+                fail_on: 1,
+                ..Default::default()
+            })
+        });
+        let err = kernel.load(&[PluginSpec::new("worker")]).unwrap_err();
+        assert!(matches!(err, KernelError::Apply { plugin, reason }
+            if plugin == "worker" && reason.contains("private-token")));
+        assert_eq!(
+            kernel.context().plugin_states()["worker"],
+            PluginState::Failed
+        );
+        assert!(kernel.context().service::<SettingsSvc>().is_none());
+        assert_eq!(kernel.context().effect_count("worker"), 0);
+        assert_eq!(
+            diagnostic_summaries(&records),
+            serde_json::json!([
+                {"event":"plugin.apply", "level":"error", "fields":{"plugin_id":"worker", "outcome":"failed", "category":"apply"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn lifecycle_reenable_failure_then_success_reports_each_outcome_once() {
+        let kernel = Kernel::new();
+        let records = capture_diagnostics(kernel.context());
+        kernel.register_factory("worker", || {
+            Arc::new(DiagnosticPlugin {
+                fail_on: 2,
+                ..Default::default()
+            })
+        });
+        kernel.load(&[PluginSpec::new("worker")]).unwrap();
+        kernel.disable("worker").unwrap();
+        assert!(matches!(
+            kernel.enable("worker"),
+            Err(KernelError::Apply { .. })
+        ));
+        assert_eq!(
+            kernel.context().plugin_states()["worker"],
+            PluginState::Failed
+        );
+        assert!(kernel.context().service::<SettingsSvc>().is_none());
+        assert_eq!(kernel.context().effect_count("worker"), 0);
+        assert!(!kernel.specs()[0].enabled);
+        kernel.enable("worker").unwrap();
+        assert_eq!(
+            kernel.context().plugin_states()["worker"],
+            PluginState::Ready
+        );
+        assert!(kernel.context().service::<SettingsSvc>().is_some());
+        assert!(kernel.specs()[0].enabled);
+        assert_eq!(
+            diagnostic_summaries(&records),
+            serde_json::json!([
+                {"event":"plugin.apply", "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}},
+                {"event":"plugin.disable", "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}},
+                {"event":"plugin.enable", "level":"error", "fields":{"plugin_id":"worker", "outcome":"failed", "category":"apply"}},
+                {"event":"plugin.enable", "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn lifecycle_reenable_config_failure_preserves_existing_disabled_state() {
+        let kernel = Kernel::new();
+        let records = capture_diagnostics(kernel.context());
+        let invalid = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let attempts = Arc::new(AtomicUsize::new(0));
+        kernel.register_factory("worker", {
+            let invalid = invalid.clone();
+            let attempts = attempts.clone();
+            move || {
+                Arc::new(DiagnosticPlugin {
+                    invalid_config: invalid.clone(),
+                    attempts: attempts.clone(),
+                    ..Default::default()
+                })
+            }
+        });
+        kernel.load(&[PluginSpec::new("worker")]).unwrap();
+        kernel.disable("worker").unwrap();
+        invalid.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            kernel.enable("worker"),
+            Err(KernelError::Config { .. })
+        ));
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            kernel.context().plugin_states()["worker"],
+            PluginState::Disabled
+        );
+        assert!(!kernel.specs()[0].enabled);
+        assert!(kernel.context().service::<SettingsSvc>().is_none());
+        assert_eq!(
+            diagnostic_summaries(&records),
+            serde_json::json!([
+                {"event":"plugin.apply", "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}},
+                {"event":"plugin.disable", "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}},
+                {"event":"plugin.enable", "level":"error", "fields":{"plugin_id":"worker", "outcome":"failed", "category":"config"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn lifecycle_required_disable_rejection_preserves_service_and_effects() {
+        let kernel = Kernel::new();
+        let records = capture_diagnostics(kernel.context());
+        kernel.register_factory("worker", || Arc::new(DiagnosticPlugin::default()));
+        kernel
+            .load(&[PluginSpec::new("worker").required()])
+            .unwrap();
+        let service = kernel.context().service::<SettingsSvc>().unwrap();
+        let registry = kernel.context().registry_snapshot();
+        let effects = kernel.context().effect_count("worker");
+        assert!(matches!(
+            kernel.disable("worker"),
+            Err(KernelError::Required(_))
+        ));
+        assert!(Arc::ptr_eq(
+            &service,
+            &kernel.context().service::<SettingsSvc>().unwrap()
+        ));
+        assert_eq!(kernel.context().registry_snapshot(), registry);
+        assert_eq!(kernel.context().effect_count("worker"), effects);
+        assert_eq!(
+            kernel.context().plugin_states()["worker"],
+            PluginState::Ready
+        );
+        assert!(kernel.specs()[0].enabled);
+        assert_eq!(
+            diagnostic_summaries(&records),
+            serde_json::json!([
+                {"event":"plugin.apply", "level":"info", "fields":{"plugin_id":"worker", "outcome":"succeeded"}},
+                {"event":"plugin.disable", "level":"warn", "fields":{"plugin_id":"worker", "outcome":"rejected", "category":"required"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn lifecycle_not_loaded_and_required_load_rejections_emit_once() {
+        let kernel = Kernel::new();
+        let records = capture_diagnostics(kernel.context());
+        assert!(matches!(
+            kernel.disable("absent"),
+            Err(KernelError::NotLoaded(_))
+        ));
+        assert!(matches!(
+            kernel.enable("absent"),
+            Err(KernelError::NotLoaded(_))
+        ));
+        assert!(matches!(
+            kernel.load(&[PluginSpec::new("required").required().disabled()]),
+            Err(KernelError::Required(_))
+        ));
+        assert_eq!(
+            diagnostic_summaries(&records),
+            serde_json::json!([
+                {"event":"plugin.disable", "level":"warn", "fields":{"outcome":"rejected", "category":"not_loaded"}},
+                {"event":"plugin.enable", "level":"warn", "fields":{"outcome":"rejected", "category":"not_loaded"}},
+                {"event":"plugin.load", "level":"warn", "fields":{"plugin_id":"required", "outcome":"rejected", "category":"required"}}
+            ])
+        );
+    }
+
+    #[test]
+    fn lifecycle_unknown_target_sentinel_is_not_a_plugin_identity() {
+        let kernel = Kernel::new();
+        let records = capture_diagnostics(kernel.context());
+        let sentinel = "SENTINEL_TOKEN_3A";
+        for error in [kernel.disable(sentinel).unwrap_err(), kernel.enable(sentinel).unwrap_err()] {
+            assert!(matches!(&error, KernelError::NotLoaded(id) if id == sentinel));
+            assert!(error.to_string().contains(sentinel));
+        }
+        let records = records.lock().unwrap().clone();
+        assert_eq!(records.len(), 2);
+        for record in records.iter() {
+            assert_eq!(record.fields.get("category"), Some(&Value::String("not_loaded".into())));
+            assert_eq!(record.fields.get("outcome"), Some(&Value::String("rejected".into())));
+            assert!(!record.fields.contains_key("plugin_id"));
+            assert!(!serde_json::to_string(record).unwrap().contains(sentinel));
+        }
+    }
+
+    #[test]
+    fn lifecycle_commands_succeed_despite_diagnostic_observer_panics() {
+        let kernel = Kernel::new();
+        let observed = Arc::new(AtomicUsize::new(0));
+        kernel.context().on::<crate::DiagnosticRecord>({
+            let observed = observed.clone();
+            move |_| {
+                observed.fetch_add(1, Ordering::SeqCst);
+                panic!("broken logger");
+            }
+        });
+        kernel.register_factory("worker", || Arc::new(DiagnosticPlugin::default()));
+        kernel.load(&[PluginSpec::new("worker")]).unwrap();
+        assert!(kernel.context().service::<SettingsSvc>().is_some());
+        kernel.disable("worker").unwrap();
+        assert!(kernel.context().service::<SettingsSvc>().is_none());
+        kernel.enable("worker").unwrap();
+        assert_eq!(
+            kernel.context().plugin_states()["worker"],
+            PluginState::Ready
+        );
+        kernel.shutdown();
+        assert!(kernel.context().service::<SettingsSvc>().is_none());
+        assert_eq!(observed.load(Ordering::SeqCst), 5);
     }
 
     #[test]

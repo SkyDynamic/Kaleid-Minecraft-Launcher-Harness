@@ -185,6 +185,7 @@ function seedPlugins(): PluginInfo[] {
   // 与宿主真实装载的插件同 id、同顺序（`standard_preset()`）：浏览器演示里
   // "哪些必需不能关"才会和真机看到的一致，而不是演示一套、真机另一套。
   return [
+    mk('launcher-logger', '启动器日志', '记录启动器、游戏启动、下载与插件调用的诊断日志', { required: true }),
     mk('core-lists', '文件夹列表', '侧栏文件夹区的兜底实现：只读选择与打开目录', { required: true }),
     mk('version-store', '版本扫描', '扫描 versions/*，解析加载器类型与就绪度', { required: true }),
     mk('settings', '分层设置', '版本 > 文件夹 > 全局 > 内置默认 的配置解析', { required: true }),
@@ -1748,6 +1749,7 @@ async function dispatch(cmd: string, args?: unknown): Promise<unknown> {
       const enabled = Boolean(arg<boolean>(args, 'enabled'));
       const plugin = state.plugins.find((p) => p.id === id);
       if (!plugin) throw new Error(`未找到插件：${id}`);
+      if (!enabled && plugin.required) throw new Error(`插件 ${id} 是必需插件，不能停用`);
       plugin.enabled = enabled;
       plugin.state = enabled ? 'ready' : 'disabled';
       const list = clone(state.plugins);

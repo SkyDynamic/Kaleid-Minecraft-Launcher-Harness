@@ -12,6 +12,7 @@
 //! `kaleid-core-plugins` 里以服务形式提供，因此都能被第三方插件遮蔽或包裹。
 
 pub mod context;
+pub mod diagnostic;
 pub mod effect;
 pub mod event;
 pub mod patch;
@@ -19,6 +20,7 @@ pub mod plugin;
 pub mod schema;
 
 pub use context::{merge_json, Context, Kernel, KernelError, ServiceHandle, ServiceKey};
+pub use diagnostic::{DiagnosticRecord, Severity};
 pub use effect::{Effect, EffectScope};
 pub use patch::{apply_patches, parse_patch, PatchError, PatchOp, UpdateOp};
 pub use plugin::{

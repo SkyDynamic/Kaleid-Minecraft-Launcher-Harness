@@ -470,6 +470,10 @@ impl Plugin for MsaLoginPlugin {
 /// 注册全部内置插件工厂。
 pub fn register_all(kernel: &Kernel, data_root: &Path) {
     let dr = data_root.to_path_buf();
+    kernel.register_factory("launcher-logger", {
+        let dr = dr.clone();
+        move || Arc::new(crate::logger::LauncherLoggerPlugin::new(&dr)) as Arc<dyn Plugin>
+    });
     kernel.register_factory("core-lists", {
         let dr = dr.clone();
         move || {
@@ -609,6 +613,7 @@ impl Plugin for SaveManagerPlugin {
 /// 归到必需。
 pub fn standard_preset() -> Vec<PluginSpec> {
     vec![
+        PluginSpec::new("launcher-logger").required(),
         PluginSpec::new("core-lists").required(),
         PluginSpec::new("version-store").required(),
         PluginSpec::new("settings").required(),
@@ -652,6 +657,7 @@ pub struct PluginDescriptor {
 
 fn meta(id: &str) -> (&'static str, &'static str) {
     match id {
+        "launcher-logger" => ("启动器日志", "记录启动、下载与插件操作，提供本地排障日志"),
         "core-lists" => ("文件夹列表", "侧栏文件夹区的兜底实现：只读选择与打开目录"),
         "version-store" => ("版本扫描", "扫描 versions/*，解析加载器类型与就绪度"),
         "settings" => ("分层设置", "版本 > 文件夹 > 全局 > 内置默认 的配置解析"),

@@ -2355,17 +2355,12 @@ mod tests {
     #[test]
     fn content_commands_report_missing_plugin() {
         let (_dir, data, mc) = env();
-        // 手工组一份"停用 game-content"的组合：降级要说清楚缺什么
+        // 合成一份缺少 game-content 的测试组合：验证缺失服务提示，不是停用生产必需插件。
         let kernel = Kernel::new();
         register_all(&kernel, &data);
         let specs = standard_preset()
             .into_iter()
-            .map(|mut spec| {
-                if spec.id == "game-content" {
-                    spec.enabled = false;
-                }
-                spec
-            })
+            .filter(|spec| spec.id != "game-content")
             .collect::<Vec<_>>();
         kernel.load(&specs).unwrap();
 
@@ -2422,18 +2417,12 @@ mod tests {
     #[test]
     fn msa_commands_report_missing_plugin() {
         let (_dir, data, _mc) = env();
-        // 界面里「微软登录」是必需插件、开关是灰的；但内核层仍可停用它
-        // （验收降级路径要用），所以命令必须说清楚缺什么，而不是抛一个空指针。
+        // 合成一份缺少 msa-login 的测试组合：验证缺失服务提示，不是停用生产必需插件。
         let kernel = Kernel::new();
         register_all(&kernel, &data);
         let specs = standard_preset()
             .into_iter()
-            .map(|mut spec| {
-                if spec.id == "msa-login" {
-                    spec.enabled = false;
-                }
-                spec
-            })
+            .filter(|spec| spec.id != "msa-login")
             .collect::<Vec<_>>();
         kernel.load(&specs).unwrap();
 
