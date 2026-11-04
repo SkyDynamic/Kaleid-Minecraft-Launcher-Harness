@@ -4,7 +4,10 @@
 //! **刻意不依赖 Tauri**：命令表可以脱离 WebView 单测，Tauri 外壳只做一层转发，
 //! 将来换掉外壳（或加一条 CLI/IPC 通道）不用重写业务。
 
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::{atomic::{AtomicBool, AtomicU64, Ordering}, Arc, Mutex};
+use std::time::Instant;
 
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -21,7 +24,205 @@ use kaleid_core_plugins::{
     RootRegistry, Settings, GameProcessManager, SaveManager, VersionAdmin, VersionStore,
     LOG_TAIL_DEFAULT,
 };
-use kaleid_kernel::Kernel;
+use kaleid_kernel::{DiagnosticRecord, Kernel, Severity};
+
+// A finite, producer-owned catalog. Never persist an arbitrary incoming command name.
+fn command_route(command: &str) -> (&'static str, &'static str) {
+    const ROUTES: &[(&str, &str)] = &[
+        ("roots_list", "core-lists"), ("roots_add", "core-lists"),
+        ("roots_remove", "core-lists"), ("roots_rename", "core-lists"),
+        ("roots_select", "core-lists"), ("roots_set_default", "core-lists"),
+        ("roots_default", "core-lists"), ("roots_clear_default", "core-lists"),
+        ("roots_set_isolation", "core-lists"), ("versions_scan", "version-store"),
+        ("versions_verify", "version-store"), ("versions_delete", "version-manager"),
+        ("versions_loader_status", "version-manager"), ("versions_update_loader", "version-manager"),
+        ("versions_remote", "version-manager"), ("versions_check_name", "version-manager"),
+        ("versions_install", "version-manager"), ("loaders_versions", "version-manager"),
+        ("loader_version_times", "version-manager"), ("fabric_api_latest", "version-manager"),
+        ("downloads_snapshot", "version-manager"), ("downloads_clear_finished", "version-manager"),
+        ("downloads_cancel", "version-manager"), ("sources_list", "version-manager"),
+        ("settings_global", "settings"), ("jvm_default_args", "settings"),
+        ("settings_patch_global", "settings"), ("settings_version", "settings"),
+        ("settings_patch_version", "settings"), ("settings_effective", "settings"),
+        ("app_platform", "host"), ("skin_resolve", "accounts"),
+        ("accounts_list", "accounts"), ("accounts_active", "accounts"),
+        ("accounts_set_active", "accounts"), ("accounts_apply_offline", "accounts"),
+        ("accounts_remove", "accounts"), ("msa_config", "msa-login"),
+        ("msa_start", "msa-login"), ("msa_poll", "msa-login"),
+        ("msa_cancel", "msa-login"), ("msa_states", "msa-login"),
+        ("plugins_list", "kernel"), ("plugins_set_enabled", "kernel"),
+        ("plugins_slots", "manifests"), ("plugins_manifests", "manifests"),
+        ("launch_plan", "launch"), ("launch_command", "launch"),
+        ("launch_check", "launch"), ("launch_start", "game-launch"),
+        ("launch_state", "game-launch"), ("launch_states", "game-launch"),
+        ("launch_stop", "game-launch"), ("launch_cancel", "game-launch"),
+        ("launch_console_tail", "game-launch"), ("crash_report", "game-launch"),
+        ("crash_export", "game-launch"), ("crash_export_zip", "game-launch"),
+        ("saves_list", "save-manager"), ("saves_delete", "save-manager"),
+        ("saves_datapacks_list", "save-manager"), ("saves_datapack_import", "save-manager"),
+        ("saves_datapack_delete", "save-manager"), ("mods_target", "mod-download"),
+        ("mods_types", "mod-download"), ("mods_ranking", "mod-download"),
+        ("mods_search", "mod-download"), ("mods_detail", "mod-download"),
+        ("mods_install", "mod-download"), ("mods_updates_check", "game-content"),
+        ("mods_apply_update", "game-content"), ("content_dirs", "game-content"),
+        ("content_mods_list", "game-content"), ("content_mods_set_enabled", "game-content"),
+        ("content_mod_icon", "game-content"), ("content_packs_list", "game-content"),
+        ("content_saves_list", "game-content"), ("content_logs_list", "game-content"),
+        ("content_logs_read", "game-content"), ("content_import", "game-content"),
+        ("content_delete", "game-content"), ("java_list", "java-runtime"),
+        ("java_inspect", "java-runtime"), ("java_pick", "java-runtime"),
+    ];
+    ROUTES.iter().copied().find(|(name, _)| *name == command).unwrap_or(("unknown", "host"))
+}
+
+#[derive(Default)]
+struct CommandDiagnostics {
+    poll_failures: Mutex<HashSet<(&'static str, &'static str)>>,
+    shutdown_started: AtomicBool,
+}
+
+fn command_diagnostics(kernel: &Kernel) -> Arc<CommandDiagnostics> {
+    // Only initialization is process-wide; the bounded failure set is owned by this kernel.
+    static INIT: Mutex<()> = Mutex::new(());
+    if let Some(state) = kernel.context().service::<CommandDiagnostics>() { return state; }
+    let _guard = INIT.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(state) = kernel.context().service::<CommandDiagnostics>() { return state; }
+    kernel.context().provide_root("host-command-diagnostics", CommandDiagnostics::default(), 0);
+    kernel.context().service::<CommandDiagnostics>().unwrap_or_else(|| Arc::new(CommandDiagnostics::default()))
+}
+
+fn uuid_id(value: &str) -> bool {
+    value.len() == 36 && value.bytes().enumerate().all(|(i, b)| {
+        if matches!(i, 8 | 13 | 18 | 23) { b == b'-' } else { b.is_ascii_hexdigit() }
+    })
+}
+
+fn public_version_id(value: &str) -> bool {
+    if value.len() > 32 { return false; }
+    let parts: Vec<_> = value.split('.').collect();
+    if (2..=3).contains(&parts.len()) && parts.iter().all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit())) {
+        return value.len() <= 32;
+    }
+    let b = value.as_bytes();
+    b.len() == 6 && b[2] == b'w' && b[5].is_ascii_lowercase()
+        && [b[0], b[1], b[3], b[4]].iter().all(|b| b.is_ascii_digit())
+}
+
+#[derive(Default)]
+struct CommandIds {
+    root: Option<String>,
+    version: Option<String>,
+    session: Option<String>,
+    job: Option<String>,
+}
+
+impl CommandIds {
+    fn from_args(command: &str, args: &Value) -> Self {
+        let mut ids = Self::default();
+        // Explicit command + field roles. Account IDs/names and custom version names are omitted.
+        let root_key = match command {
+            "roots_remove" | "roots_rename" | "roots_select" | "roots_set_default" | "roots_set_isolation" => Some("id"),
+            "versions_scan" | "versions_verify" | "versions_delete" | "versions_loader_status" |
+            "versions_update_loader" | "versions_install" | "versions_check_name" |
+            "settings_version" | "settings_patch_version" | "settings_effective" |
+            "launch_plan" | "launch_command" | "launch_check" | "launch_start" |
+            "saves_list" | "saves_delete" | "saves_datapacks_list" | "saves_datapack_import" |
+            "saves_datapack_delete" | "mods_target" | "mods_detail" | "mods_install" |
+            "mods_updates_check" | "mods_apply_update" | "content_dirs" | "content_mods_list" |
+            "content_mods_set_enabled" | "content_mod_icon" | "content_packs_list" |
+            "content_saves_list" | "content_logs_list" | "content_logs_read" | "content_import" |
+            "content_delete" => Some("rootId"),
+            _ => None,
+        };
+        if let Some(key) = root_key {
+            ids.root = args.get(key).and_then(Value::as_str).filter(|id| uuid_id(id)).map(str::to_owned);
+            ids.version = args.get("versionId").and_then(Value::as_str).filter(|id| public_version_id(id)).map(str::to_owned);
+        }
+        if matches!(command, "launch_stop" | "launch_cancel" | "launch_console_tail" | "crash_report" | "crash_export" | "crash_export_zip") {
+            ids.session = args.get("sessionId").and_then(Value::as_u64).map(|id| id.to_string());
+        }
+        if command == "downloads_cancel" {
+            ids.job = args.get("id").and_then(Value::as_str).filter(|id| uuid_id(id)).map(str::to_owned);
+        }
+        ids
+    }
+
+    fn attach(&self, mut record: DiagnosticRecord) -> DiagnosticRecord {
+        if let Some(id) = &self.root { record = record.with_field("root_id", id.clone()); }
+        if let Some(id) = &self.version { record = record.with_field("version_id", id.clone()); }
+        if let Some(id) = &self.session { record = record.with_session_id(id.clone()); }
+        if let Some(id) = &self.job { record = record.with_job_id(id.clone()); }
+        record
+    }
+}
+
+fn observe_command(
+    kernel: &Kernel,
+    command: &str,
+    args: Value,
+    execute: impl FnOnce(Value) -> Result<Value, String>,
+) -> Result<Value, String> {
+    static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
+    let (command, component) = command_route(command);
+    let operation = format!("{}-{}", std::process::id(), NEXT_OPERATION.fetch_add(1, Ordering::Relaxed));
+    let started = Instant::now();
+    let mut ids = CommandIds::from_args(command, &args);
+    let polling = matches!(command, "downloads_snapshot" | "launch_state" | "launch_states" | "launch_console_tail" | "msa_states" | "msa_poll");
+    let record = |event, severity| DiagnosticRecord::new(component, event, severity)
+        .with_operation_id(operation.clone()).with_field("command", command).with_field("source", "host");
+    if !polling { kernel.context().diagnostic(ids.attach(record("command.start", Severity::Info)).with_field("outcome", "started")); }
+    let result = execute(args);
+    if let Ok(value) = &result {
+        // Only these typed, generated result IDs cross the boundary; never persist the body.
+        if matches!(command, "versions_install" | "versions_update_loader" | "mods_install") {
+            ids.job = value.get("jobId").and_then(Value::as_str).filter(|id| uuid_id(id)).map(str::to_owned);
+        }
+        if command == "launch_start" {
+            ids.session = value.get("sessionId").and_then(Value::as_u64).map(|id| id.to_string());
+        }
+        if command == "roots_add" {
+            ids.root = value.get("id").and_then(Value::as_str).filter(|id| uuid_id(id)).map(str::to_owned);
+        }
+    }
+    let (outcome, category) = match &result {
+        Err(_) => ("failed", if command == "unknown" { "unknown_command" } else { "command_failed" }),
+        Ok(value) if command == "launch_check" && value.get("ok").and_then(Value::as_bool) == Some(false) => {
+            let category = match value.pointer("/blocks/0/kind").and_then(Value::as_str) {
+                Some("no-account") => "no-account", Some("java") => "java", Some("version") => "version", Some("auth") => "auth", _ => "blocked",
+            };
+            ("blocked", category)
+        }
+        Ok(_) if matches!(command, "versions_install" | "versions_update_loader" | "mods_install" | "launch_start") => ("accepted", "queued"),
+        Ok(_) => ("succeeded", "completed"),
+    };
+    if polling {
+        let state = command_diagnostics(kernel);
+        let mut failures = state.poll_failures.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if result.is_ok() {
+            failures.retain(|(name, _)| *name != command);
+            return result;
+        }
+        if !failures.insert((command, category)) { return result; }
+    }
+    kernel.context().diagnostic(ids.attach(record("command.result", if outcome == "failed" { Severity::Warn } else { Severity::Info }))
+        .with_field("outcome", outcome).with_field("category", category)
+        .with_field("duration_ms", started.elapsed().as_millis().min(u64::MAX as u128) as u64));
+    result
+}
+
+fn lifecycle(kernel: &Kernel, event: &'static str, outcome: &'static str, category: &'static str) {
+    kernel.context().diagnostic(DiagnosticRecord::new("host", event, if matches!(outcome, "failed" | "rejected") { Severity::Warn } else { Severity::Info })
+        .with_field("outcome", outcome).with_field("category", category));
+}
+
+fn finish_logging(kernel: &Kernel) {
+    let state = command_diagnostics(kernel);
+    if state.shutdown_started.swap(true, Ordering::AcqRel) { return; }
+    lifecycle(kernel, "launcher.shutdown", "started", "logger_only");
+    // Existing writer-owned cleanup removes the subscriber, drains and flushes once.
+    // Removing its effects also prevents a later Kernel Drop from waiting again.
+    kernel.context().dispose_owner("launcher-logger");
+}
 
 /// 宿主状态：一个进程一套内核。
 pub struct Host {
@@ -35,6 +236,12 @@ impl Host {
     pub fn boot(data_root: &Path, minimal: bool) -> Result<Self, String> {
         let kernel = Kernel::new();
         register_all(&kernel, data_root);
+        let _ = kaleid_core_plugins::bootstrap_logger(&kernel, data_root);
+        let _ = command_diagnostics(&kernel);
+        // Invalid summaries contain untrusted names, paths and errors: persist none of them.
+        for _ in kaleid_core_plugins::list_manifests(data_root).into_iter().filter(|m| m.error.is_some()) {
+            lifecycle(&kernel, "manifest.validation", "rejected", "invalid_manifest");
+        }
         // 第三方清单：配置类动作先改规格，服务类动作等内核就绪后再注册。
         let manifests = kaleid_core_plugins::load_ready_manifests(data_root);
         let mut specs = if minimal {
@@ -43,9 +250,16 @@ impl Host {
             standard_preset()
         };
         if let Err(error) = kaleid_core_plugins::apply_to_specs(&manifests, &mut specs) {
+            lifecycle(&kernel, "manifest.apply", "rejected", "apply_rejected");
             eprintln!("清单未生效：{error}");
         }
-        kernel.load(&specs).map_err(|e| e.to_string())?;
+        kaleid_core_plugins::ensure_logger_spec(&mut specs);
+        if let Err(error) = kernel.load(&specs) {
+            lifecycle(&kernel, "startup.result", "failed", "kernel_load_failed");
+            // Run writer-owned drain/flush once; later Kernel Drop cannot repeat its wait.
+            finish_logging(&kernel);
+            return Err(error.to_string());
+        }
         for manifest in &manifests {
             if let Some((owner, sources)) = kaleid_core_plugins::manifest_source_table(manifest) {
                 kernel.context().provide(
@@ -56,6 +270,7 @@ impl Host {
             }
         }
         apply_manifest_defaults(data_root, &kernel, &manifests);
+        lifecycle(&kernel, "startup.result", "succeeded", "ready");
         Ok(Host {
             kernel,
             minimal,
@@ -71,16 +286,24 @@ impl Host {
         self.minimal
     }
 
+    /// Drain launcher diagnostics once, with the writer's single bounded deadline.
+    /// This does not dispose business services, wait for workers, or stop child games.
+    pub fn shutdown_logging(&self) {
+        finish_logging(&self.kernel);
+    }
+
     /// 执行一条命令。
     pub fn dispatch(&self, cmd: &str, args: Value) -> Result<Value, String> {
         // 清单相关的两条命令要读数据目录，所以留在宿主层，不进无状态命令表。
         match cmd {
             "plugins_slots" => {
-                let manifests = kaleid_core_plugins::load_ready_manifests(&self.data_root);
-                return to_value(kaleid_core_plugins::manifest_slots(&manifests));
+                return observe_command(&self.kernel, cmd, args, |_| {
+                    let manifests = kaleid_core_plugins::load_ready_manifests(&self.data_root);
+                    to_value(kaleid_core_plugins::manifest_slots(&manifests))
+                });
             }
             "plugins_manifests" => {
-                return to_value(kaleid_core_plugins::list_manifests(&self.data_root));
+                return observe_command(&self.kernel, cmd, args, |_| to_value(kaleid_core_plugins::list_manifests(&self.data_root)));
             }
             _ => {}
         }
@@ -113,6 +336,7 @@ fn apply_manifest_defaults(
         let mut patch = serde_json::Map::new();
         patch.insert(key.clone(), value);
         if let Err(error) = settings.patch_global(&Value::Object(patch)) {
+            lifecycle(kernel, "manifest.default", "rejected", "default_rejected");
             eprintln!("清单默认值 {key} 未生效：{error}");
         }
     }
@@ -607,6 +831,10 @@ struct JavaPickArgs {
 
 /// 命令名 → 实现。界面侧的命令常量必须与此表一致。
 pub fn dispatch(kernel: &Kernel, cmd: &str, args: Value) -> Result<Value, String> {
+    observe_command(kernel, cmd, args, |args| dispatch_inner(kernel, cmd, args))
+}
+
+fn dispatch_inner(kernel: &Kernel, cmd: &str, args: Value) -> Result<Value, String> {
     let ctx = kernel.context();
     match cmd {
         // ---- 文件夹 ----
@@ -1351,6 +1579,401 @@ pub fn bootstrap_snapshot(kernel: &Kernel) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn logger_records(kernel: &Kernel) -> (String, Vec<Value>) {
+        let logger = kernel.context().service::<kaleid_core_plugins::LauncherLogger>().unwrap();
+        assert_eq!(logger.flush(), kaleid_core_plugins::LoggerControlOutcome::Flushed);
+        let mut text = String::new();
+        for entry in std::fs::read_dir(logger.run_dir()).unwrap().flatten() {
+            if entry.file_name().to_string_lossy().starts_with("launcher.log") {
+                text.push_str(&std::fs::read_to_string(entry.path()).unwrap());
+            }
+        }
+        let records = text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+        (text, records)
+    }
+
+    // Scan every persisted launcher run and archive, not only the current active log.
+    fn logger_all_launcher_records(kernel: &Kernel, data_root: &Path) -> (String, Vec<Value>) {
+        let logger = kernel.context().service::<kaleid_core_plugins::LauncherLogger>().unwrap();
+        assert_eq!(logger.flush(), kaleid_core_plugins::LoggerControlOutcome::Flushed);
+        let mut text = String::new();
+        for run in std::fs::read_dir(data_root.join("logs/launcher")).unwrap() {
+            let run = run.unwrap();
+            if !run.file_type().unwrap().is_dir() { continue; }
+            for entry in std::fs::read_dir(run.path()).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_file() && entry.file_name().to_string_lossy().starts_with("launcher.log") {
+                    text.push_str(&std::fs::read_to_string(entry.path()).unwrap());
+                }
+            }
+        }
+        let records = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        (text, records)
+    }
+
+    fn root_provenance_update_args(root_id: &str, file_name: &str) -> Value {
+        json!({
+            "rootId": root_id, "versionId": "1.21.4",
+            "update": {
+                "fileName": file_name, "modId": "fixture", "source": "modrinth",
+                "projectId": "AANobbMI", "currentVersion": "1", "latestVersion": "2",
+                "latestFileName": "fixture-new.jar", "downloadUrl": "https://cdn.modrinth.com/fixture.jar",
+                "size": 1, "sha1": null, "pageUrl": null
+            }
+        })
+    }
+
+    fn assert_unknown_root_domain_logs_are_private(minimal: bool) {
+        let (_dir, data, _mc) = env();
+        let host = Host::boot(&data, minimal).unwrap();
+        let sentinel = "SENTINEL_TOKEN_FINAL_REVIEW";
+        let install = host.dispatch("mods_install", json!({
+            "rootId": sentinel, "versionId": "1.21.4", "source": "modrinth",
+            "projectId": "AANobbMI", "fileId": "AANobbMJ", "overwrite": false
+        })).unwrap_err();
+        let update = host.dispatch("mods_apply_update", root_provenance_update_args(sentinel, "fixture-old.jar")).unwrap_err();
+        let original_error = if minimal {
+            "插件未就绪：下载服务不可用，请先启用「版本管理」插件".to_string()
+        } else {
+            format!("未找到：文件夹 {sentinel}")
+        };
+        assert_eq!(install, original_error);
+        assert_eq!(update, original_error, "keep downloader-before-root business validation order");
+        let (text, records) = logger_all_launcher_records(host.kernel(), &data);
+        assert!(!text.contains(sentinel), "unestablished root leaked through nested domain diagnostics");
+        for (component, operation) in [("mods", "mod_install"), ("content", "mod_update")] {
+            let domain: Vec<_> = records.iter().filter(|r| r["component"] == component && r["fields"]["operation"] == operation).collect();
+            let ends: Vec<_> = domain.iter().filter(|r| r["event"] == "operation.finished").collect();
+            assert_eq!(ends.len(), 1);
+            assert_eq!(ends[0]["fields"]["outcome"], "failed");
+            assert_eq!(ends[0]["fields"]["category"], if minimal { "unavailable" } else { "not_found" });
+            assert!(domain.iter().all(|r| r["fields"].get("root_id").is_none()));
+            assert_eq!(domain.iter().filter(|r| r["event"] == "operation.accepted").count(), 1);
+        }
+    }
+
+    #[test]
+    fn logger_domain_unknown_root_standard_never_persists_unestablished_identity() {
+        assert_unknown_root_domain_logs_are_private(false);
+    }
+
+    #[test]
+    fn logger_domain_unknown_root_minimal_never_persists_unestablished_identity() {
+        assert_unknown_root_domain_logs_are_private(true);
+    }
+
+    #[test]
+    fn logger_domain_validated_root_is_retained_only_after_existing_resolution() {
+        for minimal in [false, true] {
+            let (_dir, data, mc) = env();
+            let host = Host::boot(&data, minimal).unwrap();
+            let root = host.dispatch("roots_add", json!({"path": mc.to_string_lossy()})).unwrap();
+            let root_id = root["id"].as_str().unwrap();
+            let error = host.dispatch("mods_apply_update", root_provenance_update_args(root_id, "../invalid.jar")).unwrap_err();
+            assert_eq!(error, if minimal {
+                "插件未就绪：下载服务不可用，请先启用「版本管理」插件"
+            } else {
+                "非法输入：非法的文件名：../invalid.jar"
+            });
+            let (_, records) = logger_all_launcher_records(host.kernel(), &data);
+            let domain: Vec<_> = records.iter().filter(|r| r["component"] == "content" && r["fields"]["operation"] == "mod_update").collect();
+            let accepted = domain.iter().find(|r| r["event"] == "operation.accepted").unwrap();
+            assert!(accepted["fields"].get("root_id").is_none(), "acceptance precedes existing area_dir validation");
+            let ended: Vec<_> = domain.iter().filter(|r| r["event"] == "operation.finished").collect();
+            assert_eq!(ended.len(), 1);
+            if minimal {
+                assert!(ended[0]["fields"].get("root_id").is_none(), "unavailable downloader prevents root establishment");
+            } else {
+                assert_eq!(ended[0]["fields"]["root_id"], root_id, "retain genuine root on the domain result, not only the Host command");
+            }
+        }
+    }
+
+    fn command_results<'a>(records: &'a [Value], command: &str) -> Vec<&'a Value> {
+        records.iter().filter(|r| r["event"] == "command.result" && r["fields"]["command"] == command).collect()
+    }
+
+    #[test]
+    fn logger_unknown_plugin_targets_never_persist_as_kernel_identities() {
+        let (_dir, data, _mc) = env();
+        let host = Host::boot(&data, false).unwrap();
+        let sentinel = "SENTINEL_TOKEN_3A";
+        for enabled in [false, true] {
+            let error = host.dispatch("plugins_set_enabled", json!({"id": sentinel, "enabled": enabled})).unwrap_err();
+            assert!(error.contains(sentinel), "business error must remain unchanged");
+        }
+        host.dispatch("plugins_set_enabled", json!({"id": "news", "enabled": false})).unwrap();
+        host.dispatch("plugins_set_enabled", json!({"id": "news", "enabled": true})).unwrap();
+        let (text, records) = logger_records(host.kernel());
+        assert!(!text.contains(sentinel), "unregistered target leaked through kernel lifecycle");
+        for event in ["plugin.disable", "plugin.enable"] {
+            let rejected: Vec<_> = records.iter().filter(|r| r["component"] == "kernel" && r["event"] == event && r["fields"]["category"] == "not_loaded").collect();
+            assert_eq!(rejected.len(), 1);
+            assert_eq!(rejected[0]["fields"]["outcome"], "rejected");
+            assert!(rejected[0]["fields"].get("plugin_id").is_none());
+            assert!(records.iter().any(|r| r["component"] == "kernel" && r["event"] == event && r["fields"]["plugin_id"] == "news" && r["fields"]["outcome"] == "succeeded"));
+        }
+    }
+
+    #[test]
+    fn logger_lazy_free_state_survives_ambient_plugin_disposal() {
+        let (_dir, data, _mc) = env();
+        let kernel = Kernel::new();
+        let _ = kaleid_core_plugins::bootstrap_logger(&kernel, &data);
+        kernel.context().with_owner("news", |_| {
+            assert!(dispatch(&kernel, "downloads_snapshot", json!({})).is_err());
+        });
+        kernel.context().dispose_owner("news");
+        assert!(dispatch(&kernel, "downloads_snapshot", json!({})).is_err());
+        let (_, records) = logger_records(&kernel);
+        assert_eq!(command_results(&records, "downloads_snapshot").len(), 1, "plugin disposal reset the failure episode");
+        let state = command_diagnostics(&kernel);
+        state.shutdown_started.store(true, Ordering::Release);
+        kernel.context().dispose_owner("news");
+        let retained = command_diagnostics(&kernel);
+        assert!(Arc::ptr_eq(&state, &retained));
+        assert!(retained.shutdown_started.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn logger_boot_establishes_root_state_before_public_commands() {
+        let (_dir, data, _mc) = env();
+        let host = Host::boot(&data, true).unwrap();
+        assert!(host.kernel().context().service::<CommandDiagnostics>().is_some());
+        assert!(host.kernel().context().registry_snapshot().iter().any(|(service, owner, _)| {
+            *service == "host-command-diagnostics" && owner.is_empty()
+        }));
+    }
+
+    #[test]
+    fn logger_first_free_poll_during_reapply_survives_plugin_disable() {
+        struct Reapply {
+            attempts: std::sync::atomic::AtomicUsize,
+            entered: Arc<std::sync::Barrier>,
+            release: Arc<std::sync::Barrier>,
+        }
+        impl kaleid_kernel::Plugin for Reapply {
+            fn id(&self) -> &str { "news" }
+            fn apply(&self, _ctx: &kaleid_kernel::Context, _cfg: Value) -> kaleid_kernel::PluginResult {
+                if self.attempts.fetch_add(1, Ordering::SeqCst) != 0 {
+                    self.entered.wait();
+                    self.release.wait();
+                }
+                Ok(())
+            }
+        }
+        let (_dir, data, _mc) = env();
+        let kernel = Arc::new(Kernel::new());
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let release = Arc::new(std::sync::Barrier::new(2));
+        let plugin = Arc::new(Reapply {
+            attempts: std::sync::atomic::AtomicUsize::new(0),
+            entered: entered.clone(),
+            release: release.clone(),
+        });
+        kernel.register_factory("news", move || plugin.clone() as Arc<dyn kaleid_kernel::Plugin>);
+        let _ = kaleid_core_plugins::bootstrap_logger(&kernel, &data);
+        kernel.load(&[kaleid_kernel::PluginSpec::new("news")]).unwrap();
+        kernel.disable("news").unwrap();
+        let applying = kernel.clone();
+        let worker = std::thread::spawn(move || applying.enable("news"));
+        entered.wait();
+        let first = dispatch(&kernel, "downloads_snapshot", json!({}));
+        release.wait();
+        worker.join().unwrap().unwrap();
+        assert!(first.is_err());
+        kernel.disable("news").unwrap();
+        assert!(dispatch(&kernel, "downloads_snapshot", json!({})).is_err());
+        let (_, records) = logger_records(&kernel);
+        assert_eq!(command_results(&records, "downloads_snapshot").len(), 1);
+    }
+
+    // Missing bootstrap or wrapping Host and free dispatch twice must break this test.
+    #[test]
+    fn logger_startup_and_each_public_gateway_persist_once() {
+        for minimal in [false, true] {
+            let (_dir, data, _mc) = env();
+            let host = Host::boot(&data, minimal).unwrap();
+            host.dispatch("roots_list", json!({})).unwrap();
+            dispatch(host.kernel(), "sources_list", json!({})).unwrap();
+            host.dispatch("plugins_slots", json!({})).unwrap();
+            host.dispatch("plugins_manifests", json!({})).unwrap();
+            let (_, records) = logger_records(host.kernel());
+            assert_eq!(records.iter().filter(|r| r["event"] == "startup.result" && r["fields"]["outcome"] == "succeeded").count(), 1);
+            for (command, component) in [("roots_list", "core-lists"), ("sources_list", "version-manager"), ("plugins_slots", "manifests"), ("plugins_manifests", "manifests")] {
+                let results = command_results(&records, command);
+                assert_eq!(results.len(), 1, "{command}: {records:?}");
+                assert_eq!(results[0]["component"], component);
+                assert_eq!(results[0]["fields"]["outcome"], "succeeded");
+                assert!(results[0]["fields"]["duration_ms"].is_u64());
+                let starts: Vec<_> = records.iter().filter(|r| r["event"] == "command.start" && r["fields"]["command"] == command).collect();
+                assert_eq!(starts.len(), 1);
+                assert_eq!(starts[0]["operation_id"], results[0]["operation_id"]);
+            }
+        }
+    }
+
+    // Keep diagnostic production outside the match: ?, unknown and Ok(blocked) are observable.
+    #[test]
+    fn logger_errors_early_blocks_and_payloads_are_safe() {
+        let (_dir, data, mc) = env();
+        let host = Host::boot(&data, false).unwrap();
+        let root = host.dispatch("roots_add", json!({"path": mc.to_string_lossy()})).unwrap();
+        let root_id = root["id"].as_str().unwrap();
+        let blocked = host.dispatch("launch_check", json!({"rootId": root_id, "versionId": "1.21.4"})).unwrap();
+        assert_eq!(blocked["ok"], false);
+        let sentinels = ["SENTINEL_TOKEN_3A", "DEVICECODE_3A", "-DprivateJvm=3A", "https://user:credential3A@example.invalid/private", "SecretUser_42"];
+        assert!(host.dispatch("settings_patch_global", json!({"patch": {"jvmArgs": sentinels}})).is_ok());
+        host.dispatch("roots_add", json!({"path": sentinels[3], "alias": sentinels[4]})).unwrap();
+        assert!(dispatch(host.kernel(), sentinels[0], json!({"rootId": sentinels[1], "versionId": sentinels[4], "sessionId": sentinels[2]})).is_err());
+        assert!(host.dispatch("versions_scan", json!({"rootId": sentinels[1]})).is_err());
+        assert!(host.dispatch("accounts_apply_offline", json!({"name": sentinels[4]})).is_ok());
+        assert!(host.dispatch("roots_remove", json!({"id": [sentinels[0], sentinels[1]]})).is_err());
+        assert!(host.dispatch("plugins_set_enabled", json!({"id": "launcher-logger", "enabled": false})).is_err());
+        let (text, records) = logger_records(host.kernel());
+        for sentinel in sentinels { assert!(!text.contains(sentinel), "leaked {sentinel}"); }
+        assert_eq!(command_results(&records, "unknown").len(), 1);
+        assert_eq!(command_results(&records, "unknown")[0]["fields"]["outcome"], "failed");
+        assert_eq!(command_results(&records, "versions_scan")[0]["fields"]["category"], "command_failed");
+        assert_eq!(command_results(&records, "roots_remove")[0]["fields"]["outcome"], "failed");
+        let checks = command_results(&records, "launch_check");
+        assert_eq!(checks[0]["fields"]["outcome"], "blocked");
+        assert_eq!(checks[0]["fields"]["category"], "no-account");
+        assert_eq!(checks[0]["fields"]["root_id"], root_id);
+        assert_eq!(command_results(&records, "plugins_set_enabled")[0]["fields"]["outcome"], "failed");
+    }
+
+    // Successful polls stay silent; one failure episode is local to this kernel and resets.
+    #[test]
+    fn logger_poll_failures_coalesce_until_success_per_kernel() {
+        let (_dir, data, _mc) = env();
+        let host = Host::boot(&data, false).unwrap();
+        host.kernel().disable("version-manager").unwrap();
+        for _ in 0..3 {
+            host.dispatch("launch_states", json!({})).unwrap();
+            host.dispatch("launch_state", json!({})).unwrap();
+            assert!(host.dispatch("downloads_snapshot", json!({})).is_err());
+            assert!(dispatch(host.kernel(), "msa_poll", json!({})).is_err());
+        }
+        host.kernel().enable("version-manager").unwrap();
+        host.dispatch("downloads_snapshot", json!({})).unwrap();
+        host.kernel().disable("version-manager").unwrap();
+        for _ in 0..2 { assert!(dispatch(host.kernel(), "downloads_snapshot", json!({})).is_err()); }
+        let (_, records) = logger_records(host.kernel());
+        assert!(command_results(&records, "launch_states").is_empty());
+        assert!(command_results(&records, "launch_state").is_empty());
+        assert_eq!(command_results(&records, "downloads_snapshot").len(), 2);
+        assert_eq!(command_results(&records, "msa_poll").len(), 1);
+        assert!(!records.iter().any(|r| r["event"] == "command.start" && r["fields"]["command"] == "downloads_snapshot"));
+        let (_other_dir, other_data, _mc) = env();
+        let other = Host::boot(&other_data, true).unwrap();
+        assert!(other.dispatch("downloads_snapshot", json!({})).is_err());
+        assert_eq!(command_results(&logger_records(other.kernel()).1, "downloads_snapshot").len(), 1);
+    }
+
+    // Exercise the real producer boundary without starting detached download/game workers.
+    #[test]
+    fn logger_queue_results_are_accepted_not_terminal_success() {
+        let (_dir, data, _mc) = env();
+        let host = Host::boot(&data, false).unwrap();
+        let job = "d486b9fc-8459-4c25-a5ab-348e3b63fb84";
+        for command in ["versions_install", "versions_update_loader", "mods_install", "launch_start"] {
+            let response = if command == "launch_start" { json!({"sessionId": 7, "phase":"preparing", "message":"PRIVATE_RESPONSE_3A"}) } else { json!({"jobId": job, "message":"PRIVATE_RESPONSE_3A"}) };
+            let result = observe_command(host.kernel(), command, json!({}), |_| Ok(response.clone())).unwrap();
+            assert_eq!(result, response);
+        }
+        observe_command(host.kernel(), "mods_apply_update", json!({}), |_| Ok(Value::Null)).unwrap();
+        let (text, records) = logger_records(host.kernel());
+        assert!(!text.contains("PRIVATE_RESPONSE_3A"));
+        for command in ["versions_install", "versions_update_loader", "mods_install", "launch_start"] {
+            let results = command_results(&records, command);
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0]["fields"]["outcome"], "accepted");
+            if command == "launch_start" { assert_eq!(results[0]["session_id"], "7"); }
+            else { assert_eq!(results[0]["job_id"], job); }
+        }
+        assert_eq!(command_results(&records, "mods_apply_update")[0]["fields"]["outcome"], "succeeded");
+    }
+
+    #[test]
+    fn logger_shutdown_is_once_and_keeps_business_services_alive() {
+        let (_dir, data, _mc) = env();
+        let host = Arc::new(Host::boot(&data, false).unwrap());
+        let logger = host.kernel().context().service::<kaleid_core_plugins::LauncherLogger>().unwrap();
+        let run_dir = logger.run_dir().to_path_buf();
+        let left = host.clone();
+        let right = host.clone();
+        let a = std::thread::spawn(move || left.shutdown_logging());
+        let b = std::thread::spawn(move || right.shutdown_logging());
+        a.join().unwrap();
+        b.join().unwrap();
+        host.shutdown_logging();
+        assert!(host.kernel().context().service::<kaleid_core_plugins::LauncherLogger>().is_none());
+        assert!(host.dispatch("roots_list", json!({})).unwrap().is_array());
+        drop(host);
+        let text = std::fs::read_to_string(run_dir.join("launcher.log")).unwrap();
+        let records: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(records.iter().filter(|r| r["event"] == "launcher.shutdown").count(), 1);
+        assert_eq!(records.iter().filter(|r| r["event"] == "writer.shutdown").count(), 1);
+    }
+
+    #[test]
+    fn logger_boot_failure_is_persisted_without_business_error_text() {
+        let (_dir, data, _mc) = env();
+        let plugin = data.join("plugins/bad-config");
+        std::fs::create_dir_all(&plugin).unwrap();
+        std::fs::write(plugin.join("manifest.json"), json!({
+            "id":"bad-config", "name":"bad", "version":"1", "api":"1",
+            "steps":[{"op":"update-config", "target":"version-manager", "patch":{"enableMojang":"PRIVATE_BOOT_ERROR_3A"}}]
+        }).to_string()).unwrap();
+        assert!(Host::boot(&data, false).is_err());
+        let mut text = String::new();
+        for run in std::fs::read_dir(data.join("logs/launcher")).unwrap().flatten() {
+            text.push_str(&std::fs::read_to_string(run.path().join("launcher.log")).unwrap());
+        }
+        let records: Vec<Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert!(records.iter().any(|r| r["event"] == "startup.result" && r["fields"]["outcome"] == "failed"));
+        assert_eq!(records.iter().filter(|r| r["event"] == "writer.shutdown").count(), 1);
+        assert!(!text.contains("PRIVATE_BOOT_ERROR_3A"));
+    }
+
+    #[test]
+    fn logger_degraded_output_does_not_change_dispatch_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("not-a-directory");
+        std::fs::write(&blocked, "x").unwrap();
+        let kernel = Kernel::new();
+        let logger = kaleid_core_plugins::bootstrap_logger(&kernel, &blocked);
+        assert!(dispatch(&kernel, "jvm_default_args", json!({})).unwrap().is_array());
+        let error = dispatch(&kernel, "PRIVATE_UNKNOWN_3A", json!({})).unwrap_err();
+        assert!(error.contains("PRIVATE_UNKNOWN_3A"));
+        assert_eq!(logger.flush(), kaleid_core_plugins::LoggerControlOutcome::Degraded);
+    }
+
+    // Bootstrap must already observe validation/apply failures before Kernel::load.
+    #[test]
+    fn logger_manifest_rejections_are_safe_and_cannot_disable_sink() {
+        let (_dir, data, _mc) = env();
+        let invalid = data.join("plugins/PRIVATE_DIRECTORY_3A");
+        let valid = data.join("plugins/logger-boundary");
+        std::fs::create_dir_all(&invalid).unwrap();
+        std::fs::create_dir_all(&valid).unwrap();
+        std::fs::write(invalid.join("manifest.json"), "PRIVATE_MANIFEST_ERROR_3A").unwrap();
+        std::fs::write(valid.join("manifest.json"), json!({
+            "id":"logger-boundary", "name":"boundary", "version":"1", "api":"1",
+            "steps":[{"op":"disable-plugin", "target":"launcher-logger"},
+                     {"op":"set-default-setting", "key":"memoryMb", "value":"PRIVATE_DEFAULT_3A"}]
+        }).to_string()).unwrap();
+        let host = Host::boot(&data, false).unwrap();
+        host.dispatch("roots_list", json!({})).unwrap();
+        let (text, records) = logger_records(host.kernel());
+        for sentinel in ["PRIVATE_DIRECTORY_3A", "PRIVATE_MANIFEST_ERROR_3A", "PRIVATE_DEFAULT_3A"] { assert!(!text.contains(sentinel)); }
+        for event in ["manifest.validation", "manifest.apply", "manifest.default"] {
+            assert!(records.iter().any(|r| r["event"] == event && r["fields"]["outcome"] == "rejected"), "missing {event}: {records:?}");
+        }
+        assert_eq!(command_results(&records, "roots_list").len(), 1);
+    }
 
     fn env() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
         let dir = tempfile::tempdir().unwrap();

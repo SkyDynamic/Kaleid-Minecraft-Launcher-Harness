@@ -230,6 +230,7 @@ fn kaleid_set_theme(window: tauri::WebviewWindow, theme: String) -> Result<(), S
 fn kaleid_after_launch(
     window: tauri::WebviewWindow,
     app: tauri::AppHandle,
+    state: State<'_, AppState>,
     action: String,
 ) -> Result<(), String> {
     match action.as_str() {
@@ -242,6 +243,9 @@ fn kaleid_after_launch(
         }
         // 退出启动器：窗口销毁后进程由 Tauri 自己收尾（游戏进程不跟着死）。
         "exit" => {
+            // AppHandle::exit has a direct process::exit fallback if event delivery fails.
+            // The same idempotent logger-only boundary is also used by RunEvent::Exit.
+            state.host.shutdown_logging();
             app.exit(0);
             Ok(())
         }
@@ -363,11 +367,13 @@ fn main() {
         }
     };
 
-    tauri::Builder::default()
+    let host = Arc::new(host);
+    let setup_host = host.clone();
+    let app = tauri::Builder::default()
         .manage(AppState {
-            host: Arc::new(host),
+            host: host.clone(),
         })
-        .setup(|app| {
+        .setup(move |app| {
             let window = WebviewWindowBuilder::new(app, "main", WebviewUrl::default())
                 .title("Kaleid Launcher Harness")
                 .inner_size(1180.0, 760.0)
@@ -376,7 +382,11 @@ fn main() {
                 .theme(Some(tauri::Theme::Dark))
                 .background_color(tauri::window::Color(0x15, 0x15, 0x17, 0xff))
                 .initialization_script(BRIDGE_JS)
-                .build()?;
+                .build()
+                .map_err(|error| {
+                    setup_host.shutdown_logging();
+                    error
+                })?;
 
             // 把系统拖拽的路径转给界面（Windows 上 Tauri 顶掉了 WebView2 的
             // HTML5 拖放，页面里收不到 dataTransfer 文件列表）。
@@ -408,6 +418,15 @@ fn main() {
             kaleid_fonts_list,
             kaleid_font_read
         ])
-        .run(tauri::generate_context!())
-        .expect("Tauri 运行失败");
+        .build(tauri::generate_context!())
+        .unwrap_or_else(|error| {
+            host.shutdown_logging();
+            panic!("Tauri 运行失败：{error}");
+        });
+    // Tauri 2.12 emits Exit before process::exit; Drop is not an exit lifecycle hook.
+    app.run(move |_, event| {
+        if let tauri::RunEvent::Exit = event {
+            host.shutdown_logging();
+        }
+    });
 }

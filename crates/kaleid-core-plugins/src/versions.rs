@@ -245,6 +245,50 @@ fn marker_game(dir: &Path) -> Option<String> {
     None
 }
 
+/// PCL2 把加载器版本写在版本目录的 `PCL/Setup.ini` 里（`VersionNeoForge` 等）。
+/// 它生成的 JSON 没有 `net.neoforged:neoforge:<ver>` 坐标，不补这一层时侧栏
+/// 只会显示“NeoForge”，看不到具体版本。
+fn pcl_setup_value(dir: &Path, key: &str) -> Option<String> {
+    let text = std::fs::read_to_string(dir.join("PCL").join("Setup.ini")).ok()?;
+    for line in text.lines() {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim().eq_ignore_ascii_case(key) {
+            let value = value.trim();
+            if !value.is_empty() {
+                return Some(value.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn pcl_loader_version(dir: &Path, loader: LoaderKind) -> Option<String> {
+    let key = match loader {
+        LoaderKind::Fabric => "VersionFabric",
+        LoaderKind::Forge => "VersionForge",
+        LoaderKind::NeoForge => "VersionNeoForge",
+        LoaderKind::OptiFine => "VersionOptiFine",
+        _ => return None,
+    };
+    let mut version = pcl_setup_value(dir, key)?;
+    // Forge/NeoForge 有时写成 `1.21.4-54.1.22`；只留加载器版本。
+    if let Some((head, tail)) = version.split_once('-') {
+        if head.chars().next().is_some_and(|c| c.is_ascii_digit())
+            && head.matches('.').count() >= 1
+            && tail.chars().next().is_some_and(|c| c.is_ascii_digit())
+        {
+            version = tail.to_string();
+        }
+    }
+    Some(version)
+}
+
+fn pcl_game_version(dir: &Path) -> Option<String> {
+    pcl_setup_value(dir, "VersionVanillaName").or_else(|| pcl_setup_value(dir, "VersionOriginal"))
+}
+
 fn loader_version(value: &Value, loader: LoaderKind) -> Option<String> {
     let prefix = match loader {
         LoaderKind::Fabric => "net.fabricmc:fabric-loader:",
@@ -443,6 +487,13 @@ impl VersionStoreService for VersionStore {
                 continue;
             }
             let dir_name = entry.file_name().to_string_lossy().to_string();
+            // 安装中/失败留下的工作目录不参与版本列表。
+            if dir_name.starts_with('.') {
+                continue;
+            }
+            if entry.path().join(".kaleid-incomplete").is_file() {
+                continue;
+            }
             let Some(json_path) = resolve_version_json(&entry.path(), &dir_name) else {
                 continue;
             };
@@ -494,17 +545,20 @@ impl VersionStoreService for VersionStore {
             Some((kind, version)) => (*kind, version.clone()),
             None => (classify(&value), None),
         };
-        let loader_version = marker_version.or_else(|| loader_version(&value, loader)).map(|version| {
-            // Forge 的 Maven 坐标是 `1.21.4-54.1.22`，而安装请求只带 `54.1.22`。
-            if loader == LoaderKind::Forge {
-                if let Some(game) = inherits_from.as_deref() {
-                    if let Some(short) = version.strip_prefix(&format!("{game}-")) {
-                        return short.to_string();
+        let loader_version = marker_version
+            .or_else(|| loader_version(&value, loader))
+            .or_else(|| pcl_loader_version(version_dir, loader))
+            .map(|version| {
+                // Forge 的 Maven 坐标是 `1.21.4-54.1.22`，而安装请求只带 `54.1.22`。
+                if loader == LoaderKind::Forge {
+                    if let Some(game) = inherits_from.as_deref() {
+                        if let Some(short) = version.strip_prefix(&format!("{game}-")) {
+                            return short.to_string();
+                        }
                     }
                 }
-            }
-            version
-        });
+                version
+            });
         let java_major = value
             .get("javaVersion")
             .and_then(|v| v.get("majorVersion"))
@@ -537,7 +591,9 @@ impl VersionStoreService for VersionStore {
             loader,
             loader_version,
             inherits_from,
-            game_version: marker_game(version_dir).or_else(|| base_game_version(&chain, &dir_name)),
+            game_version: marker_game(version_dir)
+                .or_else(|| pcl_game_version(version_dir))
+                .or_else(|| base_game_version(&chain, &dir_name)),
             readiness,
             java_major,
             json_path: json_path.to_string_lossy().to_string(),
@@ -825,6 +881,55 @@ mod tests {
         let list = store.scan(&f.root).unwrap();
         assert_eq!(list.len(), 1);
         assert_eq!(list[0].id, "1.21.4");
+    }
+
+    /// 安装中/失败留下的 `.kaleid-incomplete` 目录不能出现在版本列表里。
+    #[test]
+    fn install_in_progress_directories_are_not_listed() {
+        let f = make_fixture();
+        write_version(&f.root, "26.3-NeoForge", json!({"id": "26.3-NeoForge"}), true, &[]);
+        let marker = f.root.join("versions/26.3-NeoForge/.kaleid-incomplete");
+        std::fs::write(&marker, "job\n0").unwrap();
+        // 点目录也要跳过（防御性：历史上可能写过临时目录）。
+        let hidden = f.root.join("versions/.kaleid-install");
+        std::fs::create_dir_all(&hidden).unwrap();
+        std::fs::write(hidden.join(".kaleid-install.json"), json!({"id": ".kaleid-install"}).to_string())
+            .unwrap();
+
+        let store = VersionStore::new();
+        let list = store.scan(&f.root).unwrap();
+        assert!(list.is_empty(), "安装中的目录不该出现在版本列表：{list:?}");
+    }
+
+    /// PCL2 生成的 NeoForge 版本没有 neoforge 坐标，加载器版本记在 PCL/Setup.ini。
+    #[test]
+    fn pcl_setup_ini_supplies_loader_and_game_version() {
+        let f = make_fixture();
+        let dir = f.root.join("versions/1.21.1-NeoForge_21.1.188");
+        std::fs::create_dir_all(dir.join("PCL")).unwrap();
+        std::fs::write(
+            dir.join("PCL/Setup.ini"),
+            "VersionVanillaName:1.21.1\nVersionNeoForge:21.1.188\nInfo:正式版 1.21.1, NeoForge 21.1.188\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("1.21.1-NeoForge_21.1.188.json"),
+            json!({
+                "id": "1.21.1-NeoForge_21.1.188",
+                "type": "release",
+                "mainClass": "cpw.mods.bootstraplauncher.BootstrapLauncher",
+                "libraries": [{"name": "net.neoforged:bus:8.0.5"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let store = VersionStore::new();
+        let list = store.scan(&f.root).unwrap();
+        let neo = list.iter().find(|v| v.id == "1.21.1-NeoForge_21.1.188").unwrap();
+        assert_eq!(neo.loader, LoaderKind::NeoForge);
+        assert_eq!(neo.loader_version.as_deref(), Some("21.1.188"));
+        assert_eq!(neo.game_version.as_deref(), Some("1.21.1"));
     }
 
     /// 其它启动器写出来的 NeoForge 版本：JSON 文件名不等于目录名，加载器只记在标记里。

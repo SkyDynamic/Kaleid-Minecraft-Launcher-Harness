@@ -376,4 +376,77 @@ fn cli_installs_and_removes_a_manifest_end_to_end() {
     assert!(ok);
     assert!(!text.contains("campus-mirror"), "卸载后源应当消失：{text}");
     assert!(text.contains("mojang"), "内置源不受影响：{text}");
+
+    let (text, records) = logger_cli_records(&data);
+    let installs: Vec<_> = records.iter().filter(|r| r["event"] == "command.result" && r["fields"]["command"] == "plugins_install").collect();
+    assert_eq!(installs.len(), 2, "{text}");
+    assert!(installs.iter().any(|r| r["fields"]["outcome"] == "failed"));
+    assert!(installs.iter().any(|r| r["fields"]["outcome"] == "succeeded"));
+    assert!(records.iter().any(|r| r["event"] == "command.result" && r["fields"]["command"] == "plugins_remove" && r["fields"]["outcome"] == "succeeded"));
+    assert!(!text.contains(&manifest_path.to_string_lossy().to_string()));
+}
+
+fn logger_cli_records(data: &Path) -> (String, Vec<serde_json::Value>) {
+    let mut text = String::new();
+    let runs = std::fs::read_dir(data.join("logs/launcher")).expect("CLI must persist a run before process exit");
+    for run in runs.flatten() {
+        if !run.path().is_dir() { continue; }
+        for entry in std::fs::read_dir(run.path()).unwrap().flatten() {
+            if entry.path().is_file() { text.push_str(&std::fs::read_to_string(entry.path()).unwrap()); }
+        }
+    }
+    let records = text.lines().filter_map(|line| serde_json::from_str(line).ok()).collect();
+    (text, records)
+}
+
+// A pre-dispatch boot failure must still drain the boot/exit record before code 2.
+#[test]
+fn logger_cli_boot_failure_flushes_before_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let plugin = data.join("plugins/bad-config");
+    std::fs::create_dir_all(&plugin).unwrap();
+    std::fs::write(plugin.join("manifest.json"), json!({
+        "id":"bad-config", "name":"bad", "version":"1", "api":"1",
+        "steps":[{"op":"update-config", "target":"version-manager", "patch":{"enableMojang":"PRIVATE_CLI_BOOT_3A"}}]
+    }).to_string()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_kaleid"))
+        .arg("--data-dir").arg(&data).args(["roots", "list"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    let (text, records) = logger_cli_records(&data);
+    assert!(records.iter().any(|r| r["event"] == "startup.result" && r["fields"]["outcome"] == "failed"));
+    assert!(records.iter().any(|r| r["event"] == "cli.exit" && r["fields"]["exit_code"] == 2));
+    assert_eq!(records.iter().filter(|r| r["event"] == "writer.shutdown").count(), 1);
+    assert!(!text.contains("PRIVATE_CLI_BOOT_3A"));
+}
+
+// A real process::exit must not lose queued invocation/exit records or persist argv/errors.
+#[test]
+fn logger_cli_actual_exit_persists_safe_success_and_failure_results() {
+    for minimal in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        let run = |args: &[&str]| {
+            let mut command = std::process::Command::new(env!("CARGO_BIN_EXE_kaleid"));
+            command.arg("--data-dir").arg(&data);
+            if minimal { command.arg("--minimal"); }
+            command.args(args).output().unwrap()
+        };
+        assert!(run(&["roots", "list"]).status.success());
+        let sentinels = ["SENTINEL_TOKEN_CLI_3A", "DEVICECODE_CLI_3A", "-DprivateJvm=CLI3A", "https://user:credentialCLI3A@example.invalid/private", "SecretCliUser42"];
+        assert!(!run(&["roots", "remove", sentinels[4]]).status.success());
+        assert!(!run(&sentinels).status.success());
+        let (text, records) = logger_cli_records(&data);
+        assert_eq!(records.iter().filter(|r| r["event"] == "startup.result" && r["fields"]["outcome"] == "succeeded").count(), 3);
+        for (command, outcome) in [("roots_list", "succeeded"), ("roots_remove", "failed"), ("unknown", "failed")] {
+            let results: Vec<_> = records.iter().filter(|r| r["event"] == "command.result" && r["fields"]["command"] == command).collect();
+            assert_eq!(results.len(), 1, "{command}: {text}");
+            assert_eq!(results[0]["fields"]["outcome"], outcome);
+            assert!(results[0]["operation_id"].is_string());
+            assert!(results[0]["fields"]["duration_ms"].is_u64());
+        }
+        assert_eq!(records.iter().filter(|r| r["event"] == "cli.exit").count(), 3);
+        assert_eq!(records.iter().filter(|r| r["event"] == "writer.shutdown").count(), 3);
+        for sentinel in sentinels { assert!(!text.contains(sentinel), "leaked {sentinel}"); }
+    }
 }

@@ -4,6 +4,8 @@
 //! 不启动界面也能验证「收录文件夹 → 扫描版本 → 选账号 → 生成启动命令行」整条链路。
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::Instant;
 
 use kaleid_api::{
     AccountServiceApi, IsolationMode, MsaAuthApi, RootRegistryService, SettingsServiceApi,
@@ -13,7 +15,36 @@ use kaleid_core_plugins::{
     all_install_sources, describe_plugins, minimal_preset, register_all, standard_preset, Accounts,
     LaunchPlanner, RootRegistry, Settings, VersionStore,
 };
-use kaleid_kernel::Kernel;
+use kaleid_kernel::{DiagnosticRecord, Kernel, Severity};
+
+fn cli_route(rest: &[String]) -> (&'static str, &'static str) {
+    match (rest.first().map(String::as_str).unwrap_or(""), rest.get(1).map(String::as_str)) {
+        ("" | "help", _) => ("help", "cli"),
+        ("roots", None | Some("list")) => ("roots_list", "core-lists"),
+        ("roots", Some("add")) => ("roots_add", "core-lists"),
+        ("roots", Some("remove")) => ("roots_remove", "core-lists"),
+        ("roots", Some("isolation")) => ("roots_isolation", "core-lists"),
+        ("roots", Some("select")) => ("roots_select", "core-lists"),
+        ("versions", _) => ("versions", "version-store"),
+        ("plan", _) => ("launch_plan", "launch"),
+        // Unlike the host queueing command, CLI launch waits for the terminal state.
+        ("launch", _) => ("launch_wait", "game-launch"),
+        ("accounts", None | Some("list")) => ("accounts_list", "accounts"),
+        ("accounts", Some("off")) => ("accounts_off", "accounts"),
+        ("accounts", Some("use")) => ("accounts_use", "accounts"),
+        ("settings", _) => ("settings", "settings"),
+        ("plugins", None) => ("plugins_list", "kernel"),
+        ("plugins", Some("install")) => ("plugins_install", "manifests"),
+        ("plugins", Some("remove")) => ("plugins_remove", "manifests"),
+        ("sources", _) => ("sources", "version-manager"),
+        _ => ("unknown", "cli"),
+    }
+}
+
+fn lifecycle(kernel: &Kernel, event: &'static str, outcome: &'static str, category: &'static str) {
+    kernel.context().diagnostic(DiagnosticRecord::new("cli", event, if matches!(outcome, "failed" | "rejected") { Severity::Warn } else { Severity::Info })
+        .with_field("outcome", outcome).with_field("category", category));
+}
 
 const USAGE: &str = r#"kaleid —— Kaleid 启动器的无头命令行
 
@@ -49,7 +80,12 @@ const USAGE: &str = r#"kaleid —— Kaleid 启动器的无头命令行
 "#;
 
 fn main() {
-    let code = run();
+    // Keep ownership here: process::exit skips Drop, so exactly one bounded drain runs.
+    let kernel = Kernel::new();
+    let code = run(&kernel);
+    kernel.context().diagnostic(DiagnosticRecord::new("cli", "cli.exit", Severity::Info)
+        .with_field("exit_code", code).with_field("outcome", if code == 0 { "succeeded" } else { "failed" }));
+    let _ = kaleid_core_plugins::shutdown_logger(&kernel);
     std::process::exit(code);
 }
 
@@ -82,15 +118,18 @@ fn parse_args() -> Args {
     }
 }
 
-fn run() -> i32 {
+fn run(kernel: &Kernel) -> i32 {
     let args = parse_args();
     let data_root = args
         .data_dir
         .clone()
         .unwrap_or_else(kaleid_core_plugins::data_root);
 
-    let kernel = Kernel::new();
-    register_all(&kernel, &data_root);
+    register_all(kernel, &data_root);
+    let _ = kaleid_core_plugins::bootstrap_logger(kernel, &data_root);
+    for _ in kaleid_core_plugins::list_manifests(&data_root).into_iter().filter(|m| m.error.is_some()) {
+        lifecycle(kernel, "manifest.validation", "rejected", "invalid_manifest");
+    }
     // 第三方清单的配置类动作要先落到规格上，再装载内核。
     let manifests = kaleid_core_plugins::load_ready_manifests(&data_root);
     let mut specs = if args.minimal {
@@ -100,9 +139,12 @@ fn run() -> i32 {
     };
     if let Err(e) = kaleid_core_plugins::apply_to_specs(&manifests, &mut specs) {
         // 清单坏了只跳过它，不拖死整个启动：用户还得能进 `plugins remove`。
+        lifecycle(kernel, "manifest.apply", "rejected", "apply_rejected");
         eprintln!("清单未生效：{e}");
     }
+    kaleid_core_plugins::ensure_logger_spec(&mut specs);
     if let Err(e) = kernel.load(&specs) {
+        lifecycle(kernel, "startup.result", "failed", "kernel_load_failed");
         eprintln!("插件装载失败：{e}");
         return 2;
     }
@@ -117,7 +159,8 @@ fn run() -> i32 {
         }
     }
 
-    match dispatch(&kernel, &args.rest, &data_root) {
+    lifecycle(kernel, "startup.result", "succeeded", "ready");
+    match dispatch(kernel, &args.rest, &data_root) {
         Ok(()) => 0,
         Err(e) => {
             eprintln!("{e}");
@@ -127,6 +170,23 @@ fn run() -> i32 {
 }
 
 fn dispatch(kernel: &Kernel, rest: &[String], data_root: &Path) -> Result<(), String> {
+    static NEXT_OPERATION: AtomicU64 = AtomicU64::new(1);
+    let (command, component) = cli_route(rest);
+    let operation = format!("{}-{}", std::process::id(), NEXT_OPERATION.fetch_add(1, Ordering::Relaxed));
+    let started = Instant::now();
+    let record = |event, severity| DiagnosticRecord::new(component, event, severity)
+        .with_operation_id(operation.clone()).with_field("command", command).with_field("source", "cli");
+    kernel.context().diagnostic(record("command.start", Severity::Info).with_field("outcome", "started"));
+    // All service lookup errors, ? and early returns remain inside the observed boundary.
+    let result = dispatch_inner(kernel, rest, data_root);
+    kernel.context().diagnostic(record("command.result", if result.is_ok() { Severity::Info } else { Severity::Warn })
+        .with_field("outcome", if result.is_ok() { "succeeded" } else { "failed" })
+        .with_field("category", if result.is_ok() { "completed" } else { "command_failed" })
+        .with_field("duration_ms", started.elapsed().as_millis().min(u64::MAX as u128) as u64));
+    result
+}
+
+fn dispatch_inner(kernel: &Kernel, rest: &[String], data_root: &Path) -> Result<(), String> {
     let ctx = kernel.context();
     let cmd = rest.first().map(|s| s.as_str()).unwrap_or("");
     let roots = ctx
@@ -533,6 +593,15 @@ fn dispatch(kernel: &Kernel, rest: &[String], data_root: &Path) -> Result<(), St
                     s.manifest_url(),
                     s.base_url()
                 );
+            }
+            // 校园镜像不是下载源：它们没有版本清单，只是"镜像里那个文件下不动时"的
+            // 候选地址（见 kaleid_core_plugins::mirrors）。单独列出来是为了让人能一眼
+            // 看到安装时到底会去哪些主机。
+            println!(
+                "\nBMCLAPI 校园镜像兜底（文件下载失败时按顺序轮询，不提供清单）："
+            );
+            for mirror in kaleid_core_plugins::mirrors::CAMPUS_MIRRORS {
+                println!("  {:<22} {}", mirror.host, mirror.base);
             }
             Ok(())
         }

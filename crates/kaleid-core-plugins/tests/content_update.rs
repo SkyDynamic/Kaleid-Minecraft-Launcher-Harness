@@ -183,6 +183,53 @@ fn has_staging_leftover(mods_dir: &Path) -> bool {
 }
 
 #[test]
+fn diagnostics_update_failure_after_download_is_not_operation_success() {
+    let body = b"new jar bytes".to_vec();
+    let server = FileServer::start(body.clone());
+    let mut f = fixture();
+    let kernel = kaleid_kernel::Kernel::new();
+    let records = Arc::new(std::sync::Mutex::new(Vec::<kaleid_kernel::DiagnosticRecord>::new()));
+    let captured = records.clone();
+    kernel.context().on::<kaleid_kernel::DiagnosticRecord>(move |r| captured.lock().unwrap().push(r.clone()));
+    f.svc = f.svc.with_context(kernel.context().clone());
+    std::fs::write(f.mods_dir.join("sodium-0.6.0.jar"), b"old").unwrap();
+    // Download succeeds, but a regular file blocks creation of the backup directory.
+    std::fs::write(f.mods_dir.join(".kaleid-backup"), b"blocked").unwrap();
+    let update = update_for(format!("{}/secret?token=SECRET_QUERY", server.base), body.len() as u64, "new.jar");
+    assert!(f.svc.apply_update(&f.root_id, "1.21.4-fabric", &update).is_err());
+    let records = records.lock().unwrap();
+    let ended: Vec<_> = records.iter().filter(|r| r.event == "operation.finished").collect();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0].fields["operation"], "mod_update");
+    assert_eq!(ended[0].fields["outcome"], "failed");
+    assert_eq!(ended[0].fields["category"], "io");
+    assert!(!serde_json::to_string(&*records).unwrap().contains("SECRET_QUERY"));
+}
+
+#[test]
+fn diagnostics_update_success_persists_safe_lifecycle_to_file_sink() {
+    let body = b"new jar bytes".to_vec();
+    let server = FileServer::start(body.clone());
+    let mut f = fixture();
+    let kernel = kaleid_kernel::Kernel::new();
+    let logger = kaleid_core_plugins::bootstrap_logger(&kernel, &f._dir.path().join("launcher-data"));
+    f.svc = f.svc.with_context(kernel.context().clone());
+    std::fs::write(f.mods_dir.join("sodium-0.6.0.jar"), b"old").unwrap();
+    let update = update_for(format!("{}/secret?token=SECRET_QUERY", server.base), body.len() as u64, "new.jar");
+    f.svc.apply_update(&f.root_id, "1.21.4-fabric", &update).unwrap();
+    assert!(matches!(logger.flush(), kaleid_core_plugins::LoggerControlOutcome::Flushed));
+    let text = std::fs::read_to_string(logger.run_dir().join("launcher.log")).unwrap();
+    let records: Vec<serde_json::Value> = text.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+    let ended: Vec<_> = records.iter().filter(|r| r["event"] == "operation.finished").collect();
+    assert_eq!(ended.len(), 1);
+    assert_eq!(ended[0]["fields"]["outcome"], "succeeded");
+    assert_eq!(ended[0]["fields"]["project_id"], "AANobbMI");
+    assert_eq!(ended[0]["fields"]["root_id"], f.root_id, "preserve established root correlation on the domain result");
+    assert!(records.iter().filter(|r| r["event"] == "operation.accepted").all(|r| r["fields"].get("root_id").is_none()));
+    assert!(!text.contains("SECRET_QUERY"));
+}
+
+#[test]
 fn apply_update_replaces_file_and_keeps_a_backup() {
     let body = b"new jar bytes".to_vec();
     let server = FileServer::start(body.clone());

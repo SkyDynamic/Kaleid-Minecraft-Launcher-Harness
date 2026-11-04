@@ -32,6 +32,8 @@ use kaleid_api::{
 };
 
 use crate::downloads::{DownloadItem, DownloadManager, Job};
+use crate::downloads::diagnostics::{Operation, Recorder};
+use kaleid_kernel::Context;
 use crate::jar::{self, ModMeta};
 use crate::modnames::ModNames;
 use crate::mods;
@@ -83,6 +85,7 @@ pub fn resolve_game_dir(
 
 /// 本地内容服务。
 pub struct ContentService {
+    ctx: Recorder,
     settings: Arc<Settings>,
     roots: Arc<RootRegistry>,
     names: Arc<ModNames>,
@@ -97,6 +100,7 @@ pub struct ContentService {
 impl ContentService {
     pub fn new(settings: Arc<Settings>, roots: Arc<RootRegistry>, names: Arc<ModNames>) -> Self {
         ContentService {
+            ctx: None,
             settings,
             roots,
             names,
@@ -105,6 +109,8 @@ impl ContentService {
             versions: None,
         }
     }
+
+    pub fn with_context(mut self, ctx: Context) -> Self { self.ctx = Some(ctx); self }
 
     /// 挂上下载器（由 `version-manager` 提供）。没有它也能用，只是 `apply_update` 会报"缺少下载服务"。
     pub fn with_downloads(mut self, downloads: Option<Arc<DownloadManager>>) -> Self {
@@ -1311,10 +1317,22 @@ impl ContentService {
         version_id: &str,
         update: &ModUpdate,
     ) -> ApiResult<()> {
+        let mut operation = Operation::new(self.ctx.clone(), "content", "mod_update");
+        operation.record = operation.record.with_field("version_id", version_id).with_field("project_id", update.project_id.clone());
+        operation.accepted();
+        let mut tracked_job = None;
+        let result = self.apply_update_traced(root_id, version_id, update, &mut operation, &mut tracked_job);
+        operation.finish_with_failure(&result, tracked_job.as_ref().map(|job: &Arc<Job>| job.cancelled()).unwrap_or(false), tracked_job.as_ref().map(|job| job.diagnostic_failed()).unwrap_or(false));
+        result
+    }
+
+    fn apply_update_traced(&self, root_id: &str, version_id: &str, update: &ModUpdate, operation: &mut Operation, tracked_job: &mut Option<Arc<Job>>) -> ApiResult<()> {
         let downloads = self.downloads.clone().ok_or_else(|| {
             ApiError::Unavailable("下载服务不可用，请先启用「版本管理」插件".into())
         })?;
         let dir = self.area_dir(root_id, version_id, ContentKind::Mod)?;
+        // area_dir has resolved this exact registry ID; only now use it as identity.
+        operation.record = operation.record.clone().with_field("root_id", root_id);
         fs::create_dir_all(&dir).map_err(|e| ApiError::io(format!("{}: {e}", dir.display())))?;
 
         let old_name = plain_name(&update.file_name)?.to_string();
@@ -1350,6 +1368,8 @@ impl ContentService {
             "mcim",
         );
         downloads.register(job.clone());
+        operation.record = operation.record.clone().with_job_id(&job.id);
+        *tracked_job = Some(job.clone());
         job.set_status(DownloadStatus::Queued, "准备下载更新");
         job.add_total("mods", update.size, 1);
 
@@ -1426,6 +1446,7 @@ impl ContentService {
                 backup_dir.display()
             ))
         })?;
+        operation.record = operation.record.clone().with_field("enabled_preserved", true).with_field("count", moved as u64);
         Ok(())
     }
 

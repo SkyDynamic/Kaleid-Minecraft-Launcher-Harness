@@ -24,6 +24,8 @@ use kaleid_api::{
 use crate::crash;
 use crate::crash_zip;
 use crate::downloads::{DownloadManager, Job};
+use crate::downloads::diagnostics::{Operation, publish, millis, spawn_thread, observed_cancel};
+use kaleid_kernel::{DiagnosticRecord, Severity};
 use crate::gpu;
 use crate::jar;
 use crate::options;
@@ -53,6 +55,7 @@ const SESSION_KEEP_MS: u64 = 10 * 60 * 1000;
 const SESSION_KEEP_MAX: usize = 16;
 
 struct Runtime {
+    diagnostics: Operation,
     state: LaunchState,
     child: Option<Child>,
     log: Arc<Mutex<String>>,
@@ -218,8 +221,11 @@ impl GameProcessManager {
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
+        let mut operation = Operation::new(self.ctx.clone(), "launch", "launch");
+        operation.record = operation.record.with_session_id(session_id.to_string()).with_field("version_id", plan.version_id.clone()).with_field("game_version", plan.game_version.clone());
+        operation.accepted();
         let run_dir = self.run_dir_for(&plan, session_id);
-        std::fs::create_dir_all(&run_dir)?;
+        std::fs::create_dir_all(&run_dir).map_err(|e| { operation.finish(&Err::<(), _>(ApiError::io(&e)), false); e })?;
         let log_path = run_dir.join("console.log");
 
         let cancel = Arc::new(AtomicBool::new(false));
@@ -241,6 +247,7 @@ impl GameProcessManager {
             sessions.push(Session {
                 id: session_id,
                 runtime: Runtime {
+                    diagnostics: operation.clone(),
                     state: state.clone(),
                     child: None,
                     log: Arc::new(Mutex::new(String::new())),
@@ -258,15 +265,13 @@ impl GameProcessManager {
         let data_root = self.data_root.clone();
         let downloads = self.resolve_downloads();
         let prep_delay = self.prep_delay();
-        std::thread::Builder::new()
-            .name("kaleid-launch-prep".into())
-            .spawn(move || {
+        spawn_thread("kaleid-launch-prep", move || {
                 prepare_and_spawn(
                     sessions, data_root, downloads, session_id, plan, token, mods, run_dir, cancel,
                     prep_delay,
                 );
             })
-            .map_err(|e| ApiError::io(format!("无法创建启动准备线程：{e}")))?;
+            .map_err(|e| { operation.record = operation.record.clone().with_field("category", "thread_spawn"); let error = ApiError::io(format!("无法创建启动准备线程：{e}")); operation.finish(&Err::<(), _>(ApiError::io("thread_spawn")), false); error })?;
 
         Ok(state)
     }
@@ -277,6 +282,7 @@ impl GameProcessManager {
     /// 直接结束。所以这里对 `Launching` / `Running` 明说一句人话而不是假装成功——
     /// 界面要是拿到 `Ok` 就会把遮罩收掉，用户会以为"取消了"可游戏还在起。
     pub fn cancel(&self, session_id: u64) -> ApiResult<LaunchState> {
+        let result = (|| {
         let sessions = self.sessions.lock().unwrap();
         let Some(session) = sessions.iter().find(|s| s.id == session_id) else {
             return Err(ApiError::not_found("这个启动会话已经不存在了"));
@@ -291,6 +297,9 @@ impl GameProcessManager {
         }
         session.runtime.cancel.store(true, Ordering::SeqCst);
         Ok(snapshot(&session.runtime))
+        })();
+        publish(&self.ctx, DiagnosticRecord::new("launch", "launch.cancel_requested", Severity::Info).with_session_id(session_id.to_string()).with_field("outcome", if result.is_ok() { "accepted" } else { "rejected" }).with_field("reason", "user_request"));
+        result
     }
 
     /// 结束游戏进程（连同它拉起的子进程）。
@@ -332,6 +341,8 @@ impl GameProcessManager {
             let _ = child.kill();
             stopped.push(snapshot(&session.runtime));
         }
+        drop(sessions);
+        for state in &stopped { publish(&self.ctx, DiagnosticRecord::new("launch", "launch.stop_requested", Severity::Info).with_session_id(state.session_id.to_string()).with_field("outcome", "accepted").with_field("reason", "user_request")); }
         Ok(stopped)
     }
 
@@ -601,6 +612,18 @@ fn step_mut<'a>(state: &'a mut LaunchState, id: &str) -> Option<&'a mut LaunchSt
     state.steps.iter_mut().find(|s| s.id == id)
 }
 
+fn session_operation(sessions: &Arc<Mutex<Vec<Session>>>, id: u64) -> Option<Operation> {
+    sessions.lock().ok()?.iter().find(|session| session.id == id).map(|session| session.runtime.diagnostics.clone())
+}
+fn session_event(sessions: &Arc<Mutex<Vec<Session>>>, id: u64, event: &'static str, level: Severity, fields: &[(&str, serde_json::Value)]) {
+    if let Some(operation) = session_operation(sessions, id) {
+        let mut record = operation.record.clone(); record.event = event.into(); record.level = level;
+        for (key, value) in fields { record = record.with_field(*key, value.clone()); }
+        publish(&operation.ctx, record);
+    }
+}
+fn step_status(status: PhaseStatus) -> &'static str { match status { PhaseStatus::Pending => "pending", PhaseStatus::Running => "running", PhaseStatus::Completed => "completed", PhaseStatus::Skipped => "skipped", PhaseStatus::Failed => "failed" } }
+
 /// 改某一步的状态与说明。
 fn set_step(
     sessions: &Arc<Mutex<Vec<Session>>>,
@@ -610,16 +633,21 @@ fn set_step(
     detail: impl Into<String>,
 ) {
     let detail = detail.into();
+    let mut previous = None;
     touch(sessions, session_id, |runtime| {
         if let Some(step) = step_mut(&mut runtime.state, step_id) {
+            if step.status != status { previous = Some(step.status); }
             step.status = status;
             step.detail = detail.clone();
         }
     });
+    if let Some(previous) = previous { session_event(sessions, session_id, "launch.step", Severity::Info, &[("step", json!(step_id)), ("previous_status", json!(step_status(previous))), ("status", json!(step_status(status)))]); }
 }
 
 /// 准备阶段失败：`Failed` + 原因，并把没走完的步骤标掉。
 fn fail_preparing(sessions: &Arc<Mutex<Vec<Session>>>, session_id: u64, message: String) {
+    let operation = session_operation(sessions, session_id);
+    let mut failed_step = None;
     touch(sessions, session_id, |runtime| {
         if let Some(step) = runtime
             .state
@@ -627,19 +655,25 @@ fn fail_preparing(sessions: &Arc<Mutex<Vec<Session>>>, session_id: u64, message:
             .iter_mut()
             .find(|s| s.status == PhaseStatus::Running)
         {
+            failed_step = Some(step.id.clone());
             step.status = PhaseStatus::Failed;
             step.detail = message.clone();
         }
         runtime.state.phase = LaunchPhase::Failed;
         runtime.state.error = Some(message);
     });
+    if let Some(step) = failed_step { session_event(sessions, session_id, "launch.step", Severity::Error, &[("step", json!(step)), ("status", json!("failed"))]); }
+    if let Some(mut operation) = operation { operation.record = operation.record.with_field("category", "preparation"); operation.finish(&Err::<(), _>(ApiError::Unavailable("preparation".into())), false); }
 }
 
 /// 用户取消：`Cancelled`，不算崩溃、不写崩溃报告。
 fn mark_cancelled(sessions: &Arc<Mutex<Vec<Session>>>, session_id: u64) {
+    let operation = session_operation(sessions, session_id);
+    let mut skipped_steps = Vec::new();
     touch(sessions, session_id, |runtime| {
         for step in runtime.state.steps.iter_mut() {
             if step.status == PhaseStatus::Running {
+                skipped_steps.push(step.id.clone());
                 step.status = PhaseStatus::Skipped;
                 step.detail = "已取消".into();
             }
@@ -651,6 +685,13 @@ fn mark_cancelled(sessions: &Arc<Mutex<Vec<Session>>>, session_id: u64) {
             runtime.state.elapsed_ms = unix_ms().saturating_sub(started);
         }
     });
+    for step in skipped_steps { session_event(sessions, session_id, "launch.step", Severity::Info, &[("step", json!(step)), ("previous_status", json!("running")), ("status", json!("skipped"))]); }
+    session_event(sessions, session_id, "launch.cancelled", Severity::Info, &[("outcome", json!("cancelled")), ("reason", json!("user_request"))]);
+    if let Some(operation) = operation { operation.finish(&Err::<(), _>(ApiError::invalid("任务已取消")), true); }
+}
+
+fn repair_outcome(result: &ApiResult<()>, join_panicked: bool) -> &'static str {
+    if join_panicked { "failed" } else if result.is_ok() { "succeeded" } else if observed_cancel(result) { "cancelled" } else { "failed" }
 }
 
 /// 准备线程的本体：五步走完，最后把进程交给 watcher。
@@ -754,6 +795,8 @@ fn prepare_and_spawn(
         }
         downloads.register(job.clone());
         let job_id = job.id.clone();
+        let repair_started = Instant::now();
+        session_event(&sessions, session_id, "launch.repair_started", Severity::Info, &[("pass", json!(pass)), ("files_total", json!(files)), ("total_bytes", json!(total))]);
         touch(&sessions, session_id, |runtime| {
             runtime.state.queue_job_id = Some(job_id.clone());
         });
@@ -797,7 +840,18 @@ fn prepare_and_spawn(
                 break;
             }
         }
-        let result = runner.join().unwrap_or_else(|_| Ok(()));
+        let joined = runner.join();
+        let join_panicked = joined.is_err();
+        // Preserve the legacy runtime fallback, but do not describe an observed panic as success.
+        let result = joined.unwrap_or_else(|_| Ok(()));
+        if job.diagnostic_failed() { if let Some(operation) = session_operation(&sessions, session_id) { operation.note_terminal_failure(); } }
+        if let Some(operation) = session_operation(&sessions, session_id) {
+            let mut record = operation.record.clone(); record.event = "launch.repair_finished".into();
+            record = record.with_job_id(&job.id).with_field("pass", pass as u64).with_field("files_total", files as u64).with_field("total_bytes", total).with_field("duration_ms", millis(repair_started)).with_field("outcome", repair_outcome(&result, join_panicked || job.diagnostic_failed())).with_field("cancelled", cancelled());
+            if join_panicked { record = record.with_field("category", "worker_panic"); }
+            if repair_outcome(&result, join_panicked || job.diagnostic_failed()) == "failed" { record.level = Severity::Error; }
+            publish(&operation.ctx, record);
+        }
         if cancelled() {
             return mark_cancelled(&sessions, session_id);
         }
@@ -827,6 +881,7 @@ fn prepare_and_spawn(
         return fail_preparing(&sessions, session_id, format!("解压 natives 失败：{e}"));
     }
     set_step(&sessions, session_id, "natives", PhaseStatus::Completed, "");
+    session_event(&sessions, session_id, "launch.natives", Severity::Info, &[("count", json!(plan.natives_jars.len()))]);
 
     // ---- ④ 启动进程 ----
     if cancelled() {
@@ -893,6 +948,7 @@ fn prepare_and_spawn(
         }
     };
     let pid = child.id();
+    session_event(&sessions, session_id, "launch.spawned", Severity::Info, &[("pid", json!(pid)), ("outcome", json!("started"))]);
     if cancelled() {
         // 取消正好卡在 spawn 上：不能留孤儿进程。
         let _ = child.kill();
@@ -902,11 +958,11 @@ fn prepare_and_spawn(
     let log = Arc::new(Mutex::new(String::new()));
     if let Some(stdout) = child.stdout.take() {
         if let Ok(clone) = log_file.try_clone() {
-            spawn_pipe_reader(stdout, log.clone(), clone);
+            spawn_pipe_reader(stdout, log.clone(), clone, session_operation(&sessions, session_id));
         }
     }
     if let Some(stderr) = child.stderr.take() {
-        spawn_pipe_reader(stderr, log.clone(), log_file);
+        spawn_pipe_reader(stderr, log.clone(), log_file, session_operation(&sessions, session_id));
     }
 
     let moved = touch(&sessions, session_id, |runtime| {
@@ -929,6 +985,8 @@ fn prepare_and_spawn(
         return;
     }
 
+    session_event(&sessions, session_id, "launch.step", Severity::Info, &[("step", json!("spawn")), ("previous_status", json!("running")), ("status", json!("completed"))]);
+    session_event(&sessions, session_id, "launch.step", Severity::Info, &[("step", json!("window")), ("previous_status", json!("pending")), ("status", json!("running"))]);
     // ---- ⑤ 等窗口 ----
     spawn_watcher(sessions, session_id, pid, mods, run_dir);
 }
@@ -968,6 +1026,7 @@ fn spawn_watcher(
                     None => Some(None),
                 };
                 if let Some(code) = exited {
+                    let operation = runtime.diagnostics.clone();
                     let log_text = runtime.log.lock().unwrap().clone();
                     let crash_file = latest_crash_report(runtime);
                     let mut report = crash::analyze(
@@ -1035,13 +1094,26 @@ fn spawn_watcher(
                     }
                     runtime.report = report;
                     runtime.child = None;
+                    let mut record = operation.record.clone(); record.event = "launch.exited".into();
+                    record = record.with_field("pid", pid).with_field("crashed", crashed).with_field("killed", killed).with_field("reached_running", reached_running).with_field("runtime_duration_ms", millis(started));
+                    if let Some(code) = code { record = record.with_field("exit_code", code); }
+                    let failed = crashed || (!reached_running && !killed);
+                    let result = if failed { Err(ApiError::Unavailable("process_exit".into())) } else { Ok(()) };
+                    drop(guard);
+                    publish(&operation.ctx, record);
+                    if !reached_running { session_event(&sessions, session_id, "launch.step", Severity::Warn, &[("step", json!("window")), ("status", json!("failed"))]); }
+                    operation.finish(&result, false);
                     return;
                 }
 
+                let mut running = None;
                 if runtime.state.phase == LaunchPhase::Launching {
                     let log_text = runtime.log.lock().unwrap().to_ascii_lowercase();
                     let seen = RUNNING_MARKERS.iter().any(|m| log_text.contains(m));
                     if seen || started.elapsed() >= RUNNING_FALLBACK {
+                        let operation = runtime.diagnostics.clone();
+                        let mut record = operation.record.clone(); record.event = "launch.running".into();
+                        running = Some((operation.ctx, record.with_field("pid", pid).with_field("reason", if seen { "log_marker" } else { "timeout_fallback" })));
                         runtime.state.phase = LaunchPhase::Running;
                         runtime.state.game_window_found = seen;
                         if let Some(step) = step_mut(&mut runtime.state, "window") {
@@ -1056,6 +1128,11 @@ fn spawn_watcher(
                 }
                 if let Some(started_at) = runtime.state.started_at {
                     runtime.state.elapsed_ms = unix_ms().saturating_sub(started_at);
+                }
+                drop(guard);
+                if let Some((ctx, record)) = running {
+                    publish(&ctx, record);
+                    session_event(&sessions, session_id, "launch.step", Severity::Info, &[("step", json!("window")), ("previous_status", json!("running")), ("status", json!("completed"))]);
                 }
             }
         })
@@ -1319,12 +1396,14 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
     reader: R,
     log: Arc<Mutex<String>>,
     mut file: std::fs::File,
+    diagnostics: Option<Operation>,
 ) {
     std::thread::Builder::new()
         .name("kaleid-launch-stdout".into())
         .spawn(move || {
             let mut buf = BufReader::new(reader);
             let mut raw: Vec<u8> = Vec::new();
+            let mut write_warned = false;
             loop {
                 raw.clear();
                 match buf.read_until(b'\n', &mut raw) {
@@ -1339,7 +1418,10 @@ fn spawn_pipe_reader<R: Read + Send + 'static>(
                         } else {
                             line
                         };
-                        let _ = file.write_all(trimmed.as_bytes());
+                        if file.write_all(trimmed.as_bytes()).is_err() && !write_warned {
+                            write_warned = true;
+                            if let Some(operation) = &diagnostics { let mut record = operation.record.clone(); record.event = "launch.console_failed".into(); record.level = Severity::Warn; publish(&operation.ctx, record.with_field("category", "io")); }
+                        }
                         let mut guard = log.lock().unwrap();
                         guard.push_str(&trimmed);
                         if guard.len() > 4 * 1024 * 1024 {
@@ -1411,6 +1493,7 @@ fn unix_ms() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("game_diagnostics_tests.rs");
 
     /// 启动现在是异步的（准备阶段跑在后台线程），测试要等它推进到目标阶段。
     ///

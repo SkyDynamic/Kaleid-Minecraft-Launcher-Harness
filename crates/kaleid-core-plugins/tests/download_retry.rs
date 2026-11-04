@@ -29,6 +29,10 @@ enum Mode {
     DropFirst(usize),
     /// 前 n 个请求回 500。
     Status500First(usize),
+    /// A non-retried final HTTP address error for diagnostic coverage.
+    Status404,
+    /// A failed initial probe body followed by the normal body.
+    CorruptFirstBody,
     /// 忽略 `Range`：永远回整个文件。
     IgnoreRange,
     /// 正常支持 `Range`。
@@ -127,6 +131,14 @@ fn serve(mut stream: TcpStream, body: &[u8], mode: Mode, index: usize) {
             // 什么都不写直接关掉：客户端会看到"连接在响应前就没了"。
             return;
         }
+    }
+    if mode == Mode::CorruptFirstBody && index == 0 {
+        write_full(&mut stream, &vec![0; body.len()], None);
+        return;
+    }
+    if mode == Mode::Status404 {
+        let _ = stream.write_all(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+        return;
     }
     if let Mode::Status500First(n) = mode {
         if index < n {
@@ -349,6 +361,147 @@ fn assert_no_leftovers(dest: &Path) {
 }
 
 /* ------------------------------- 用例 ------------------------------- */
+include!("support/download_fix1_diagnostics_tests.rs");
+
+fn diagnostic_records(ctx: &kaleid_kernel::Context) -> Arc<std::sync::Mutex<Vec<kaleid_kernel::DiagnosticRecord>>> {
+    let records = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = records.clone();
+    ctx.on::<kaleid_kernel::DiagnosticRecord>(move |record| { if let Ok(mut records) = captured.lock() { records.push(record.clone()); } });
+    records
+}
+
+#[test]
+fn diagnostics_actual_source_fallback_keeps_only_safe_hosts() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = kaleid_kernel::Kernel::new();
+    let records = diagnostic_records(kernel.context());
+    let manager = manager(dir.path()).with_context(kernel.context().clone());
+    let body = body_of(4096);
+    let official = TestServer::start(vec![0; body.len()], Mode::RangeOk);
+    let mirror = TestServer::start(body.clone(), Mode::RangeOk);
+    let official_url = format!("http://SECRET_USER:SECRET_PASSWORD@{}/file?token=SECRET_QUERY", official.base.trim_start_matches("http://"));
+    let dest = dir.path().join("file.jar");
+    manager.run_batch(job("source-fallback"), vec![item_with_mirror("SECRET_LABEL", official_url, format!("{}/file", mirror.base), &dest, &body)]).unwrap();
+    assert_eq!(std::fs::read(dest).unwrap(), body);
+    let records = records.lock().unwrap();
+    let fallback = records.iter().find(|r| r.event == "download.source_fallback").unwrap();
+    assert!(fallback.fields["host"].as_str().unwrap().starts_with("127.0.0.1:"));
+    assert!(fallback.batch_id.is_some());
+    let ended = records.iter().find(|r| r.event == "download.batch.finished").unwrap();
+    assert_eq!(ended.fields["source_fallback_count"], 1);
+    assert_eq!(ended.fields["outcome"], "succeeded");
+    assert!(!serde_json::to_string(&*records).unwrap().contains("SECRET"));
+}
+
+#[test]
+fn diagnostics_unknown_size_batch_omits_unavailable_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = kaleid_kernel::Kernel::new();
+    let records = diagnostic_records(kernel.context());
+    let manager = manager(dir.path()).with_context(kernel.context().clone());
+    let body = body_of(1024);
+    let server = TestServer::start(body.clone(), Mode::RangeOk);
+    let dest = dir.path().join("unknown.jar");
+    manager.run_batch(job("unknown-batch"), vec![unknown_size_item("unknown", format!("{}/unknown", server.base), &dest, &body)]).unwrap();
+    assert_eq!(std::fs::read(dest).unwrap(), body);
+    let records = records.lock().unwrap();
+    let ended = records.iter().find(|r| r.event == "download.batch.finished").unwrap();
+    assert_eq!(ended.fields["files_done"], 1);
+    assert!(!ended.fields.contains_key("done_bytes"));
+    assert!(!ended.fields.contains_key("total_bytes"));
+}
+
+#[test]
+fn diagnostics_builtin_services_attach_the_shared_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = kaleid_kernel::Kernel::new();
+    kaleid_core_plugins::register_all(&kernel, dir.path());
+    kernel.load(&kaleid_core_plugins::standard_preset()).unwrap();
+    let ctx = kernel.context();
+    let records = diagnostic_records(ctx);
+    ctx.service::<DownloadManager>().unwrap().register(job("registered"));
+    let mods = ctx.service::<kaleid_core_plugins::ModService>().unwrap();
+    assert!(mods.install(&kaleid_core_plugins::ModInstallRequest { root_id: "missing".into(), version_id: "fixture".into(), source: kaleid_api::ModSource::Modrinth, project_id: "project".into(), file_id: "file".into(), overwrite: false }).is_err());
+    let records = records.lock().unwrap();
+    assert!(records.iter().any(|r| r.event == "download.accepted"));
+    assert!(records.iter().any(|r| r.event == "operation.finished" && r.fields["operation"] == "mod_install"));
+}
+
+#[test]
+fn diagnostics_legacy_status_flaps_do_not_flood_or_hold_job_locks() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = kaleid_kernel::Kernel::new();
+    let records = diagnostic_records(kernel.context());
+    let manager = manager(dir.path()).with_context(kernel.context().clone());
+    let shared = job("flaps");
+    let reentrant = shared.clone();
+    kernel.context().on::<kaleid_kernel::DiagnosticRecord>(move |_| { let _ = reentrant.snapshot(); });
+    manager.register(shared.clone());
+    for _ in 0..1000 { shared.begin_item("assets", "SECRET_LABEL"); shared.fail("SECRET_ERROR"); }
+    let records = records.lock().unwrap();
+    assert!(records.len() < 15, "legacy status flaps flooded {} records", records.len());
+    assert_eq!(records.iter().filter(|r| r.event == "download.status" && r.fields.get("status") == Some(&serde_json::json!("running"))).count(), 1, "retain the first legitimate Running transition");
+    assert!(!serde_json::to_string(&*records).unwrap().contains("SECRET"));
+}
+
+#[test]
+fn diagnostics_batches_are_distinct_and_never_claim_operation_completion() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = kaleid_kernel::Kernel::new();
+    let records = diagnostic_records(kernel.context());
+    let manager = manager(dir.path()).with_context(kernel.context().clone());
+    let shared = job("shared");
+    let small = body_of(16 * 1024);
+    let large = body_of(32 * 1024);
+    let one = TestServer::start(small.clone(), Mode::RangeOk);
+    let two = TestServer::start(large.clone(), Mode::RangeOk);
+    shared.add_total("assets", (small.len() + large.len()) as u64, 2);
+    let first = manager.begin_session(shared.clone());
+    let second = manager.begin_session(shared);
+    first.push(item("first", format!("{}/one", one.base), &dir.path().join("one"), &small)).unwrap();
+    second.push(item("second", format!("{}/two", two.base), &dir.path().join("two"), &large)).unwrap();
+    first.close_and_wait().unwrap();
+    second.close_and_wait().unwrap();
+    let records = records.lock().unwrap();
+    let ended: Vec<_> = records.iter().filter(|r| r.event == "download.batch.finished").collect();
+    assert_eq!(ended.len(), 2);
+    assert_ne!(ended[0].batch_id, ended[1].batch_id);
+    assert!(ended.iter().all(|r| r.fields["files_total"] == 1 && r.fields["files_done"] == 1));
+    let mut bytes: Vec<_> = ended.iter().map(|r| r.fields["done_bytes"].as_u64().unwrap()).collect();
+    bytes.sort_unstable();
+    assert_eq!(bytes, vec![16 * 1024, 32 * 1024]);
+    assert!(ended.iter().all(|r| r.job_id.as_deref() == Some("shared") && r.fields["outcome"] == "succeeded"));
+    assert!(!records.iter().any(|r| r.event == "operation.finished"));
+}
+
+#[test]
+fn diagnostics_retry_range_and_integrity_are_safe_and_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let kernel = kaleid_kernel::Kernel::new();
+    let records = diagnostic_records(kernel.context());
+    let manager = manager(dir.path()).with_context(kernel.context().clone());
+    let body = body_of(16 * 1024);
+    let server = TestServer::start(body.clone(), Mode::Status500First(2));
+    manager.run_batch(job("retry-diagnostics"), vec![item("SECRET_LABEL", format!("{}/secret?token=SECRET_QUERY", server.base), &dir.path().join("secret-path.jar"), &body)]).unwrap();
+    let ranged = TestServer::start(body_of(1_100_000), Mode::IgnoreRange);
+    manager.run_batch(job("range-diagnostics"), vec![item("range", format!("{}/range", ranged.base), &dir.path().join("range.jar"), &body_of(1_100_000))]).unwrap();
+    let mut broken = item("SECRET_LABEL", format!("{}/broken", server.base), &dir.path().join("broken.jar"), &body);
+    broken.sha1 = Some("0".repeat(40));
+    assert!(manager.run_batch(job("integrity-diagnostics"), vec![broken]).is_err());
+    let records = records.lock().unwrap();
+    for event in ["download.retry", "download.range_fallback", "download.integrity_failure"] {
+        assert!(records.iter().any(|r| r.event == event), "missing {event}: {records:?}");
+    }
+    assert!(records.len() < 60, "per-packet or per-attempt flood");
+    let text = serde_json::to_string(&*records).unwrap();
+    for secret in ["SECRET_LABEL", "SECRET_QUERY", "secret-path.jar", "?token="] { assert!(!text.contains(secret), "leaked {secret}"); }
+    let failed = records.iter().find(|r| r.event == "download.batch.finished" && r.job_id.as_deref() == Some("integrity-diagnostics")).unwrap();
+    assert_eq!(failed.fields["outcome"], "failed");
+    assert_eq!(failed.fields["integrity_failure_count"], 1);
+    assert_eq!(failed.fields["internal_error_count"], 0, "ordinary transfer/content failures are not worker panics");
+    assert_eq!(failed.fields["failed"], 1);
+}
+
 
 #[test]
 fn retries_after_connection_drops() {
@@ -905,5 +1058,115 @@ fn a_mid_flight_range_flip_does_not_stall_the_file() {
         server.requests.load(Ordering::SeqCst) > 2,
         "应当真的并发取过分段"
     );
+    assert_no_leftovers(&dest);
+}
+/* ------------------------- 连接复用 / 单次请求 ------------------------- */
+
+/// 一个支持 HTTP/1.1 keep-alive 的最小服务：同一条 TCP 连接上连续回多个请求，
+/// 并记下一共 `accept` 了几条连接。
+struct KeepAliveServer {
+    base: String,
+    accepted: Arc<AtomicUsize>,
+    stop: Arc<AtomicBool>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl KeepAliveServer {
+    fn start(body: Vec<u8>) -> KeepAliveServer {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("绑定本地端口");
+        listener.set_nonblocking(true).unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let body = Arc::new(body);
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread = {
+            let stop = stop.clone();
+            let accepted = accepted.clone();
+            std::thread::spawn(move || {
+                while !stop.load(Ordering::SeqCst) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            accepted.fetch_add(1, Ordering::SeqCst);
+                            let body = body.clone();
+                            std::thread::spawn(move || {
+                                stream.set_nonblocking(false).ok();
+                                stream.set_read_timeout(Some(Duration::from_secs(3))).ok();
+                                while read_head(&mut stream).is_some() {
+                                    let head = format!(
+                                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+                                        body.len()
+                                    );
+                                    if stream.write_all(head.as_bytes()).is_err()
+                                        || stream.write_all(&body).is_err()
+                                    {
+                                        return;
+                                    }
+                                    let _ = stream.flush();
+                                }
+                            });
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            })
+        };
+        KeepAliveServer {
+            base,
+            accepted,
+            stop,
+            thread: Some(thread),
+        }
+    }
+}
+
+impl Drop for KeepAliveServer {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// 几十个小文件（资源对象那种）不能每个都重新建一条 TCP/TLS 连接。
+///
+/// ureq 默认每台主机只留 1 条空闲连接，4 个 worker 下完文件后有 3 条被关掉，
+/// 于是几乎每个文件都要重新握手。连接池开大以后，连接数应当接近并发数。
+#[test]
+fn small_files_reuse_connections() {
+    let body = body_of(2048);
+    let server = KeepAliveServer::start(body.clone());
+    let dir = tempfile::tempdir().unwrap();
+    let downloads = manager_with_concurrency(dir.path(), 4);
+    let items: Vec<DownloadItem> = (0..40)
+        .map(|i| {
+            item(
+                &format!("资源 {i}"),
+                format!("{}/obj/{i}", server.base),
+                &dir.path().join(format!("obj-{i}")),
+                &body,
+            )
+        })
+        .collect();
+    downloads.run_batch(job("reuse"), items).expect("小文件批量下载");
+    let accepted = server.accepted.load(Ordering::SeqCst);
+    assert!(accepted <= 8, "40 个小文件开了 {accepted} 条连接，连接池没有复用");
+}
+
+/// 清单里没写大小的小文件（安装器 / OptiFine 那类）只应请求一次：
+/// 探测大小用的那个响应直接流完，不再扔掉重下。
+#[test]
+fn unknown_size_small_file_is_fetched_with_one_request() {
+    let body = body_of(4096);
+    let server = TestServer::start(body.clone(), Mode::RangeOk);
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("installer.jar");
+    let mut it = item("安装器", format!("{}/installer.jar", server.base), &dest, &body);
+    it.size = 0;
+    manager(dir.path())
+        .run_batch(job("probe-once"), vec![it])
+        .expect("未知大小的小文件");
+    assert_eq!(std::fs::read(&dest).unwrap(), body);
+    assert_eq!(server.requests.load(Ordering::SeqCst), 1, "探测 + 下载应当是同一次请求");
     assert_no_leftovers(&dest);
 }

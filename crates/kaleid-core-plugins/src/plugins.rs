@@ -311,17 +311,19 @@ impl Plugin for VersionManagerPlugin {
         let roots = ctx.service::<RootRegistry>().ok_or("roots 服务不可用")?;
         // 重定向终点缓存放进数据目录：跨进程复用，同一个版本的资源不必反复探测。
         let downloads = Arc::new(
-            DownloadManager::new(settings.clone()).with_data_root(&self.data_root),
+            DownloadManager::new(settings.clone()).with_data_root(&self.data_root).with_context(ctx.clone()),
         );
         // 上次被强杀留下的安装现场（几百 MB 的 jar）顺手清掉，别越攒越多。
         crate::install::sweep_staging(&self.data_root);
-        let install = Arc::new(InstallService::new(
-            settings,
-            versions.clone(),
-            roots,
-            downloads.clone(),
-            &self.data_root,
-        ));
+        // 上次被强杀留下的“安装中”版本：完整就删标记，半成品就清掉。
+        crate::install::sweep_incomplete_installs(roots.as_ref());
+        let java = ctx
+            .service::<JavaService>()
+            .map(|service| service as Arc<dyn JavaServiceApi>);
+        let install = Arc::new(
+            InstallService::new(settings, versions.clone(), roots, downloads.clone(), &self.data_root)
+                .with_java(java).with_context(ctx.clone()),
+        );
         // Context 按 **值类型** 建索引：要提供 `DownloadManager` 本体，而不是
         // 外面那层 Arc，否则宿主 `service::<DownloadManager>()` 会找不到。
         ctx.provide("downloads", (*downloads).clone(), 0);
@@ -363,7 +365,7 @@ impl Plugin for ModDownloadPlugin {
         let versions = ctx.service::<VersionStore>().ok_or("versions 服务不可用")?;
         let roots = ctx.service::<RootRegistry>().ok_or("roots 服务不可用")?;
         let downloads = ctx.service::<DownloadManager>();
-        let service = ModService::new(settings, roots, versions, downloads, &self.data_root);
+        let service = ModService::new(settings, roots, versions, downloads, &self.data_root).with_context(ctx.clone());
         ctx.provide("mods", service, 0);
         Ok(())
     }
@@ -400,7 +402,7 @@ impl Plugin for GameContentPlugin {
         let versions = ctx.service::<VersionStore>();
         let service = ContentService::new(settings, roots, names)
             .with_downloads(downloads)
-            .with_versions(versions);
+            .with_versions(versions).with_context(ctx.clone());
         ctx.provide("content", service, 0);
         Ok(())
     }

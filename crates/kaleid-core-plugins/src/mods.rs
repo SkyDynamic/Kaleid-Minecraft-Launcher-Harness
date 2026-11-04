@@ -30,6 +30,8 @@ use kaleid_api::{
 use sha1::{Digest, Sha1};
 
 use crate::downloads::{DownloadItem, DownloadManager, Job};
+use crate::downloads::diagnostics::{Operation, Recorder, spawn_thread};
+use kaleid_kernel::Context;
 use crate::modnames::ModNames;
 use crate::roots::RootRegistry;
 use crate::settings::Settings;
@@ -454,6 +456,7 @@ struct RankingEntry {
 
 #[derive(Clone)]
 pub struct ModService {
+    ctx: Recorder,
     settings: Arc<Settings>,
     roots: Arc<RootRegistry>,
     versions: Arc<VersionStore>,
@@ -482,6 +485,7 @@ impl ModService {
             .user_agent(USER_AGENT)
             .build();
         ModService {
+            ctx: None,
             settings,
             roots,
             versions,
@@ -494,6 +498,8 @@ impl ModService {
             translate: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    pub fn with_context(mut self, ctx: Context) -> Self { self.ctx = Some(ctx); self }
 
     /// 当前数据源设置；老配置文件里的三态取值会被归一化成新取值。
     fn policy(&self) -> String {
@@ -1504,10 +1510,20 @@ impl ModService {
     // -- 安装 --------------------------------------------------------------
 
     pub fn install(&self, req: &ModInstallRequest) -> ApiResult<kaleid_api::InstallQueued> {
+        let mut operation = Operation::new(self.ctx.clone(), "mods", "mod_install");
+        operation.record = operation.record.with_field("version_id", req.version_id.clone()).with_field("source", req.source.as_str()).with_field("project_id", req.project_id.clone()).with_field("file_id", req.file_id.clone()).with_field("overwrite", req.overwrite);
+        operation.accepted();
+        let result = self.install_traced(req, &mut operation);
+        if result.is_err() { operation.finish(&result, false); }
+        result
+    }
+
+    fn install_traced(&self, req: &ModInstallRequest, operation: &mut Operation) -> ApiResult<kaleid_api::InstallQueued> {
         let downloads = self.downloads.clone().ok_or_else(|| {
             ApiError::Unavailable("下载服务不可用，请先启用「版本管理」插件".into())
         })?;
         let target = self.target(&req.root_id, &req.version_id)?;
+        operation.record = operation.record.clone().with_field("root_id", target.root_id.clone());
         let detail = self.detail(ModDetailQuery {
             source: req.source,
             project_id: req.project_id.clone(),
@@ -1557,6 +1573,8 @@ impl ModService {
                 downloads.register(job.clone());
                 job.set_status(DownloadStatus::Queued, "文件已存在，直接完成");
                 job.complete();
+                operation.record = operation.record.clone().with_job_id(&job.id).with_field("reason", "existing_identical").with_field("skipped", true);
+                operation.finish(&Ok::<(), ApiError>(()), job.cancelled());
                 return Ok(kaleid_api::InstallQueued {
                     job_id: job.id.clone(),
                 });
@@ -1593,21 +1611,23 @@ impl ModService {
         };
         let handle = downloads.clone();
         let job_for_thread = job.clone();
-        std::thread::Builder::new()
-            .name("kaleid-mod-install".into())
-            .spawn(move || {
+        operation.record = operation.record.clone().with_job_id(&job.id).with_field("game_version", target.game_version.clone()).with_field("loader", target.loader.slug());
+        let worker_operation = operation.clone();
+        spawn_thread("kaleid-mod-install", move || {
                 let _ = job_for_thread.start_phase("mods");
                 job_for_thread.set_status(DownloadStatus::Queued, "准备下载模组");
                 job_for_thread.add_total("mods", item.size, 1);
-                match handle.run_batch(job_for_thread.clone(), vec![item]) {
+                let result = handle.run_batch(job_for_thread.clone(), vec![item]);
+                match &result {
                     Ok(()) => {
                         job_for_thread.complete_phase("mods");
                         job_for_thread.complete();
                     }
                     Err(err) => job_for_thread.fail(err.to_string()),
                 }
+                worker_operation.finish_with_failure(&result, job_for_thread.cancelled(), job_for_thread.diagnostic_failed());
             })
-            .map_err(|e| ApiError::io(e.to_string()))?;
+            .map_err(|e| { operation.record = operation.record.clone().with_field("category", "thread_spawn"); ApiError::io(e.to_string()) })?;
 
         Ok(kaleid_api::InstallQueued {
             job_id: job.id.clone(),
@@ -2395,6 +2415,31 @@ pub struct ModInstallRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("mods_diagnostics_tests.rs");
+
+    #[test]
+    fn diagnostics_mod_preflight_is_one_safe_operation_result() {
+        let dir = tempfile::tempdir().unwrap();
+        let kernel = kaleid_kernel::Kernel::new();
+        let records = Arc::new(Mutex::new(Vec::<kaleid_kernel::DiagnosticRecord>::new()));
+        let captured = records.clone();
+        kernel.context().on::<kaleid_kernel::DiagnosticRecord>(move |r| captured.lock().unwrap().push(r.clone()));
+        let settings = Arc::new(Settings::open(dir.path()));
+        let roots = Arc::new(RootRegistry::empty_at(dir.path()).unwrap());
+        let service = ModService::new(settings, roots, Arc::new(VersionStore::new()), None, dir.path()).with_context(kernel.context().clone());
+        let req = ModInstallRequest { root_id: "root".into(), version_id: "fixture".into(), source: ModSource::Modrinth, project_id: "project".into(), file_id: "file".into(), overwrite: false };
+        assert!(service.install(&req).is_err());
+        let records = records.lock().unwrap();
+        let ended: Vec<_> = records.iter().filter(|r| r.event == "operation.finished").collect();
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].fields["operation"], "mod_install");
+        assert_eq!(ended[0].fields["category"], "unavailable");
+        assert_eq!(ended[0].fields["project_id"], "project");
+        assert_eq!(ended[0].fields["file_id"], "file");
+        assert!(!ended[0].fields.contains_key("root_id"), "unavailable downloader prevents root validation");
+        assert!(records.iter().filter(|r| r.event == "operation.accepted").all(|r| !r.fields.contains_key("root_id")));
+    }
+
 
     #[test]
     fn user_agent_matches_mcim_whitelist_shape() {
