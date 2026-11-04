@@ -223,12 +223,12 @@ function MsaPanel({ accounts, active }: { accounts: Account[]; active: Account |
           </div>
           <div className="mt-[3px] text-[11px] leading-[14px] text-ink4">
             {hero && stateOf(hero.id)?.reloginRequired
-              ? '正版账号 · 需要重新登录'
+              ? '正版登录 · 需要重新登录'
               : hero && stateOf(hero.id)?.usable === false
-                ? '正版账号 · 登录已过期'
+                ? '正版登录 · 登录已过期'
                 : hero
-                  ? '正版账号 · 登录有效 · 自动续期'
-                  : '正版账号'}
+                  ? '正版登录'
+                  : '正版登录'}
           </div>
         </div>
       </div>
