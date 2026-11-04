@@ -729,7 +729,7 @@ export function InstallWizard() {
             : '官方优先 → BMCLAPI';
   const sourceHint =
     downloadSource === 'auto'
-      ? '逐个文件判断：镜像只是转回官方的就直连官方，真跳到国内节点的走镜像'
+      ? '从 BMCLAPI 起步，只是转回官方的文件直连官方；整体偏慢时在镜像与官方间自动换边'
       : downloadSource === 'mirror-first'
         ? 'BMCLAPI 优先；文件失败时回退官方源'
         : downloadSource === 'mirror-only'
@@ -737,13 +737,18 @@ export function InstallWizard() {
           : downloadSource === 'official-only'
             ? '仅使用官方源；文件失败时不会自动切换镜像'
             : '官方源优先；连续两个测速窗口低于 512 KB/s 时自动切换 BMCLAPI';
+  // 校园镜像只影响"镜像侧失败之后怎么办"，而且默认就在兜底，所以只补一句尾巴。
+  const campusTail =
+    globalSettings?.downloadCampusMirrors && downloadSource !== 'official-only'
+      ? '（镜像失败会再轮询八家教育网镜像）'
+      : '';
 
   return (
     <Dialog
       open={open}
       onClose={closeInstall}
       title="获取新版本"
-      subtitle={sourceHint}
+      subtitle={`${sourceHint}${campusTail}`}
       width={860}
       bodyClassName="min-h-0"
       footer={

@@ -90,8 +90,10 @@ pub fn builtin_sources() -> InstallSourceTable {
                 id: "bmclapi",
                 label: "BMCLAPI 镜像",
                 priority: 10,
-                manifest: "https://bmclapi2.bangbang93.com/mc/game/version_manifest_v2.json",
-                base: "https://bmclapi2.bangbang93.com",
+                // 主站还带八个校园镜像（见 [`crate::mirrors`]），但它们只有静态文件树、
+                // 没有清单，所以只在这一张"下载源表"里出现一次。
+                manifest: crate::mirrors::BMCLAPI_MANIFEST_URL,
+                base: crate::mirrors::BMCLAPI_BASE,
             }),
         ],
     }

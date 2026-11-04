@@ -1,5 +1,6 @@
 //! Mojang 版本清单、版本分类与远程 JSON 抓取。
 
+use std::io::Read;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -9,8 +10,7 @@ use kaleid_api::{ApiError, ApiResult, RemoteVersion, RemoteVersions};
 
 pub const OFFICIAL_MANIFEST: &str =
     "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json";
-pub const MIRROR_MANIFEST: &str =
-    "https://bmclapi2.bangbang93.com/mc/game/version_manifest_v2.json";
+pub const MIRROR_MANIFEST: &str = crate::mirrors::BMCLAPI_MANIFEST_URL;
 
 pub struct RemoteClient {
     agent: ureq::Agent,
@@ -24,11 +24,13 @@ impl RemoteClient {
         let agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(15))
             .timeout_read(Duration::from_secs(45))
+            .max_idle_connections_per_host(16)
             .user_agent("KaleidLauncher/0.1")
             .build();
         let meta_agent = ureq::AgentBuilder::new()
             .timeout_connect(Duration::from_secs(4))
             .timeout_read(Duration::from_secs(30))
+            .max_idle_connections_per_host(16)
             .user_agent("KaleidLauncher/0.1")
             .build();
         RemoteClient {
@@ -150,52 +152,109 @@ impl RemoteClient {
     /// 1. 非 2xx 直接记一笔，换下一个地址；
     /// 2. `Content-Type` 明显不是 JSON 就拒收，并把正文开头摘出来（HTML 的话能
     ///    一眼看出是 429 / 403 还是 502）；
-    /// 3. 读取有上限，防止镜像把整个 jar 当 JSON 灌过来；
-    /// 4. 每个地址试 `VERIFY_ROUNDS` 轮，最后的错误里带上"是谁回的不是 JSON"。
+    /// 3. `Content-Length` 或实际读取超过上限就立即失败，防止镜像把整个 jar
+    ///    当 JSON 灌过来；
+    /// 4. **内容错误不重试同一个地址**——坏地址撞两次只是让用户多等一轮；
+    ///    只有连接失败/读超时这种网络抖动才在同一地址上再试一次。
     pub fn fetch_verified_json(&self, urls: &[String], what: &str) -> ApiResult<Value> {
+        self.fetch_verified_json_capped(urls, what, VERIFY_MAX_BYTES)
+    }
+
+    /// 同 [`Self::fetch_verified_json`]，但允许调用方按已知文件大小放宽上限
+    /// （资源索引会按 `assetIndex.size` 放宽，避免未来索引真超过 16 MiB 被误杀）。
+    pub fn fetch_verified_json_capped(
+        &self,
+        urls: &[String],
+        what: &str,
+        max_bytes: usize,
+    ) -> ApiResult<Value> {
+        self.fetch_validated_bytes(urls, what, max_bytes, |meta| {
+            serde_json::from_slice::<Value>(&meta.bytes).map_err(|error| {
+                format!(
+                    "返回的内容不是合法的 JSON（{error}）：{}",
+                    snippet(&String::from_utf8_lossy(&meta.bytes))
+                )
+            })
+        }).map(|(_, value)| value)
+    }
+
+    /// 抓取并校验一段元数据，返回原始字节。
+    ///
+    /// 调用方拿到字节后可以自己落盘再解析——资源索引只下载一次，不必
+    /// "下载项下一次 + 解析时再一次"。
+    pub fn fetch_verified_bytes(
+        &self,
+        urls: &[String],
+        what: &str,
+        max_bytes: usize,
+    ) -> ApiResult<VerifiedBytes> {
+        self.fetch_validated_bytes(urls, what, max_bytes, |_| Ok(())).map(|(meta, ())| meta)
+    }
+
+    /// 每个候选只取一次正文；调用方的内容校验失败时直接换源，不消耗传输重试预算。
+    pub(crate) fn fetch_validated_bytes<T>(
+        &self,
+        urls: &[String],
+        what: &str,
+        max_bytes: usize,
+        validate: impl Fn(&VerifiedBytes) -> Result<T, String>,
+    ) -> ApiResult<(VerifiedBytes, T)> {
         if urls.is_empty() {
             return Err(ApiError::Network(format!("{what}：没有可用的地址")));
         }
-        let mut last = ApiError::Network(format!("{what}：没有可用的地址"));
-        let mut tried: Vec<String> = Vec::new();
-        for round in 0..VERIFY_ROUNDS {
-            for url in urls {
-                let host = host_of(url);
-                if !tried.iter().any(|seen| seen == &host) {
-                    tried.push(host.clone());
+        let mut failures: Vec<String> = Vec::new();
+        for url in urls {
+            let host = host_of(url);
+            match self.meta_attempt(url, what, &host, max_bytes) {
+                Ok(bytes) => {
+                    let meta = VerifiedBytes { bytes, url: url.clone() };
+                    match validate(&meta) {
+                        Ok(value) => return Ok((meta, value)),
+                        Err(reason) => failures.push(format!("{url} → {reason}")),
+                    }
                 }
-                match self.meta_agent.get(url).call() {
-                    Ok(response) => match verified_body(response, what, &host) {
-                        Ok(text) => match serde_json::from_str::<Value>(&text) {
-                            Ok(value) => return Ok(value),
-                            Err(error) => {
-                                last = ApiError::Network(format!(
-                                    "{what}下载失败：{host} 返回的内容不是合法的 JSON（{error}）：{}",
-                                    snippet(&text)
-                                ));
-                            }
-                        },
-                        Err(error) => last = error,
-                    },
-                    Err(error) => {
-                        last = ApiError::Network(format!("{what}下载失败：{host}：{error}"));
+                Err(reason) => failures.push(format!("{url} → {reason}")),
+            }
+        }
+        Err(ApiError::Network(format!(
+            "{what}下载失败：{}",
+            failures.join("；")
+        )))
+    }
+
+    /// 单个地址：网络错误最多试两次，内容错误立即返回。
+    fn meta_attempt(
+        &self,
+        url: &str,
+        what: &str,
+        host: &str,
+        max_bytes: usize,
+    ) -> Result<Vec<u8>, String> {
+        let mut last = format!("{host}：没有尝试请求");
+        for attempt in 0..META_ATTEMPTS {
+            match self
+                .meta_agent
+                .get(url)
+                .set("Accept", "application/json")
+                .call()
+            {
+                Ok(response) => return verified_body(response, what, host, max_bytes),
+                Err(error) => {
+                    let transport = matches!(error, ureq::Error::Transport(_));
+                    last = format!("{host}：{error}");
+                    // HTTP 4xx/5xx 再打一次也是同样的答复；只有传输层错误值得重试。
+                    if !transport {
+                        break;
+                    }
+                    if attempt + 1 < META_ATTEMPTS {
+                        std::thread::sleep(Duration::from_millis(META_PAUSE_MS));
                     }
                 }
             }
-            // 全部地址都失败：下一轮之前歇一下，别把对方的限流越撞越死。
-            if round + 1 < VERIFY_ROUNDS {
-                std::thread::sleep(Duration::from_millis(VERIFY_PAUSE_MS));
-            }
         }
-        Err(match last {
-            ApiError::Network(message) => ApiError::Network(format!(
-                "{message}（已尝试 {} 轮，地址：{}）",
-                VERIFY_ROUNDS,
-                tried.join("、")
-            )),
-            other => other,
-        })
+        Err(last)
     }
+
 
     pub fn version_json_url(&self, version_id: &str) -> ApiResult<String> {
         let versions = self.versions(false)?;
@@ -209,12 +268,19 @@ impl RemoteClient {
     }
 }
 
-/// 元数据"必须是 JSON"的抓取要试几轮、读多少字节、歇多久。
-const VERIFY_ROUNDS: usize = 2;
-const VERIFY_MAX_BYTES: usize = 16 * 1024 * 1024;
-const VERIFY_PAUSE_MS: u64 = 500;
+/// 元数据"必须是 JSON"的抓取 read 多少字节、网络错误在同一地址重试几次。
+pub const VERIFY_MAX_BYTES: usize = 16 * 1024 * 1024;
+const META_ATTEMPTS: usize = 2;
+const META_PAUSE_MS: u64 = 400;
 /// 报错时摘多少字节的正文——够看清是 429 还是 502 就行。
 const SNIPPET_BYTES: usize = 120;
+
+/// 一次校验过的元数据：原始字节 + 实际命中的地址。
+#[derive(Debug, Clone)]
+pub struct VerifiedBytes {
+    pub bytes: Vec<u8>,
+    pub url: String,
+}
 
 fn host_of(url: &str) -> String {
     crate::urlcache::host_of(url)
@@ -234,49 +300,79 @@ fn snippet(text: &str) -> String {
 }
 
 /// 校验并读出正文：拦掉"200 + HTML 错误页"和体积离谱的响应。
-fn verified_body(response: ureq::Response, what: &str, host: &str) -> ApiResult<String> {
+fn verified_body(
+    response: ureq::Response,
+    _what: &str,
+    host: &str,
+    max_bytes: usize,
+) -> Result<Vec<u8>, String> {
     let content_type = response.header("content-type").unwrap_or("").to_string();
+    // 先看声明大小：镜像把 40 MB 的 client.jar 当索引时，不必读满 16 MiB 才发现。
+    if let Some(length) = response
+        .header("content-length")
+        .and_then(|value| value.trim().parse::<usize>().ok())
+    {
+        if length > max_bytes {
+            return Err(format!(
+                "{host} 返回的内容过大（{length} 字节，超过 {} 字节上限）；这个地址不是元数据",
+                max_bytes
+            ));
+        }
+    }
     let mut reader = response.into_reader();
     let mut buffer: Vec<u8> = Vec::with_capacity(64 * 1024);
     let mut chunk = [0u8; 64 * 1024];
     loop {
         let read = reader
             .read(&mut chunk)
-            .map_err(|e| ApiError::Network(format!("{what}下载失败：{host} 读取中断：{e}")))?;
+            .map_err(|e| format!("{host} 读取中断：{e}"))?;
         if read == 0 {
             break;
         }
-        // 超限就地停下：读满 16 MiB 再判断等于白吃内存。
-        if buffer.len() + read > VERIFY_MAX_BYTES {
-            return Err(ApiError::Network(format!(
-                "{what}下载失败：{host} 返回的内容过大（超过 16 MiB 上限），镜像可能把大文件当成了元数据"
-            )));
+        if buffer.len() + read > max_bytes {
+            return Err(format!(
+                "{host} 返回的内容过大（已读超过 {} 字节上限）；这个地址不是元数据",
+                max_bytes
+            ));
         }
         buffer.extend_from_slice(&chunk[..read]);
     }
-    let text = String::from_utf8_lossy(&buffer).to_string();
+    let text = String::from_utf8_lossy(&buffer);
     let trimmed = text.trim_start_matches('\u{feff}').trim_start();
     // 明显是 HTML / XML：这类响应一定是错误页，不需要再让 serde 猜。
     let looks_markup = trimmed.starts_with('<');
     let says_json = content_type.to_ascii_lowercase().contains("json");
     if looks_markup || (!says_json && content_type.to_ascii_lowercase().contains("html")) {
-        return Err(ApiError::Network(format!(
-            "{what}下载失败：{host} 返回的不是 JSON（Content-Type: {}）：{}",
+        return Err(format!(
+            "返回的不是 JSON（Content-Type: {}）：{}",
             if content_type.is_empty() {
                 "未知"
             } else {
                 &content_type
             },
             snippet(trimmed)
-        )));
+        ));
     }
-    Ok(text)
+    Ok(buffer)
+}
+
+/// 同 [`meta_url_pair`]，但给"官方主机在国内常年超时"的元数据用（Forge / NeoForge
+/// 的 Maven）：除非玩家选了「仅官方」，否则镜像排第一——和 `DownloadItem::prefer_mirror`
+/// 一个规则，免得每次安装都先白等一次官方超时。
+pub fn meta_url_pair_prefer_mirror(official: &str, mirror: &str, policy: &str) -> Vec<String> {
+    let policy = policy.trim_start_matches("mod-");
+    match policy {
+        kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_ONLY => vec![official.to_string()],
+        kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY => vec![mirror.to_string()],
+        _ => vec![mirror.to_string(), official.to_string()],
+    }
 }
 
 /// 官方 / 镜像两个元数据地址按下载源策略排序。`mirror-only` 不包含官方地址。
 pub fn meta_url_pair(official: &str, mirror: &str, policy: &str) -> Vec<String> {
     let mirror_first = policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
-        || policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY;
+        || policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY
+        || policy == kaleid_api::DOWNLOAD_SOURCE_AUTO;
     let mirror_only = policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY;
     let official_only = policy == kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_ONLY;
     let mut urls = Vec::new();
@@ -382,6 +478,23 @@ pub fn now_secs() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prefer_mirror_pair_respects_only_policies() {
+        let o = "https://maven.neoforged.net/x.sha1";
+        let m = "https://bmclapi2.bangbang93.com/maven/x.sha1";
+        for policy in ["auto", "official-first", "mirror-first"] {
+            assert_eq!(meta_url_pair_prefer_mirror(o, m, policy), vec![m, o], "{policy}");
+        }
+        assert_eq!(meta_url_pair_prefer_mirror(o, m, "official-only"), vec![o]);
+        assert_eq!(meta_url_pair_prefer_mirror(o, m, "mirror-only"), vec![m]);
+    }
+
+    #[test]
+    fn auto_metadata_starts_on_the_mirror_side() {
+        assert_eq!(meta_url_pair("o", "m", "auto"), vec!["m", "o"]);
+        assert_eq!(meta_url_pair("o", "m", "official-first"), vec!["o", "m"]);
+    }
 
     #[test]
     fn mirror_only_metadata_urls_skip_mojang() {

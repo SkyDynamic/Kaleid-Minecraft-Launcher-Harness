@@ -313,8 +313,13 @@ fn item(
             .unwrap_or_else(|| url.to_string()),
         phase: phase.to_string(),
         official_url: Some(url.to_string()),
-        // 补全走和安装同一套镜像策略：官方连不上会自动换镜像。
-        mirror_url: kaleid_api::mirror_url_for(url),
+        // 补全走和安装同一套镜像策略：官方连不上会自动换镜像，镜像失败再轮询校园镜像。
+        //
+        // `kaleid_api::mirror_url_for` 只认 Modrinth / CurseForge / forgecdn —— 游戏文件
+        // 一个都匹配不上，于是旧实现的补全从来不走镜像（与安装不一致）。这里再接一层
+        // 「官方地址 → BMCLAPI 等价地址」的映射：资源对象进 `/assets/`，依赖库进 `/maven/`。
+        mirror_url: kaleid_api::mirror_url_for(url)
+            .or_else(|| crate::mirrors::bmclapi_for_official(url)),
         fallback_url: None,
         prefer_mirror: false,
         dest,
@@ -539,6 +544,59 @@ mod tests {
         assert_eq!(
             repair.items[0].official_url.as_deref(),
             Some("https://resources.download.minecraft.net/ff/ffeedd5678")
+        );
+    }
+
+    /// 补全和安装要用同一套镜像：资源对象与依赖库都得带上 BMCLAPI 地址。
+    ///
+    /// 旧实现里 `mirror_url` 只认 Modrinth / CurseForge，游戏文件一个都匹配不上，
+    /// 于是「启动前补全」永远是直连 Mojang——一条镜像都不会试。
+    #[test]
+    fn repair_items_carry_the_bmclapi_mirror() {
+        let dir = tempdir().unwrap();
+        let mc = dir.path();
+        write_version(
+            mc,
+            "1.20.1",
+            json!({
+                "id": "1.20.1",
+                "assetIndex": {"id": "12", "url": "https://example.invalid/12.json", "size": 10, "sha1": "00"},
+                "libraries": [
+                    {"name": "a:b:1", "url": "https://libraries.minecraft.net/", "downloads": {"artifact": {"path": "a/b/1/b-1.jar"}}}
+                ]
+            }),
+        );
+        std::fs::write(mc.join("versions/1.20.1/1.20.1.jar"), b"jar").unwrap();
+        let indexes = mc.join("assets/indexes");
+        std::fs::create_dir_all(&indexes).unwrap();
+        std::fs::write(
+            indexes.join("12.json"),
+            json!({"objects": {"minecraft/sounds/a.ogg": {"hash": "abcdef1234", "size": 10}}})
+                .to_string(),
+        )
+        .unwrap();
+
+        let plan = plan_for(mc, "1.20.1");
+        let repair = missing_items(&plan).unwrap();
+        assert_eq!(repair.files(), 2, "库 + 资源对象");
+        let asset = repair
+            .items
+            .iter()
+            .find(|item| item.phase == "assets")
+            .expect("应当有资源对象");
+        assert_eq!(
+            asset.mirror_url.as_deref(),
+            Some("https://bmclapi2.bangbang93.com/assets/ab/abcdef1234"),
+            "资源对象要能走 BMCLAPI（校园镜像在下载器里再展开）"
+        );
+        let library = repair
+            .items
+            .iter()
+            .find(|item| item.phase == "libraries")
+            .expect("应当有依赖库");
+        assert_eq!(
+            library.mirror_url.as_deref(),
+            Some("https://bmclapi2.bangbang93.com/maven/a/b/1/b-1.jar")
         );
     }
 

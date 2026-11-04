@@ -216,6 +216,7 @@ function seedGlobal(): GlobalSettings {
     theme: 'dark',
     downloadConcurrency: 8,
     downloadSource: 'auto',
+    downloadCampusMirrors: true,
     modSource: 'official-first',
     modDescription: 'original',
     checkBeforeLaunch: true,

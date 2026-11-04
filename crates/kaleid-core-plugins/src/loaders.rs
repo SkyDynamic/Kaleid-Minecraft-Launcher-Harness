@@ -9,28 +9,31 @@ use kaleid_api::{
     ApiError, ApiResult, FabricApiInfo, LoaderVersion, LoaderVersionTimes, LoaderVersions,
 };
 
+use crate::mirrors::{BMCLAPI_FABRIC_META, BMCLAPI_MAVEN_BASE, BMCLAPI_OPTIFINE_BASE};
 use crate::remote::{now_secs, RemoteClient};
 
 const FABRIC_META: &str = "https://meta.fabricmc.net/v2";
-const FABRIC_META_BMCLAPI: &str = "https://bmclapi2.bangbang93.com/fabric-meta/v2";
+const FABRIC_META_BMCLAPI: &str = BMCLAPI_FABRIC_META;
 const FORGE_MAVEN: &str = "https://maven.minecraftforge.net";
 const FORGE_PROMOTIONS: &str =
     "https://files.minecraftforge.net/net/minecraftforge/forge/promotions_slim.json";
 const NEOFORGE_MAVEN: &str = "https://maven.neoforged.net";
 const NEOFORGE_API: &str =
     "https://maven.neoforged.net/api/maven/versions/releases/net/neoforged/neoforge";
-const BMCLAPI_MAVEN: &str = "https://bmclapi2.bangbang93.com/maven";
+const BMCLAPI_MAVEN: &str = BMCLAPI_MAVEN_BASE;
 /// OptiFine 的列表与直链都在 BMCLAPI 上（官网要过 adfocus 跳转，抓不动）。
-const BMCLAPI_OPTIFINE: &str = "https://bmclapi2.bangbang93.com/optifine";
+const BMCLAPI_OPTIFINE: &str = BMCLAPI_OPTIFINE_BASE;
 const MODRINTH: &str = "https://api.modrinth.com/v2";
 
 pub fn fabric_loaders(client: &RemoteClient, game: &str) -> ApiResult<LoaderVersions> {
     // Fabric 官方 meta 在部分网络下不可达；BMCLAPI 的 fabric-meta 路径
     // 返回同样的结构，优先走它，失败再回官方。
     let path = format!("/versions/loader/{}", url_encode(game));
-    let value = client
-        .get_json(&format!("{FABRIC_META_BMCLAPI}{path}"))
-        .or_else(|_| client.get_json(&format!("{FABRIC_META}{path}")))?;
+    // 走 4 秒连接超时的元数据通道：一侧连不上立刻换另一侧，不再白等 15 秒 + 重试。
+    let value = client.fetch_json_ordered(&[
+        format!("{FABRIC_META_BMCLAPI}{path}"),
+        format!("{FABRIC_META}{path}"),
+    ])?;
     let rows = value
         .as_array()
         .ok_or_else(|| ApiError::Format("Fabric loader 列表不是数组".into()))?;
@@ -271,9 +274,11 @@ pub fn fabric_profile(client: &RemoteClient, game: &str, loader: &str) -> ApiRes
         url_encode(game),
         url_encode(loader)
     );
-    client
-        .get_json(&format!("{FABRIC_META_BMCLAPI}{path}"))
-        .or_else(|_| client.get_json(&fabric_profile_url(game, loader)))
+    // 安装路径上的关键一步：用短超时通道，镜像连不上立刻换官方，别把下载开工往后拖。
+    client.fetch_json_ordered(&[
+        format!("{FABRIC_META_BMCLAPI}{path}"),
+        fabric_profile_url(game, loader),
+    ])
 }
 
 pub fn neoforge_installer_url(version: &str) -> String {
@@ -291,9 +296,12 @@ pub fn neoforge_installer_mirror_url(version: &str) -> String {
 }
 
 /// Forge 的 Maven 坐标把游戏版本和加载器版本拼在一起，例如 `1.21.4-54.1.22`。
+///
+/// 官方兜底用 `files.minecraftforge.net/maven`（PCL2 旧 commit 同源）；
+/// `maven.minecraftforge.net` 在国内常被重定向/超时。
 pub fn forge_installer_url(game: &str, version: &str) -> String {
     let full = format!("{game}-{version}");
-    format!("{FORGE_MAVEN}/net/minecraftforge/forge/{full}/forge-{full}-installer.jar")
+    format!("https://files.minecraftforge.net/maven/net/minecraftforge/forge/{full}/forge-{full}-installer.jar")
 }
 
 pub fn forge_installer_sha1_url(game: &str, version: &str) -> String {
@@ -410,7 +418,8 @@ pub fn fabric_api_latest(client: &RemoteClient, game: &str) -> ApiResult<Option<
         "{MODRINTH}/project/fabric-api/version?game_versions=%5B%22{}%22%5D&loaders=%5B%22fabric%22%5D",
         url_encode(game)
     );
-    let value = client.get_json(&query)?;
+    // Modrinth 没有镜像元数据端点：同一地址用短超时通道试两次（抖动一次不算失败）。
+    let value = client.fetch_json_ordered(&[query.clone(), query])?;
     let rows = value
         .as_array()
         .ok_or_else(|| ApiError::Format("Modrinth 返回不是数组".into()))?;
@@ -629,7 +638,7 @@ mod tests {
         );
         assert_eq!(
             forge_installer_url("1.21.4", "54.1.22"),
-            "https://maven.minecraftforge.net/net/minecraftforge/forge/1.21.4-54.1.22/forge-1.21.4-54.1.22-installer.jar"
+            "https://files.minecraftforge.net/maven/net/minecraftforge/forge/1.21.4-54.1.22/forge-1.21.4-54.1.22-installer.jar"
         );
     }
 

@@ -16,15 +16,24 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// 镜像中枢自己扛不了并发，先给它小一点的默认上限。
-const BMCLAPI_HOST: &str = "bmclapi2.bangbang93.com";
-const BMCLAPI_LIMIT: usize = 4;
+/// 镜像中枢的静态上限。
+///
+/// 早先是 4：那时 429 还等于"立刻换源"，只能靠硬上限防风暴。现在有 AIMD（429 预算
+/// 减半）、`Retry-After` 冷却和"同地址多轮重试"，硬上限 4 反而让镜像模式下 4000 个
+/// 资源文件全挤在 4 条连接里排队。放宽到 16，由 AIMD 自己往下压。
+const BMCLAPI_HOST: &str = crate::mirrors::BMCLAPI_HOST;
+const BMCLAPI_LIMIT: usize = 16;
 /// 连续成功多少次才允许把预算加回 1。
 const RECOVER_STREAK: usize = 20;
 /// 429 没给 `Retry-After` 时的默认冷却。
 const DEFAULT_COOLDOWN_MS: u64 = 3000;
 /// 拿不到槽位时建议的重试间隔（调度器据此决定下一步等多久）。
 pub const RETRY_HINT_MS: u64 = 200;
+/// 一个地址"内容不对 / 根本没这个文件"后，多久之内不再选它。
+///
+/// 和限流冷却（秒级）不是一回事：校园镜像上没有某个文件是**稳定事实**，一个资源
+/// 文件撞上一次就够了——不记住的话，4000 个资源文件会各撞一次，安装时间直接翻倍。
+const UNUSABLE_COOLDOWN_MS: u64 = 10 * 60 * 1000;
 
 /// 一台主机的记账状态。
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,6 +48,10 @@ pub struct HostState {
     pub ok_streak: usize,
     /// 冷却到哪个时刻（Unix 毫秒）。
     pub cooldown_until_ms: u64,
+    /// 这个**地址**被判定"给不出正确内容"到哪个时刻（Unix 毫秒）。
+    ///
+    /// 只被选源逻辑读：换源时跳过它，但配额记账照旧（它随时可能恢复）。
+    pub unusable_until_ms: u64,
     /// 每分钟请求数上限；`None` 表示没有观测到明确配额，不主动掐。
     pub per_minute: Option<u32>,
     /// 当前分钟编号（`now_ms / 60_000`）。
@@ -56,6 +69,7 @@ impl HostState {
             used: 0,
             ok_streak: 0,
             cooldown_until_ms: 0,
+            unusable_until_ms: 0,
             per_minute,
             minute_id: 0,
             minute_used: 0,
@@ -207,6 +221,40 @@ impl HostLimits {
             .unwrap_or(false)
     }
 
+    /// 这个地址刚证明了"给不出要对的东西"（404 / 0 字节 / SHA-1 不符）。
+    ///
+    /// 只影响**选源**：十分钟内换地址时跳过它。不是限流冷却，所以不碰配额与
+    /// 并发——它随时可能被上游修好，真要用也还连得上。
+    pub fn note_unusable(&self, host: &str) {
+        self.note_unusable_at(host, now_ms());
+    }
+
+    /// [`HostLimits::note_unusable`] 的可注入时间版本（测试用）。
+    pub fn note_unusable_at(&self, host: &str, now_ms: u64) {
+        let mut inner = self.inner.lock().unwrap();
+        let state = inner
+            .entry(host.to_string())
+            .or_insert_with(|| self.fresh_state(host));
+        state.unusable_until_ms = state
+            .unusable_until_ms
+            .max(now_ms.saturating_add(UNUSABLE_COOLDOWN_MS));
+    }
+
+    /// 选源时还该不该把地址发到这台主机上。
+    pub fn usable(&self, host: &str) -> bool {
+        self.usable_at(host, now_ms())
+    }
+
+    /// [`Self::usable`] 的显式时间版本（测试用）。
+    pub fn usable_at(&self, host: &str, now_ms: u64) -> bool {
+        self.inner
+            .lock()
+            .unwrap()
+            .get(host)
+            .map(|state| state.unusable_until_ms <= now_ms)
+            .unwrap_or(true)
+    }
+
     fn fresh_state(&self, host: &str) -> HostState {
         let limit = if host.eq_ignore_ascii_case(BMCLAPI_HOST) {
             self.concurrency.min(BMCLAPI_LIMIT)
@@ -239,10 +287,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bmclapi_is_capped_at_four_connections() {
-        let limits = HostLimits::for_concurrency(16);
+    fn bmclapi_is_capped_at_sixteen_connections() {
+        let limits = HostLimits::for_concurrency(64);
         let host = BMCLAPI_HOST;
-        for _ in 0..4 {
+        for _ in 0..16 {
             assert!(limits.try_acquire_at(host, 0).is_ok());
         }
         assert!(limits.try_acquire_at(host, 0).is_err());
@@ -304,8 +352,7 @@ mod tests {
     }
 
     #[test]
-    fn header_observation_only_tightens_when_quota_is_almost_gone() {
-        let limits = HostLimits::for_concurrency(8);
+    fn header_observation_only_tightens_when_quota_is_almost_gone() {        let limits = HostLimits::for_concurrency(8);
         let host = BMCLAPI_HOST;
         limits.observe_headers_at(host, Some(9), Some(60), 0);
         assert!(limits.try_acquire_at(host, 0).is_ok());
@@ -314,5 +361,20 @@ mod tests {
         limits.observe_headers_at(host, Some(1), Some(30), 0);
         assert!(limits.try_acquire_at(host, 0).is_err());
         assert!(limits.try_acquire_at(host, 31_000).is_ok());
+    }
+
+    #[test]
+    fn unusable_host_is_skipped_by_the_source_picker_then_recovers() {
+        let limits = HostLimits::for_concurrency(8);
+        let host = "mirrors.hit.edu.cn";
+        // 没记录过的地址：默认可用，不能因为"没听说过"就把地址扔掉。
+        assert!(limits.usable_at(host, 0));
+        limits.note_unusable_at(host, 1_000);
+        assert!(!limits.usable_at(host, 1_000));
+        assert!(!limits.usable_at(host, 1_000 + UNUSABLE_COOLDOWN_MS - 1));
+        assert!(limits.usable_at(host, 1_000 + UNUSABLE_COOLDOWN_MS));
+        // 只是选源开关：配额与并发完全不受影响（它随时可能恢复，而不是"坏掉"）。
+        assert!(limits.try_acquire_at(host, 1_000).is_ok());
+        assert_eq!(limits.state_of(host).unwrap().budget, 8);
     }
 }

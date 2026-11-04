@@ -6,7 +6,7 @@
 //! 报错，根本不知道是镜像在挡人。这里把那几件事钉住：
 //!
 //! 1. 明显不是 JSON 的响应 → 换下一个地址，最终能成功；
-//! 2. 每个地址都试两轮才放弃，报错里带上是**谁**回的不是 JSON；
+//! 2. 内容错误不重试同一地址，报错里带上是**谁**回的不是 JSON；
 //! 3. 体积离谱的响应直接拒收（镜像可能把整个 jar 当 JSON 灌过来）。
 
 use std::io::{Read, Write};
@@ -103,7 +103,7 @@ fn html_error_page_falls_back_to_the_next_address() {
 }
 
 #[test]
-fn every_address_is_tried_twice_before_giving_up() {
+fn content_errors_are_not_retried_on_the_same_address() {
     let mirror = StubServer::start(vec![(
         200,
         "text/html",
@@ -130,11 +130,15 @@ fn every_address_is_tried_twice_before_giving_up() {
         "错误信息要说明在下载什么：{text}"
     );
     assert!(text.contains("403 Forbidden") || text.contains("html"), "带上片段方便排查：{text}");
-    assert_eq!(mirror.hits.load(Ordering::SeqCst), 2, "第一个地址应当试两轮");
-    assert_eq!(official.hits.load(Ordering::SeqCst), 2, "第二个地址也应当试两轮");
+    assert_eq!(mirror.hits.load(Ordering::SeqCst), 1, "内容错误不该重试同一个地址");
+    assert_eq!(official.hits.load(Ordering::SeqCst), 1, "第二个地址也应当只试一次");
     assert!(
         text.contains("127.0.0.1"),
         "要报出是哪台主机回的东西：{text}"
+    );
+    assert!(
+        text.contains("/1.21.4.json") || text.contains("/version/1.21.4/json"),
+        "要报出具体 URL，而不是只有主机：{text}"
     );
 }
 
@@ -159,4 +163,52 @@ fn plain_json_without_charset_still_parses() {
         .fetch_verified_json(&[server.url("/ok.json")], "索引")
         .expect("正常 JSON 必须能读");
     assert!(value.get("objects").is_some());
+}
+
+#[test]
+fn malformed_json_falls_back_without_refetching_bad_content() {
+    let bad = StubServer::start(vec![(200, "application/json", r#"{"objects":"#.into())]);
+    let good = StubServer::start(vec![(200, "application/json", valid_index())]);
+    let value = RemoteClient::new()
+        .fetch_verified_json(&[bad.url("/truncated.json"), good.url("/healthy.json")], "索引")
+        .expect("malformed JSON must not suppress a healthy later source");
+    assert!(value["objects"]["icons/icon_16x16.png"].is_object());
+    assert_eq!(bad.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(good.hits.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn all_malformed_json_candidates_report_each_failure_once() {
+    let first = StubServer::start(vec![(200, "application/json", "{ truncated".into())]);
+    let second = StubServer::start(vec![(200, "application/json", "[ broken".into())]);
+    let first_url = first.url("/first.json");
+    let second_url = second.url("/second.json");
+    let error = RemoteClient::new()
+        .fetch_verified_json(&[first_url.clone(), second_url.clone()], "索引")
+        .expect_err("every malformed candidate must fail").to_string();
+    assert!(error.contains(&first_url), "{error}");
+    assert!(error.contains(&second_url), "{error}");
+    assert_eq!(first.hits.load(Ordering::SeqCst), 1);
+    assert_eq!(second.hits.load(Ordering::SeqCst), 1);
+}
+
+/// 真机：26.3 的索引必须能从 BMCLAPI 的 `/v1/packages/...` 拿到。
+/// `cargo test -p kaleid-core-plugins --test remote_metadata real_26_3 -- --ignored --nocapture`
+#[test]
+#[ignore = "联网，验证 26.3 资源索引映射"]
+fn real_26_3_asset_index_uses_packages_path() {
+    let client = RemoteClient::new();
+    let version: serde_json::Value = client
+        .get_json("https://piston-meta.mojang.com/v1/packages/5df1795e16eea19d75b923d66ecca9ce183353c5/26.3.json")
+        .expect("26.3 版本 JSON");
+    let index = version.get("assetIndex").expect("assetIndex");
+    let url = index.get("url").and_then(|v| v.as_str()).expect("url");
+    let mapped = kaleid_core_plugins::mirrors::bmclapi_for_official(url)
+        .expect("piston-meta 必须能映射");
+    assert!(mapped.contains("/v1/packages/"), "{mapped}");
+    let value = client
+        .fetch_verified_json(&[mapped.clone()], "资源索引 34")
+        .expect("BMCLAPI 的 packages 路径");
+    assert!(value.get("objects").and_then(|v| v.as_object()).is_some(), "{mapped}");
+    eprintln!("index ok: {mapped}");
 }

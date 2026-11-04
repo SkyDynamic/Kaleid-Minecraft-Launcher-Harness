@@ -443,6 +443,27 @@ mod tests {
         // 缺字段（老文件没有 modDescription）也要落到「原文」。
         assert_eq!(g.mod_description, "original");
         assert_eq!(g.memory_mb, 2048);
+        // 老文件里当然也没有「校园镜像兜底」这一项：默认开着，因为失败才生效。
+        assert!(g.download_campus_mirrors);
+    }
+
+    /// 校园镜像兜底是个普通布尔设置项：关掉要能落盘，重开要能读回来。
+    #[test]
+    fn campus_mirrors_setting_roundtrips() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Settings::open(dir.path());
+        assert!(s.global().unwrap().download_campus_mirrors, "缺省开着");
+        let off = s
+            .patch_global(&json!({"downloadCampusMirrors": false}))
+            .unwrap();
+        assert!(!off.download_campus_mirrors);
+        // 重新打开一个实例，确认是落在 settings.json 里而不是只在内存里。
+        let reopened = Settings::open(dir.path());
+        assert!(!reopened.global().unwrap().download_campus_mirrors);
+        let on = reopened
+            .patch_global(&json!({"downloadCampusMirrors": true}))
+            .unwrap();
+        assert!(on.download_campus_mirrors);
     }
 
     #[test]

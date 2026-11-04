@@ -214,6 +214,13 @@ export interface GlobalSettings {
   downloadConcurrency: number;
   /** 下载源：auto（自动，推荐）/ official-first / mirror-first / official-only / mirror-only。 */
   downloadSource: string;
+  /**
+   * 镜像失败后是否按顺序轮询教育网的 BMCLAPI 校园镜像。
+   *
+   * 这些镜像只同步了依赖库与资源文件（没有版本清单），所以永远排在 BMCLAPI 主站
+   * 后面当兜底：主站下不动某个文件时才轮到它们。
+   */
+  downloadCampusMirrors: boolean;
   /** Mod 数据源：official-first（官方优先）/ mirror-first（镜像优先）/ official-only（仅官方）。 */
   modSource: string;
   /** Mod 列表注释：original（原文）/ translated（MCIM 译文，不受数据源影响）。 */

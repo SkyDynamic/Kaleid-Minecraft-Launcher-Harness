@@ -357,6 +357,7 @@ fn resolve_agent() -> &'static ureq::Agent {
             .timeout_read(Duration::from_secs(10))
             // 关键：自己跟跳，才能记住每一跳的终点。
             .redirects(0)
+            .max_idle_connections_per_host(16)
             .user_agent(crate::USER_AGENT)
             .build()
     })

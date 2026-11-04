@@ -1,4 +1,17 @@
 //! 共享下载线程池与下载任务。
+//!
+//! # 镜像侧不是"一个地址"，是一组地址
+//!
+//! BMCLAPI 主站（`bmclapi2.bangbang93.com`）对每个文件都会 302 到某个节点，
+//! 而教育网的一批镜像站同步了它的静态文件树（见 [`crate::mirrors`]）。所以"走镜像"
+//! 实际是：主站 → 八家校园镜像，按顺序试，谁给对了就用谁。PCL2 / HMCL 也是这个
+//! 做法——镜像是**兜底**，不用于分摊带宽。
+//!
+//! 两个配套机制缺一不可：
+//! - 一个地址给了 404 / 0 字节 / SHA-1 不符，就在 [`HostLimits`] 里记十分钟"别选它"
+//!   （[`note_address_unusable`]）。不记的话，4000 个资源文件会挨个去撞同一个坏镜像；
+//! - 换地址时跳过被记过的（[`switch_url`]），但永远保留队尾最后一个地址——全灭的
+//!   时候还得靠它给出真实的错误原因。
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
@@ -17,8 +30,12 @@ use kaleid_api::{
 };
 
 use crate::hostlimit::{HostLimits, HostState};
+use kaleid_kernel::{Context, DiagnosticRecord, Severity};
+pub(crate) mod diagnostics;
+use diagnostics::{BatchDiagnostics, Recorder, publish};
+use crate::mirrors;
 use crate::settings::Settings;
-use crate::urlcache::UrlCache;
+use crate::urlcache::{host_of, UrlCache};
 
 type Task = Box<dyn FnOnce() + Send + 'static>;
 
@@ -146,7 +163,12 @@ struct JobState {
     window_start: Instant,
     window_bytes: u64,
     slow_windows: u8,
+    /// 自动模式已经换过几次边（镜像↔官方）。封顶防止来回横跳。
+    auto_flips: u8,
 }
+
+/// 自动模式最多换边几次：镜像慢→官方，官方又慢→回镜像，到此为止。
+const MAX_AUTO_FLIPS: u8 = 2;
 
 pub struct Job {
     pub id: String,
@@ -159,7 +181,13 @@ pub struct Job {
     source_policy: String,
     state: Mutex<JobState>,
     cancel: AtomicBool,
+    /// `source` 每变一次就加一。调度器据此给"还没开始下载"的文件重排地址——
+    /// 旧实现只改了标签，已经排队的几千个文件照旧走原来那一侧。
+    source_generation: AtomicU64,
     created_at: u64,
+    recorder: Mutex<Recorder>,
+    failure_reported: AtomicBool,
+    diagnostic_terminal_failure: AtomicBool,
 }
 
 impl Job {
@@ -173,11 +201,11 @@ impl Job {
         loader_version: Option<String>,
         source_policy: String,
     ) -> Arc<Self> {
-        // 镜像优先 / 仅镜像的任务一上来就走镜像，队列里的来源标签得如实显示。
+        // 镜像优先 / 仅镜像 / 自动的任务一上来就走镜像，队列里的来源标签得如实显示。
         let initial_source = match source_policy.as_str() {
-            kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST | kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY => {
-                "bmclapi"
-            }
+            kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
+            | kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY
+            | kaleid_api::DOWNLOAD_SOURCE_AUTO => "bmclapi",
             _ => "mojang",
         };
         Self::with_initial_source(
@@ -252,19 +280,39 @@ impl Job {
                 window_start: Instant::now(),
                 window_bytes: 0,
                 slow_windows: 0,
+                auto_flips: 0,
             }),
             cancel: AtomicBool::new(false),
+            source_generation: AtomicU64::new(0),
             created_at: crate::remote::now_secs(),
+            recorder: Mutex::new(None),
+            failure_reported: AtomicBool::new(false),
+            diagnostic_terminal_failure: AtomicBool::new(false),
         })
     }
+
+    fn attach_context(&self, ctx: &Recorder) {
+        if ctx.is_some() { if let Ok(mut recorder) = self.recorder.lock() { *recorder = ctx.clone(); } }
+    }
+
+    fn recorder(&self) -> Recorder { self.recorder.lock().ok().and_then(|ctx| ctx.clone()) }
+
+    fn diagnostic(&self, record: DiagnosticRecord) {
+        let ctx = self.recorder();
+        publish(&ctx, record.with_job_id(&self.id));
+    }
+
+    pub(crate) fn diagnostic_failed(&self) -> bool { self.diagnostic_terminal_failure.load(Ordering::SeqCst) }
 
     pub fn cancelled(&self) -> bool {
         self.cancel.load(Ordering::SeqCst)
     }
 
     pub fn cancel(&self) {
-        self.cancel.store(true, Ordering::SeqCst);
+        let requested = self.cancel.swap(true, Ordering::SeqCst);
+        if !requested { self.diagnostic(DiagnosticRecord::new("downloads", "download.cancel_requested", Severity::Info)); }
         let mut s = self.state.lock().unwrap();
+        let before = state_codes(&s);
         if matches!(
             s.status,
             DownloadStatus::Resolving | DownloadStatus::Queued | DownloadStatus::Running
@@ -272,6 +320,19 @@ impl Job {
             s.status = DownloadStatus::Cancelled;
             s.current = "已取消".into();
         }
+        let after = state_codes(&s);
+        drop(s);
+        self.transition(before, after);
+    }
+
+    fn transition(&self, before: (DownloadStatus, Vec<(String, PhaseStatus)>, String), after: (DownloadStatus, Vec<(String, PhaseStatus)>, String)) {
+        if before.0 != after.0 && (after.0 != DownloadStatus::Failed || !self.failure_reported.swap(true, Ordering::SeqCst)) {
+            self.diagnostic(DiagnosticRecord::new("downloads", "download.status", Severity::Info).with_field("previous_status", download_status(before.0)).with_field("status", download_status(after.0)));
+        }
+        for ((phase, previous), (_, status)) in before.1.into_iter().zip(after.1) {
+            if previous != status { self.diagnostic(DiagnosticRecord::new("downloads", "download.phase", Severity::Info).with_field("phase", phase).with_field("previous_status", phase_status(previous)).with_field("status", phase_status(status))); }
+        }
+        if before.2 != after.2 { self.diagnostic(DiagnosticRecord::new("downloads", "download.source", Severity::Info).with_field("previous_source", before.2).with_field("source", after.2).with_field("policy", self.policy()).with_field("reason", "source_transition")); }
     }
 
     pub fn source(&self) -> String {
@@ -285,8 +346,12 @@ impl Job {
 
     pub fn set_status(&self, status: DownloadStatus, current: impl Into<String>) {
         let mut s = self.state.lock().unwrap();
+        let before = state_codes(&s);
         s.status = status;
         s.current = current.into();
+        let after = state_codes(&s);
+        drop(s);
+        self.transition(before, after);
     }
 
     pub fn set_current(&self, current: impl Into<String>) {
@@ -295,6 +360,7 @@ impl Job {
 
     pub fn fail(&self, error: impl Into<String>) {
         let mut s = self.state.lock().unwrap();
+        let before = state_codes(&s);
         s.status = DownloadStatus::Failed;
         s.error = Some(error.into());
         s.current = "下载失败".into();
@@ -303,10 +369,14 @@ impl Job {
                 p.status = PhaseStatus::Failed;
             }
         }
+        let after = state_codes(&s);
+        drop(s);
+        self.transition(before, after);
     }
 
     pub fn complete(&self) {
         let mut s = self.state.lock().unwrap();
+        let before = state_codes(&s);
         if s.status == DownloadStatus::Cancelled {
             return;
         }
@@ -327,6 +397,9 @@ impl Job {
             s.done_bytes = s.total_bytes;
         }
         s.files_done = s.files_total;
+        let after = state_codes(&s);
+        drop(s);
+        self.transition(before, after);
     }
 
     pub fn add_total(&self, phase: &str, bytes: u64, files: usize) {
@@ -341,6 +414,7 @@ impl Job {
 
     pub fn start_phase(&self, phase: &str) {
         let mut s = self.state.lock().unwrap();
+        let before = state_codes(&s);
         if let Some(p) = s.phases.iter_mut().find(|p| p.id == phase) {
             // 「跳过」也允许被重新点亮：一批跑完后空的阶段会被标成跳过，
             // 但安装器（Forge / NeoForge）是后面单独跑起来的。
@@ -349,21 +423,29 @@ impl Job {
             }
             s.current = p.label.clone();
         }
+        let after = state_codes(&s);
+        drop(s);
+        self.transition(before, after);
     }
 
     /// 一批下载结束后调用：从头到尾没轮到一个文件的阶段标成「跳过」。
     /// 有文件的阶段不动——模组是一个文件一批地下载，不能把它们打成跳过。
     pub fn skip_untouched_phases(&self) {
         let mut s = self.state.lock().unwrap();
+        let before = state_codes(&s);
         for p in &mut s.phases {
             if p.status == PhaseStatus::Pending && p.files_total == 0 && p.total_bytes == 0 {
                 p.status = PhaseStatus::Skipped;
             }
         }
+        let after = state_codes(&s);
+        drop(s);
+        self.transition(before, after);
     }
 
     pub fn complete_phase(&self, phase: &str) {
         let mut s = self.state.lock().unwrap();
+        let before = state_codes(&s);
         if let Some(p) = s.phases.iter_mut().find(|p| p.id == phase) {
             if p.files_total == 0 && p.total_bytes == 0 {
                 p.status = PhaseStatus::Skipped;
@@ -371,10 +453,16 @@ impl Job {
                 p.status = PhaseStatus::Completed;
             }
         }
+        let after = state_codes(&s);
+        drop(s);
+        self.transition(before, after);
     }
 
     pub fn begin_item(&self, phase: &str, label: &str) {
         let mut s = self.state.lock().unwrap();
+        let mut before = state_codes(&s);
+        // Item retries may resurrect the legacy status; this is not a new job start.
+        if matches!(before.0, DownloadStatus::Failed | DownloadStatus::Cancelled) { before.0 = DownloadStatus::Running; }
         s.status = DownloadStatus::Running;
         s.current = label.to_string();
         if let Some(p) = s.phases.iter_mut().find(|p| p.id == phase) {
@@ -382,6 +470,9 @@ impl Job {
                 p.status = PhaseStatus::Running;
             }
         }
+        let after = state_codes(&s);
+        drop(s);
+        self.transition(before, after);
     }
 
     /// 文件完成：字节数已由 `add_bytes` 流式累计，这里只记文件计数。
@@ -404,17 +495,22 @@ impl Job {
 
     pub fn add_bytes(&self, phase: &str, bytes: u64) {
         let mut s = self.state.lock().unwrap();
+        let before = s.source.clone();
         s.done_bytes = s.done_bytes.saturating_add(bytes);
         if let Some(p) = s.phases.iter_mut().find(|p| p.id == phase) {
             p.done_bytes = p.done_bytes.saturating_add(bytes);
         }
         s.window_bytes = s.window_bytes.saturating_add(bytes);
         self.evaluate_window(&mut s);
+        let after = s.source.clone();
+        drop(s);
+        if before != after { self.diagnostic(DiagnosticRecord::new("downloads", "download.source", Severity::Info).with_field("previous_source", before).with_field("source", after).with_field("policy", self.policy()).with_field("reason", "slow_source")); }
     }
 
     /// 即使连接完全卡住、没有任何字节到达，也按 3 秒窗口测速。
     pub fn tick(&self) {
         let mut s = self.state.lock().unwrap();
+        let before = s.source.clone();
         if !matches!(
             s.status,
             DownloadStatus::Queued | DownloadStatus::Running | DownloadStatus::Resolving
@@ -422,6 +518,9 @@ impl Job {
             return;
         }
         self.evaluate_window(&mut s);
+        let after = s.source.clone();
+        drop(s);
+        if before != after { self.diagnostic(DiagnosticRecord::new("downloads", "download.source", Severity::Info).with_field("previous_source", before).with_field("source", after).with_field("policy", self.policy()).with_field("reason", "slow_source")); }
     }
 
     fn evaluate_window(&self, s: &mut JobState) {
@@ -435,16 +534,37 @@ impl Job {
         } else {
             s.slow_windows = 0;
         }
-        if self.source_policy == kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_FIRST
-            && s.source != "bmclapi"
-            && s.slow_windows >= 2
-        {
-            s.source = "bmclapi".into();
-            s.current = "官方源较慢，已切换 BMCLAPI".into();
-            s.slow_windows = 0;
+        if s.slow_windows >= 2 {
+            if self.source_policy == kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_FIRST
+                && s.source != "bmclapi"
+            {
+                s.source = "bmclapi".into();
+                s.current = "官方源较慢，已切换 BMCLAPI".into();
+                s.slow_windows = 0;
+                self.source_generation.fetch_add(1, Ordering::SeqCst);
+            } else if self.source_policy == kaleid_api::DOWNLOAD_SOURCE_AUTO
+                && s.auto_flips < MAX_AUTO_FLIPS
+            {
+                // 自动模式两边都能换：镜像慢就去官方，官方也慢再回镜像，封顶两次。
+                if s.source == "bmclapi" {
+                    s.source = "mojang".into();
+                    s.current = "镜像较慢，已切换官方源".into();
+                } else {
+                    s.source = "bmclapi".into();
+                    s.current = "官方源较慢，已切换 BMCLAPI".into();
+                }
+                s.auto_flips += 1;
+                s.slow_windows = 0;
+                self.source_generation.fetch_add(1, Ordering::SeqCst);
+            }
         }
         s.window_start = Instant::now();
         s.window_bytes = 0;
+    }
+
+    /// 来源每切换一次就变一次的代号（调度器据此重排未开工文件的地址）。
+    pub fn source_generation(&self) -> u64 {
+        self.source_generation.load(Ordering::SeqCst)
     }
 
     pub fn reset_speed_window(&self) {
@@ -456,11 +576,16 @@ impl Job {
 
     pub fn switch_to_mirror(&self, reason: &str) {
         let mut s = self.state.lock().unwrap();
+        let before = state_codes(&s);
         if self.source_policy == kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_FIRST && s.source != "bmclapi"
         {
             s.source = "bmclapi".into();
             s.current = reason.to_string();
+            self.source_generation.fetch_add(1, Ordering::SeqCst);
         }
+        let after = state_codes(&s);
+        drop(s);
+        self.transition(before, after);
     }
 
     pub fn snapshot(&self) -> DownloadJob {
@@ -509,6 +634,12 @@ impl Job {
     }
 }
 
+fn state_codes(s: &JobState) -> (DownloadStatus, Vec<(String, PhaseStatus)>, String) {
+    (s.status, s.phases.iter().map(|p| (p.id.clone(), p.status)).collect(), s.source.clone())
+}
+fn download_status(status: DownloadStatus) -> &'static str { match status { DownloadStatus::Resolving => "resolving", DownloadStatus::Queued => "queued", DownloadStatus::Running => "running", DownloadStatus::Completed => "completed", DownloadStatus::Failed => "failed", DownloadStatus::Cancelled => "cancelled" } }
+fn phase_status(status: PhaseStatus) -> &'static str { match status { PhaseStatus::Pending => "pending", PhaseStatus::Running => "running", PhaseStatus::Completed => "completed", PhaseStatus::Skipped => "skipped", PhaseStatus::Failed => "failed" } }
+
 #[derive(Clone, Debug)]
 pub struct DownloadItem {
     pub label: String,
@@ -530,6 +661,7 @@ pub struct DownloadItem {
 
 #[derive(Clone)]
 pub struct DownloadManager {
+    ctx: Recorder,
     executor: Arc<Executor>,
     jobs: Arc<Mutex<HashMap<String, Arc<Job>>>>,
     settings: Arc<Settings>,
@@ -557,6 +689,7 @@ impl DownloadManager {
             .map(|g| g.download_concurrency as usize)
             .unwrap_or(8);
         DownloadManager {
+            ctx: None,
             executor: Arc::new(Executor::new(concurrency)),
             jobs: Arc::new(Mutex::new(HashMap::new())),
             settings,
@@ -567,6 +700,8 @@ impl DownloadManager {
             cache: Arc::new(UrlCache::in_memory()),
         }
     }
+
+    pub fn with_context(mut self, ctx: Context) -> Self { self.ctx = Some(ctx); self }
 
     /// 把重定向缓存落到 `<data_root>/download-cache`，跨进程复用（TTL 6 小时）。
     pub fn with_data_root(mut self, data_root: &Path) -> Self {
@@ -582,7 +717,10 @@ impl DownloadManager {
     pub fn register(&self, job: Arc<Job>) {
         // 用户改完并发后可能立刻开始安装；不要等 UI 下一次 poll 才扩线程池。
         self.sync_concurrency();
-        self.jobs.lock().unwrap().insert(job.id.clone(), job);
+        job.attach_context(&self.ctx);
+        let record = DiagnosticRecord::new("downloads", "download.accepted", Severity::Info).with_field("outcome", "accepted").with_field("game_version", job.game_version.clone()).with_field("loader", job.loader_kind.slug()).with_field("policy", job.policy());
+        self.jobs.lock().unwrap().insert(job.id.clone(), job.clone());
+        job.diagnostic(record);
     }
 
     pub fn job(&self, id: &str) -> Option<Arc<Job>> {
@@ -603,6 +741,17 @@ impl DownloadManager {
             .global()
             .map(|g| g.download_source)
             .unwrap_or_else(|_| kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_FIRST.to_string())
+    }
+
+    /// 镜像失败后要不要轮到校园镜像（设置项 `downloadCampusMirrors`，缺省开）。
+    ///
+    /// 只在**建会话那一刻**读一次：一次安装里换开关没有意义，而每个文件都去读一次
+    /// 设置文件会把它自己变成瓶颈。
+    pub fn campus_mirrors_enabled(&self) -> bool {
+        self.settings
+            .global()
+            .map(|g| g.download_campus_mirrors)
+            .unwrap_or(true)
     }
 
     pub fn snapshot(&self) -> DownloadSnapshot {
@@ -687,6 +836,8 @@ impl DownloadManager {
 
     /// 可追加的下载会话。安装流程先推客户端和库，资源索引解析完再追加，不必等全部清单。
     pub fn begin_session(&self, job: Arc<Job>) -> DownloadSession {
+        job.attach_context(&self.ctx);
+        let diagnostics = BatchDiagnostics::new(job.recorder(), &job.id);
         let (cmd_tx, cmd_rx) = unbounded::<SessionCmd>();
         let (result_tx, result_rx) = bounded::<Result<(), String>>(1);
         let executor = self.executor.clone();
@@ -694,10 +845,13 @@ impl DownloadManager {
         let connections = self.connections.clone();
         let limits = self.limits.clone();
         let cache = self.cache.clone();
+        let campus = self.campus_mirrors_enabled();
         thread::Builder::new()
             .name("kaleid-download-sched".into())
             .spawn(move || {
-                let result = drive_session(job, executor, agent, connections, limits, cache, cmd_rx);
+                let result = drive_session(
+                    job, executor, agent, connections, limits, cache, campus, cmd_rx, diagnostics,
+                );
                 let _ = result_tx.send(result);
             })
             .expect("无法创建下载调度线程");
@@ -765,6 +919,7 @@ struct ReportGuard {
     id: u64,
     /// 分段任务的区间：panic 时要按区间把活放回去，不能当成整个文件失败。
     range: Option<(u64, u64)>,
+    diagnostics: Option<Arc<BatchDiagnostics>>,
 }
 
 impl ReportGuard {
@@ -774,6 +929,7 @@ impl ReportGuard {
         host: String,
         id: u64,
         range: Option<(u64, u64)>,
+        diagnostics: Option<Arc<BatchDiagnostics>>,
     ) -> Self {
         ReportGuard {
             tx: Some(tx),
@@ -781,6 +937,7 @@ impl ReportGuard {
             host,
             id,
             range,
+            diagnostics,
         }
     }
 
@@ -806,6 +963,7 @@ impl Drop for ReportGuard {
             return;
         }
         self.limits.release(&self.host);
+        if let Some(d) = &self.diagnostics { d.warning("download.internal_error", "worker_panic", None, &[]); }
         let message = "下载线程异常退出（内部错误）".to_string();
         let report = match self.range {
             Some(range) => WorkReport::RangeErr(self.id, range, message),
@@ -816,6 +974,8 @@ impl Drop for ReportGuard {
 }
 
 struct LiveFile {
+    diagnostics: Option<Arc<BatchDiagnostics>>,
+    diagnostic_failure_recorded: bool,
     id: u64,
     item: DownloadItem,
     urls: Vec<String>,
@@ -882,6 +1042,7 @@ impl LiveFile {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drive_session(
     job: Arc<Job>,
     executor: Arc<Executor>,
@@ -889,7 +1050,9 @@ fn drive_session(
     connections: Arc<AtomicUsize>,
     limits: Arc<HostLimits>,
     cache: Arc<UrlCache>,
+    campus: bool,
     cmd_rx: Receiver<SessionCmd>,
+    diagnostics: Arc<BatchDiagnostics>,
 ) -> Result<(), String> {
     job.reset_speed_window();
     let monitor_stop = Arc::new(AtomicBool::new(false));
@@ -914,6 +1077,7 @@ fn drive_session(
     let mut next_id = 1u64;
     let mut closed = false;
     let mut first_error: Option<String> = None;
+    let mut seen_generation = job.source_generation();
     let result = (|| -> Result<(), String> {
         loop {
             while let Ok(cmd) = cmd_rx.try_recv() {
@@ -926,12 +1090,15 @@ fn drive_session(
                             executor.concurrency(),
                             &cache,
                             &limits,
+                            campus,
+                            Some(diagnostics.clone()),
                         ));
                         next_id += 1;
                     }
                     SessionCmd::Close => closed = true,
                 }
             }
+            replan_untouched(&job, &mut files, &cache, &limits, campus, &mut seen_generation);
             assign_work(
                 &job,
                 &executor,
@@ -953,6 +1120,7 @@ fn drive_session(
                     .any(|file| !file.finished && file.failed.is_none())
                 && !files.iter().any(LiveFile::can_progress)
             {
+                diagnostics.warning("download.internal_error", "scheduler_stall", None, &[]);
                 return Err(
                     "下载线程卡住了：没有任何可继续的任务（请重试，通常会直接成功）".into(),
                 );
@@ -983,6 +1151,8 @@ fn drive_session(
                                     executor.concurrency(),
                                     &cache,
                                     &limits,
+                                    campus,
+                                    Some(diagnostics.clone()),
                                 ));
                                 next_id += 1;
                             }
@@ -1014,13 +1184,81 @@ fn drive_session(
     if let Some(handle) = monitor {
         let _ = handle.join();
     }
+    // A Job can own parallel sessions. Only these files belong to this batch;
+    // unknown-length and partial transfer byte counters must not borrow job totals.
+    let completed = files.iter().filter(|file| file.finished && file.failed.is_none());
+    let files_done = completed.clone().count();
+    let known_sizes = files.iter().all(|file| file.item.size > 0);
+    let done_bytes = known_sizes.then(|| completed.map(|file| file.item.size).sum());
+    let total_bytes = known_sizes.then(|| files.iter().map(|file| file.item.size).sum());
+    diagnostics.finish(&result, job.cancelled(), files_done, files.len(), done_bytes, total_bytes);
     result
+}
+
+/// 任务换了一侧（慢速监控 / 失败换源）之后，把**还没开工**的文件按新的一侧重排地址。
+///
+/// 只碰一个字节都没下过的文件：在途或下了一半的文件换源要走 `switch_url`
+/// 的"丢掉重来"流程，这里不能替它做决定，否则新旧来源的字节会混在一起。
+fn replan_untouched(
+    job: &Arc<Job>,
+    files: &mut [LiveFile],
+    cache: &UrlCache,
+    limits: &HostLimits,
+    campus: bool,
+    seen: &mut u64,
+) {
+    let generation = job.source_generation();
+    if generation == *seen {
+        return;
+    }
+    *seen = generation;
+    for file in files.iter_mut() {
+        if !is_untouched(file) {
+            continue;
+        }
+        file.urls = plan_urls(job, &file.item, cache, limits, campus);
+        file.url_index = 0;
+        file.throttle_rounds = 0;
+    }
+}
+
+fn is_untouched(file: &LiveFile) -> bool {
+    !file.finished
+        && file.failed.is_none()
+        && file.inflight == 0
+        && !file.pending_switch
+        && !file.single_started
+        && file.segments.is_empty()
+        && file.capability.is_empty()
+        && file.url_index == 0
+}
+
+/// 一个文件的**镜像侧候选地址**：主站 + 校园兜底，按"这台主机最近能不能用"重排。
+///
+/// 主站永远排第一（它就是用户选的那一侧）；校园地址里最近被证明"给不出正确内容"的
+/// 往后挪，但一个都不删——全灭的时候还得靠它们拼出真实的错误原因。
+fn mirror_group(mirror: Option<&str>, limits: &HostLimits, campus: bool) -> Vec<String> {
+    let Some(mirror) = mirror else {
+        return Vec::new();
+    };
+    let expanded = if campus {
+        mirrors::expand_mirror(mirror)
+    } else {
+        vec![mirror.to_string()]
+    };
+    let (usable, sketchy): (Vec<String>, Vec<String>) = expanded
+        .into_iter()
+        .partition(|url| limits.usable(&host_of(url)));
+    let mut group = usable;
+    group.extend(sketchy);
+    group
 }
 
 /// 决定一个文件按什么顺序试哪些地址。
 ///
 /// 显式策略（官方优先 / 镜像优先 / 仅官方 / 仅镜像）完全照用户说的办，只额外做一件
 /// 无害的事：把镜像地址换成它的**终点**，这样分段连接不必每条都吃一次重定向配额。
+/// 镜像侧本身是一组地址（主站 + 校园镜像，见 [`mirror_group`]），换源就是往后走一格。
 ///
 /// `auto` 才做"看情况挑"：解析镜像到底会去哪——
 /// - 终点就是官方主机（实测 `/version/<id>/client` 会跳回 piston-data）：那就直接用
@@ -1032,27 +1270,31 @@ fn plan_urls(
     item: &DownloadItem,
     cache: &UrlCache,
     limits: &HostLimits,
+    campus: bool,
 ) -> Vec<String> {
     // 注意看的是**策略**而不是 `job.source()`：后者是"现在实际在用哪一侧"
     // （mojang / bmclapi），会被慢速监控改写。
     let policy = job.policy().trim_start_matches("mod-").to_string();
     let auto = policy == kaleid_api::DOWNLOAD_SOURCE_AUTO;
     let current_source = job.source();
-    // 自动模式在 `ordered_urls` 里按"镜像优先"起步；解析完之后再决定要不要翻到官方。
+    // 自动模式从镜像起步（`Job::new` 把标签设成 bmclapi），慢速监控可能把它翻到官方；
+    // 排序就跟着"当前在哪一侧"走。
+    let auto_on_mirror = current_source == "bmclapi";
     let effective_policy = if auto {
-        kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
+        if auto_on_mirror {
+            kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
+        } else {
+            kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_FIRST
+        }
     } else {
         job.policy()
     };
+    let mirror_urls = mirror_group(item.mirror_url.as_deref(), limits, campus);
     let base = ordered_urls(
         item.official_url.as_deref(),
-        item.mirror_url.as_deref(),
+        &mirror_urls,
         item.fallback_url.as_deref(),
-        if auto {
-            kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
-        } else {
-            current_source.as_str()
-        },
+        current_source.as_str(),
         effective_policy,
         item.prefer_mirror,
     );
@@ -1069,8 +1311,15 @@ fn plan_urls(
     };
     let resolved = cache.resolve(mirror);
     let mirror_final = resolved.final_url.clone();
+    // 校园兜底跟着镜像走：主站换成终点之后，它们仍然排在这一侧的后面。
+    // 它们不做终点解析——校园镜像就是直连的静态文件服务器，多一次 HEAD 只是白花时间。
+    let campus_tail: Vec<String> = mirror_urls
+        .iter()
+        .filter(|url| url.as_str() != mirror)
+        .cloned()
+        .collect();
 
-    let mut urls: Vec<String> = Vec::with_capacity(3);
+    let mut urls: Vec<String> = Vec::with_capacity(base.len() + campus_tail.len());
     if auto {
         // 镜像的终点和官方是同一台机器：再走镜像只是多一次跳转、多一次配额。
         let mirror_is_official = item
@@ -1079,15 +1328,13 @@ fn plan_urls(
             .map(|official| cache.resolve(official).host == resolved.host)
             .unwrap_or(false);
         let cooling = limits.cooling_down(&resolved.host);
-        if mirror_is_official || cooling {
+        if mirror_is_official || cooling || !auto_on_mirror {
             if let Some(official) = item.official_url.as_deref() {
                 urls.push(official.to_string());
             }
-            if !urls.iter().any(|url| url == &mirror_final) {
-                urls.push(mirror_final.clone());
-            }
+            push_mirror_side(&mut urls, &mirror_final, &campus_tail);
         } else {
-            urls.push(mirror_final.clone());
+            push_mirror_side(&mut urls, &mirror_final, &campus_tail);
             if let Some(official) = item.official_url.as_deref() {
                 if !urls.iter().any(|url| url == official) {
                     urls.push(official.to_string());
@@ -1109,7 +1356,23 @@ fn plan_urls(
             urls.push(fallback.to_string());
         }
     }
-    // 去重：终点可能和另一个候选撞上（镜像跳官方时就是如此）。
+    dedupe(urls)
+}
+
+/// 镜像侧一整组推进去：终点在前，校园兜底按原顺序跟上。
+fn push_mirror_side(urls: &mut Vec<String>, mirror_final: &str, campus_tail: &[String]) {
+    if !urls.iter().any(|url| url == mirror_final) {
+        urls.push(mirror_final.to_string());
+    }
+    for url in campus_tail {
+        if !urls.iter().any(|kept| kept == url) {
+            urls.push(url.clone());
+        }
+    }
+}
+
+/// 去重但保留首次出现的顺序（终点可能和另一个候选撞上：镜像跳官方时就是如此）。
+fn dedupe(urls: Vec<String>) -> Vec<String> {
     let mut seen: Vec<String> = Vec::with_capacity(urls.len());
     for url in urls {
         if !seen.iter().any(|kept| kept == &url) {
@@ -1126,6 +1389,8 @@ fn accept_file(
     desired: usize,
     cache: &UrlCache,
     limits: &HostLimits,
+    campus: bool,
+    diagnostics: Option<Arc<BatchDiagnostics>>,
 ) -> LiveFile {
     if let Some(parent) = item.dest.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1142,7 +1407,7 @@ fn accept_file(
             finished = true;
         }
     }
-    let urls = plan_urls(job, &item, cache, limits);
+    let urls = plan_urls(job, &item, cache, limits, campus);
     let size = item.size;
     let multi = !finished && size >= SEGMENT_THRESHOLD_BYTES && desired >= 2;
     let mut unassigned = VecDeque::new();
@@ -1150,6 +1415,8 @@ fn accept_file(
         unassigned.push_back((0, size - 1));
     }
     LiveFile {
+        diagnostics,
+        diagnostic_failure_recorded: false,
         id,
         item,
         urls,
@@ -1247,16 +1514,27 @@ fn start_file_work(
     budget: usize,
 ) -> usize {
     if file.urls.is_empty() {
+        record_file_failure(job, file);
         file.failed = Some(format!("{}：没有可用的下载地址", file.item.label));
         file.finished = true;
         return 0;
     }
+    // 地址顺序是建会话那一刻算的，等真派活时情况可能变了：某个镜像刚被别的文件
+    // 证明给不出内容（校园镜像缺文件是常态），或者主站刚被限流进了冷却——这时候
+    // 派活会被 `try_acquire` 直接挡回来，文件只能干等。文件一个字节都没下时换地址
+    // 是免费的（`switch_url` 要丢分段，这里不用），所以顺手跳过去。
+    skip_dead_hosts(file, limits);
     let url = file.urls[file.url_index.min(file.urls.len() - 1)].clone();
-    if file.url_index > 0 {
-        job.switch_to_mirror("官方源下载失败，已尝试镜像");
-    }
     // 按主机记账：BMCLAPI 只给我们 10 次/分钟的短时配额，硬开 8 条连接只会换来 429。
-    let host = crate::urlcache::host_of(&url);
+    let host = host_of(&url);
+    let diagnostics = file.diagnostics.clone();
+    if file.url_index > 0 {
+        if mirrors::is_campus_host(&host) {
+            job.set_current(format!("{}：改用校园镜像 {host}", file.item.label));
+        } else {
+            job.switch_to_mirror("官方源下载失败，已尝试镜像");
+        }
+    }
     if file.multi_active() {
         let ranges = claim_ranges(&mut file.unassigned, take, budget.max(2));
         let mut started = 0usize;
@@ -1275,9 +1553,10 @@ fn start_file_work(
             let task_job = job.clone();
             let limits = limits.clone();
             let task_host = host.clone();
-            let guard = ReportGuard::new(done_tx, limits, task_host, id, Some(range));
+            let diagnostics = diagnostics.clone();
+            let guard = ReportGuard::new(done_tx, limits, task_host, id, Some(range), diagnostics.clone());
             executor.submit(Box::new(move || {
-                let report = run_range(&agent, &task_job, &item, &url, range, id);
+                let report = run_range(&agent, &task_job, &item, &url, range, id, diagnostics.as_deref());
                 let ok = matches!(report, WorkReport::RangeOk(..));
                 guard.finish(report, ok);
             }));
@@ -1306,18 +1585,18 @@ fn start_file_work(
     let task_job = job.clone();
     let limits = limits.clone();
     let task_host = host.clone();
-    let guard = ReportGuard::new(done_tx, limits, task_host, id, None);
+    let guard = ReportGuard::new(done_tx, limits, task_host, id, None, diagnostics.clone());
     executor.submit(Box::new(move || {
         let report = if discover {
-            match discover_size(&agent, &task_job, &url) {
-                Ok(Some(size)) if size >= SEGMENT_THRESHOLD_BYTES => {
-                    WorkReport::DiscoveredSize(id, size)
-                }
-                Ok(_) => run_single(&agent, &task_job, &item, &url, id),
-                Err(error) => WorkReport::SingleErr(id, error),
+            match probe_and_maybe_stream(&agent, &task_job, &item, &url, diagnostics.as_deref()) {
+                Probe::Large(size) => WorkReport::DiscoveredSize(id, size),
+                Probe::Done => WorkReport::SingleOk(id),
+                // 探测这一趟没成功：交给带重试/分类的单流路径。
+                Probe::Retry => run_single(&agent, &task_job, &item, &url, id, diagnostics.as_deref()),
+                Probe::Failed(error) => WorkReport::SingleErr(id, error),
             }
         } else {
-            run_single(&agent, &task_job, &item, &url, id)
+            run_single(&agent, &task_job, &item, &url, id, diagnostics.as_deref())
         };
         let ok = matches!(report, WorkReport::SingleOk(_) | WorkReport::DiscoveredSize(..));
         guard.finish(report, ok);
@@ -1328,25 +1607,65 @@ fn start_file_work(
     1
 }
 
-fn discover_size(
+enum Probe {
+    /// 大文件：交回调度器按分段下载。
+    Large(u64),
+    /// 小文件：探测用的那个响应已经顺手下完并校验通过。
+    Done,
+    /// 拿到了响应但流式下载失败：走普通单流重试。
+    Retry,
+    /// 连请求都发不出去。
+    Failed(String),
+}
+
+/// 清单里没给大小的文件：发一次 GET 看 `Content-Length`。
+///
+/// 旧实现读完头就把响应扔掉，小文件随后再 GET 一次——同一个文件两次请求、两次
+/// （镜像上是两次配额）。现在小文件直接把这个响应流完。
+fn probe_and_maybe_stream(
     agent: &ureq::Agent,
     job: &Arc<Job>,
+    item: &DownloadItem,
     url: &str,
-) -> Result<Option<u64>, String> {
+    diagnostics: Option<&BatchDiagnostics>,
+) -> Probe {
     if job.cancelled() {
-        return Err("任务已取消".into());
+        return Probe::Failed("任务已取消".into());
     }
-    match agent.get(url).call() {
-        Ok(response) => {
-            let len = response
-                .header("Content-Length")
-                .and_then(|value| value.parse().ok());
-            drop(response);
-            Ok(len)
+    let response = match agent.get(url).call() {
+        Ok(response) => response,
+        Err(error) => {
+            let observed = attempt_error(url, &error);
+            record_attempt_failure(diagnostics, &observed, url, 1, "probe");
+            // Do not feed the observation class back into legacy probe scheduling.
+            return Probe::Failed(explain_net_error(&format!("{url}: {error}")));
         }
-        Err(error) => Err(explain_net_error(&format!("{url}: {error}"))),
+    };
+    let len: Option<u64> = response
+        .header("Content-Length")
+        .and_then(|value| value.parse().ok());
+    if let Some(size) = len {
+        if size >= SEGMENT_THRESHOLD_BYTES {
+            return Probe::Large(size);
+        }
+    }
+    let part = part_path(&item.dest);
+    let _ = std::fs::remove_file(&part);
+    job.begin_item(&item.phase, &item.label);
+    let mut total = 0u64;
+    match stream_response(response, job, item, url, &part, &mut total) {
+        Ok(()) => Probe::Done,
+        Err(error) => {
+            record_attempt_failure(diagnostics, &error, url, 1, "probe");
+            let _ = std::fs::remove_file(&part);
+            if total > 0 {
+                job.sub_bytes(&item.phase, total);
+            }
+            Probe::Retry
+        }
     }
 }
+
 
 fn run_single(
     agent: &Arc<ureq::Agent>,
@@ -1354,8 +1673,9 @@ fn run_single(
     item: &DownloadItem,
     url: &str,
     id: u64,
+    diagnostics: Option<&BatchDiagnostics>,
 ) -> WorkReport {
-    match fetch_one(agent, job, item, url) {
+    match fetch_one(agent, job, item, url, diagnostics) {
         Ok(()) => WorkReport::SingleOk(id),
         // 限流单独走一条路：它不代表这个地址坏了，不能顺手就换源。
         Err(error) if error.class == RetryClass::Throttle => {
@@ -1372,12 +1692,13 @@ fn run_range(
     url: &str,
     range: (u64, u64),
     id: u64,
+    diagnostics: Option<&BatchDiagnostics>,
 ) -> WorkReport {
     job.begin_item(&item.phase, &item.label);
     let path = span_path(&item.dest, range.0, range.1);
     let counted = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
-    match fetch_segment(agent, job, item, url, range, &path, &counted, &stop) {
+    match fetch_segment(agent, job, item, url, range, &path, &counted, &stop, diagnostics) {
         Ok(()) => WorkReport::RangeOk(id, range.0, range.1),
         Err(SegmentFail::Unsupported) => {
             let _ = std::fs::remove_file(&path);
@@ -1412,8 +1733,18 @@ fn on_report(
         | WorkReport::RangeErr(id, _, _)
         | WorkReport::RangeThrottled(id, _, _) => *id,
     };
-    let Some(file) = files.iter_mut().find(|file| file.id == id) else {
-        return;
+    // id 从 1 起按推入顺序分配、文件从不移除，所以 `id - 1` 就是下标；
+    // 4000 个资源文件 × 4000 条报告时线性查找也是一笔开销。对不上再退回查找。
+    let direct = id
+        .checked_sub(1)
+        .map(|index| index as usize)
+        .filter(|&index| files.get(index).map(|file| file.id == id).unwrap_or(false));
+    let file = match direct {
+        Some(index) => &mut files[index],
+        None => match files.iter_mut().find(|file| file.id == id) {
+            Some(file) => file,
+            None => return,
+        },
     };
     file.inflight = file.inflight.saturating_sub(1);
     match report {
@@ -1451,7 +1782,7 @@ fn on_report(
                     .sum::<u64>()
             };
             if covered && span == file.size {
-                match join_spans(&file.item, &file.segments) {
+                match join_spans(&file.item, &file.segments, file.diagnostics.as_deref()) {
                     Ok(()) => {
                         file.finished = true;
                         job.item_done(&file.item.phase);
@@ -1461,6 +1792,7 @@ fn on_report(
             }
         }
         WorkReport::RangeUnsupported(_) => {
+            if let Some(d) = &file.diagnostics { d.warning("download.range_fallback", "range_unsupported", file.current_url().map(String::as_str), &[]); }
             // 只把**这个地址**标成不支持；换源之后还要重新探测一次，
             // 旧实现把 `multi` 永久钉成 false，于是一换源就永远单线程。
             if let Some(url) = file.current_url().cloned() {
@@ -1476,11 +1808,11 @@ fn on_report(
         }
         WorkReport::RangeErr(_, range, error) => {
             file.unassigned.push_front(range);
-            note_transfer_failure(job, file, first_error, error);
+            note_transfer_failure(job, file, first_error, error, limits);
         }
         WorkReport::SingleErr(_, error) => {
             file.single_started = false;
-            note_transfer_failure(job, file, first_error, error);
+            note_transfer_failure(job, file, first_error, error, limits);
         }
         // 被限流：这个地址本身没坏，只是让我们慢一点。把区间放回去、地址不动，
         // 顺便让该主机的预算减半——绝不能像旧实现那样"429 就等于换源"。
@@ -1506,7 +1838,7 @@ fn on_report(
     // 换源要等在途连接收尾：新旧来源的字节混在一起，拼出来的文件一定是坏的。
     if file.pending_switch && file.inflight == 0 && !file.finished && file.failed.is_none() {
         file.pending_switch = false;
-        switch_url(job, file);
+        switch_url(job, file, limits);
     }
     if file.failed.is_some() && file.inflight == 0 {
         file.finished = true;
@@ -1535,7 +1867,7 @@ fn replan_missing_ranges(job: &Arc<Job>, file: &mut LiveFile, first_error: &mut 
     }
     let gaps = missing_ranges(file.size, &file.segments);
     if gaps.is_empty() {
-        match join_spans(&file.item, &file.segments) {
+        match join_spans(&file.item, &file.segments, file.diagnostics.as_deref()) {
             Ok(()) => {
                 file.finished = true;
                 job.item_done(&file.item.phase);
@@ -1601,10 +1933,8 @@ fn note_throttled(
     // 冷却只给一个很短的提示值：真正让这台主机慢下来的是"预算减半"，而同一个文件
     // 的下一轮重试本来就要在 `fetch_one` 里按自己的退避表等——两边叠加只会让用户
     // 白等。3 秒的默认冷却在这里会变成"每个文件多等 3 秒 × 3 轮"。
-    limits.note_throttled(
-        &crate::urlcache::host_of(&url),
-        Some(crate::hostlimit::RETRY_HINT_MS),
-    );
+    if let Some(d) = &file.diagnostics { d.warning("download.throttle", "throttle", Some(&url), &[]); }
+    limits.note_throttled(&host_of(&url), Some(crate::hostlimit::RETRY_HINT_MS));
     if file.throttle_rounds < MAX_THROTTLE_ROUNDS {
         file.throttle_rounds += 1;
         job.set_current(format!(
@@ -1614,7 +1944,21 @@ fn note_throttled(
         return;
     }
     file.throttle_rounds = 0;
-    note_transfer_failure(job, file, first_error, error.to_string());
+    note_transfer_failure(job, file, first_error, error.to_string(), limits);
+}
+
+/// 当前地址刚证明了"给不出要对的东西"，记十分钟别再选它。
+///
+/// **只有校园镜像记这一笔**：主站是唯一有全套文件的来源，把它拉黑等于放弃安装；
+/// 校园镜像少一个文件是常态（实测资源对象全是 0 字节占位），记下来才不会让后面
+/// 四千个资源文件挨个再撞一次同一个坏镜像。
+fn note_address_unusable(limits: &HostLimits, file: &LiveFile) {
+    if let Some(url) = file.urls.get(file.url_index) {
+        let host = host_of(url);
+        if mirrors::is_campus_host(&host) {
+            limits.note_unusable(&host);
+        }
+    }
 }
 
 fn note_transfer_failure(
@@ -1622,17 +1966,19 @@ fn note_transfer_failure(
     file: &mut LiveFile,
     first_error: &mut Option<String>,
     error: String,
+    limits: &HostLimits,
 ) {
     if error == "任务已取消" || job.cancelled() {
         file.failed = Some(error);
         return;
     }
     if file.url_index + 1 < file.urls.len() {
+        note_address_unusable(limits, file);
         // 换了地址，限流计数也归零：新地址有它自己的脾气。
         file.throttle_rounds = 0;
         file.single_started = false;
         if file.inflight == 0 {
-            switch_url(job, file);
+            switch_url(job, file, limits);
         } else {
             // 还有连接在跑：等它们收尾。新旧来源的字节不能混在一个文件里。
             file.pending_switch = true;
@@ -1642,7 +1988,37 @@ fn note_transfer_failure(
     if file.inflight == 0 {
         fail_file(job, file, first_error, error);
     } else if file.failed.is_none() {
+        record_file_failure(job, file);
         file.failed = Some(error);
+    }
+}
+
+/// 派活前把"现在不合适的地址"跳过去。**只在文件一个字节都没下时**动手。
+///
+/// 两种"不合适"：
+/// - 被记过给不出正确内容（[`note_address_unusable`]，十分钟）——校园镜像缺文件是常态；
+/// - 正在限流冷却里（[`HostLimits::cooling_down`]）——`try_acquire` 会直接挡回来，
+///   文件只能干等到冷却结束。主站被限流时，让整批文件先去校园镜像才是对的做法。
+///
+/// 跳过很便宜：这里文件还是初始状态（没有在途连接、没开始单流、没有已完成的段），
+/// 所以只改下标，不丢任何字节。队尾地址永远不跳：全灭时还得靠它给出真实错误。
+fn skip_dead_hosts(file: &mut LiveFile, limits: &HostLimits) {
+    if file.inflight > 0 || file.pending_switch || file.single_started || !file.segments.is_empty()
+    {
+        return;
+    }
+    let mut candidate = file.url_index;
+    while candidate + 1 < file.urls.len() {
+        let host = host_of(&file.urls[candidate]);
+        if limits.usable(&host) && !limits.cooling_down(&host) {
+            break;
+        }
+        candidate += 1;
+    }
+    if candidate != file.url_index {
+        file.url_index = candidate;
+        // 还没下过任何东西，`unassigned` / `capability` 都是初始状态，不用重排。
+        file.throttle_rounds = 0;
     }
 }
 
@@ -1650,8 +2026,16 @@ fn note_transfer_failure(
 ///
 /// "干净"很关键：半个来自官方源的 span 加上半个来自镜像的 span 拼出来的文件
 /// 大小对得上、SHA-1 却一定不对，用户看到的是"校验失败"而不是"换源慢了一点"。
-fn switch_url(job: &Arc<Job>, file: &mut LiveFile) {
-    file.url_index += 1;
+///
+/// 选下一个地址时跳过十分钟内被证明给不出内容的（[`note_address_unusable`]），
+/// 但**队尾的最后一个地址永远保留**：全灭时它得把真实的 HTTP 状态带回来。
+fn switch_url(job: &Arc<Job>, file: &mut LiveFile, limits: &HostLimits) {
+    let mut next = (file.url_index + 1).min(file.urls.len().saturating_sub(1));
+    while next + 1 < file.urls.len() && !limits.usable(&host_of(&file.urls[next])) {
+        next += 1;
+    }
+    if let Some(d) = &file.diagnostics { d.warning("download.source_fallback", "transfer_failure", file.urls.get(next).map(String::as_str), &[]); }
+    file.url_index = next;
     file.single_started = false;
     file.throttle_rounds = 0;
     discard_segments(job, file);
@@ -1659,6 +2043,23 @@ fn switch_url(job: &Arc<Job>, file: &mut LiveFile) {
     // 新地址以前被证明不支持 Range 就仍然单流；没试过/试过能用就继续分段。
     if file.multi && file.size > 0 && file.range_known() != Some(false) {
         file.unassigned.push_back((0, file.size - 1));
+    }
+    if let Some(url) = file.current_url() {
+        let host = host_of(url);
+        if mirrors::is_campus_host(&host) {
+            job.set_current(format!("{}：改用校园镜像 {host}", file.item.label));
+        }
+    }
+}
+
+/// Diagnostic-only terminal evidence must precede any callback that can request cancellation.
+fn record_file_failure(job: &Job, file: &mut LiveFile) {
+    if file.diagnostic_failure_recorded { return; }
+    file.diagnostic_failure_recorded = true;
+    job.diagnostic_terminal_failure.store(true, Ordering::SeqCst);
+    if let Some(d) = &file.diagnostics {
+        d.note_terminal_failure();
+        d.warning("download.failed", "transfer_failure", file.current_url().map(String::as_str), &[]);
     }
 }
 
@@ -1668,6 +2069,7 @@ fn fail_file(
     first_error: &mut Option<String>,
     error: String,
 ) {
+    record_file_failure(job, file);
     let message = format!("{}：{error}", file.item.label);
     file.failed = Some(message.clone());
     file.finished = true;
@@ -1695,7 +2097,7 @@ fn span_path(dest: &Path, start: u64, end: u64) -> PathBuf {
     PathBuf::from(name)
 }
 
-fn join_spans(item: &DownloadItem, spans: &[(u64, u64)]) -> Result<(), String> {
+fn join_spans(item: &DownloadItem, spans: &[(u64, u64)], diagnostics: Option<&BatchDiagnostics>) -> Result<(), String> {
     let mut ordered = spans.to_vec();
     ordered.sort_by_key(|(start, _)| *start);
     let part = part_path(&item.dest);
@@ -1720,11 +2122,13 @@ fn join_spans(item: &DownloadItem, spans: &[(u64, u64)]) -> Result<(), String> {
         out.flush().map_err(|e| format!("{}: {e}", part.display()))?;
         drop(out);
         if item.size > 0 && total != item.size {
+            if let Some(d) = diagnostics { d.warning("download.integrity_failure", "size_mismatch", None, &[]); }
             return Err(format!("大小不符（期望 {}，实际 {} 字节）", item.size, total));
         }
         if let Some(expected) = &item.sha1 {
             let actual = hex::encode(hasher.finalize());
             if !actual.eq_ignore_ascii_case(expected) {
+                if let Some(d) = diagnostics { d.warning("download.integrity_failure", "digest_mismatch", None, &[]); }
                 return Err(format!("SHA-1 校验失败（期望 {expected}，实际 {actual}）"));
             }
         }
@@ -1756,9 +2160,12 @@ fn join_spans(item: &DownloadItem, spans: &[(u64, u64)]) -> Result<(), String> {
 /// - 官方优先 / 镜像优先：按名字排序，另一边兜底；
 /// - `prefer_mirror`（逐文件）：即使策略写的是"官方优先"也先试镜像。只影响这一条
 ///   文件，且 `official-only` 时无效——玩家明确选了"仅官方"就不能偷偷连镜像。
+///
+/// `mirrors` 是**镜像侧的一整组地址**（主站在前，校园镜像在后，见 [`mirror_group`]）。
+/// 组内顺序原样保留：换源就是在这一组里往后走一格。
 fn ordered_urls(
     official: Option<&str>,
-    mirror: Option<&str>,
+    mirrors: &[String],
     fallback: Option<&str>,
     source: &str,
     policy: &str,
@@ -1771,14 +2178,17 @@ fn ordered_urls(
         || policy == kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST
         || source == "bmclapi"
         || (prefer_mirror && !official_only);
+    // 官方优先时镜像只是兜底，但「只有镜像地址」的文件（CurseForge）仍然得给。
+    let allow_mirrors = !official_only || official.is_none();
+    let allow_official = !mirror_only;
 
-    let mut urls = Vec::new();
+    let mut urls = Vec::with_capacity(mirrors.len() + 2);
     if mirror_first {
-        if let Some(mirror) = mirror {
-            urls.push(mirror.to_string());
+        if allow_mirrors {
+            urls.extend(mirrors.iter().cloned());
         }
         // 「仅镜像」连官方地址都不碰；其它情况官方做兜底。
-        if !mirror_only {
+        if allow_official {
             if let Some(official) = official {
                 urls.push(official.to_string());
             }
@@ -1789,10 +2199,16 @@ fn ordered_urls(
         }
         // 选了「仅官方」就不碰镜像；但如果压根没有官方地址（CurseForge 文件就是这样），
         // 镜像就是唯一选择，仍然要给。
-        if !official_only || official.is_none() {
-            if let Some(mirror) = mirror {
-                urls.push(mirror.to_string());
-            }
+        if allow_mirrors {
+            urls.extend(mirrors.iter().cloned());
+        }
+    }
+    let mut urls = dedupe(urls);
+    // 有些文件 BMCLAPI 根本没有镜像（例如日志配置 XML）。「仅镜像」不能因为
+    // 这类文件让整次原版安装必失败：没有任何镜像候选时，官方地址是唯一出路。
+    if urls.is_empty() {
+        if let Some(official) = official {
+            urls.push(official.to_string());
         }
     }
     if let Some(fallback) = fallback {
@@ -1866,6 +2282,8 @@ enum RetryClass {
 
 impl RetryClass {
     /// 队列里给用户看的一句话；技术细节留在最终错误串里。
+    fn code(self) -> &'static str { match self { Self::Connect => "connect", Self::Transfer => "transfer", Self::Throttle => "throttle", Self::Content => "content", Self::Http => "http" } }
+
     fn label(self) -> &'static str {
         match self {
             RetryClass::Connect => "连接失败",
@@ -1895,14 +2313,20 @@ struct AttemptError {
     class: RetryClass,
     raw: String,
     retry_after: Option<Duration>,
+    category: &'static str,
+    http_status: Option<u16>,
 }
 
 impl AttemptError {
+    fn cancelled() -> Self { let mut error = Self::new(RetryClass::Content, "任务已取消"); error.category = "cancelled"; error }
+
     fn new(class: RetryClass, raw: impl Into<String>) -> Self {
         AttemptError {
             class,
             raw: raw.into(),
             retry_after: None,
+            category: class.code(),
+            http_status: None,
         }
     }
 
@@ -1911,6 +2335,8 @@ impl AttemptError {
             class: RetryClass::Throttle,
             raw: raw.into(),
             retry_after,
+            category: "throttle",
+            http_status: None,
         }
     }
 }
@@ -1920,9 +2346,14 @@ impl AttemptError {
 /// 旧的 `ureq::get(url).timeout(60s)` 是"整请求 60 秒"，既盖住了连接阶段（连不上要
 /// 干等到超时），也让慢速大文件有被整体判死的风险；拆成连接/读取两段更贴近现实。
 fn download_agent() -> ureq::Agent {
+    // ureq 默认每台主机只留 1 条空闲连接：8~64 个 worker 下完一个文件，除了一条之外
+    // 全被关掉，下一个文件又要重新握手 TCP + TLS。4000 个资源文件 = 4000 次握手，
+    // 这在官方与镜像两种模式下都是小文件阶段的主要耗时。池子开到比最大并发还大。
     ureq::AgentBuilder::new()
         .timeout_connect(Duration::from_secs(10))
         .timeout_read(Duration::from_secs(30))
+        .max_idle_connections(512)
+        .max_idle_connections_per_host(256)
         .user_agent(crate::USER_AGENT)
         .build()
 }
@@ -1963,11 +2394,9 @@ fn attempt_error(url: &str, err: &ureq::Error) -> AttemptError {
         ureq::Error::Status(_, response) => retry_after_of(response),
         _ => None,
     };
-    if class == RetryClass::Throttle {
-        AttemptError::throttled(format!("{url}: {err}"), retry_after)
-    } else {
-        AttemptError::new(class, format!("{url}: {err}"))
-    }
+    let mut result = if class == RetryClass::Throttle { AttemptError::throttled(format!("{url}: {err}"), retry_after) } else { AttemptError::new(class, format!("{url}: {err}")) };
+    if let ureq::Error::Status(code, _) = err { result.http_status = Some(*code); }
+    result
 }
 
 /// 服务器指定的等待时长。
@@ -2249,6 +2678,27 @@ fn plan_segments(size: u64, slots: usize) -> Vec<(u64, u64)> {
 
 // ---- 区间/单流底层：调度器每个 worker 只调一次 ----
 
+fn record_attempt_failure(diagnostics: Option<&BatchDiagnostics>, error: &AttemptError, url: &str, attempt: usize, reason: &'static str) {
+    if error.category == "cancelled" { return; }
+    if let Some(d) = diagnostics {
+        let mut fields = vec![("retry_class", serde_json::json!(error.class.code())), ("attempt", serde_json::json!(attempt)), ("retry_budget", serde_json::json!(error.class.budget())), ("reason", serde_json::json!(reason))];
+        if let Some(status) = error.http_status { fields.push(("http_status", serde_json::json!(status))); }
+        if let Some(after) = error.retry_after { fields.push(("retry_after_ms", serde_json::json!(after.as_millis().min(u64::MAX as u128) as u64))); }
+        d.warning("download.attempt_failed", error.category, Some(url), &fields);
+        if matches!(error.category, "digest_mismatch" | "size_mismatch") { d.warning("download.integrity_failure", error.category, Some(url), &fields); }
+        if error.class == RetryClass::Throttle { d.warning("download.throttle", "throttle", Some(url), &fields); }
+    }
+}
+
+fn record_retry(diagnostics: Option<&BatchDiagnostics>, error: &AttemptError, url: &str, attempt: usize) {
+    if let Some(d) = diagnostics {
+        let mut fields = vec![("retry_class", serde_json::json!(error.class.code())), ("attempt", serde_json::json!(attempt)), ("retry_budget", serde_json::json!(error.class.budget()))];
+        if let Some(status) = error.http_status { fields.push(("http_status", serde_json::json!(status))); }
+        if let Some(after) = error.retry_after { fields.push(("retry_after_ms", serde_json::json!(after.as_millis().min(u64::MAX as u128) as u64))); }
+        d.warning("download.retry", error.class.code(), Some(url), &fields);
+    }
+}
+
 fn part_path(dest: &Path) -> PathBuf {
     let mut s = dest.as_os_str().to_os_string();
     s.push(".part");
@@ -2295,19 +2745,22 @@ fn fetch_one(
     job: &Arc<Job>,
     item: &DownloadItem,
     url: &str,
+    diagnostics: Option<&BatchDiagnostics>,
 ) -> Result<(), AttemptError> {
     let mut attempt = 0usize;
     loop {
         if job.cancelled() {
-            return Err(AttemptError::new(RetryClass::Content, "任务已取消"));
+            return Err(AttemptError::cancelled());
         }
         match stream_attempt(agent, job, item, url) {
             Ok(()) => return Ok(()),
             Err(err) => {
+                record_attempt_failure(diagnostics, &err, url, attempt + 1, "attempt");
                 if attempt >= err.class.budget() {
                     return Err(err);
                 }
                 attempt += 1;
+                record_retry(diagnostics, &err, url, attempt);
                 job.set_current(format!(
                     "{}：第 {attempt} 次重试（{}）",
                     item.label,
@@ -2350,13 +2803,25 @@ fn stream_body(
     total: &mut u64,
 ) -> Result<(), AttemptError> {
     let response = agent.get(url).call().map_err(|e| attempt_error(url, &e))?;
+    stream_response(response, job, item, url, part, total)
+}
+
+/// 把一个已经拿到的响应流进 `.part` 并校验收尾。
+fn stream_response(
+    response: ureq::Response,
+    job: &Arc<Job>,
+    item: &DownloadItem,
+    url: &str,
+    part: &Path,
+    total: &mut u64,
+) -> Result<(), AttemptError> {
     let mut reader = response.into_reader();
     let mut file = std::fs::File::create(part).map_err(|e| AttemptError::new(RetryClass::Content, format!("{}: {e}", part.display())))?;
     let mut hasher = Sha1::new();
     let mut buf = vec![0u8; 64 * 1024];
     loop {
         if job.cancelled() {
-            return Err(AttemptError::new(RetryClass::Content, "任务已取消"));
+            return Err(AttemptError::cancelled());
         }
         let n = match reader.read(&mut buf) {
             Ok(0) => break,
@@ -2381,12 +2846,12 @@ fn finish_file(
     digest: impl AsRef<[u8]>,
 ) -> Result<(), AttemptError> {
     if item.size > 0 && total != item.size {
-        return Err(AttemptError::new(RetryClass::Content, format!("大小不符（期望 {}，实际 {} 字节）", item.size, total)));
+        let mut error = AttemptError::new(RetryClass::Content, format!("大小不符（期望 {}，实际 {} 字节）", item.size, total)); error.category = "size_mismatch"; return Err(error);
     }
     if let Some(expected) = &item.sha1 {
         let actual = hex::encode(digest);
         if !actual.eq_ignore_ascii_case(expected) {
-            return Err(AttemptError::new(RetryClass::Content, format!("SHA-1 校验失败（期望 {expected}，实际 {actual}）")));
+            let mut error = AttemptError::new(RetryClass::Content, format!("SHA-1 校验失败（期望 {expected}，实际 {actual}）")); error.category = "digest_mismatch"; return Err(error);
         }
     }
     if item.dest.exists() {
@@ -2433,7 +2898,7 @@ fn segment_attempt(
         let mut buf = vec![0u8; 64 * 1024];
         loop {
             if job.cancelled() {
-                return Err(SegmentFail::Attempt(AttemptError::new(RetryClass::Content, "任务已取消")));
+                return Err(SegmentFail::Attempt(AttemptError::cancelled()));
             }
             let n = match reader.read(&mut buf) {
                 Ok(0) => break,
@@ -2473,20 +2938,23 @@ fn fetch_segment(
     file_path: &Path,
     counted: &Arc<AtomicU64>,
     stop: &Arc<AtomicBool>,
+    diagnostics: Option<&BatchDiagnostics>,
 ) -> Result<(), SegmentFail> {
     let mut attempt = 0usize;
     loop {
         if stop.load(Ordering::SeqCst) || job.cancelled() {
-            return Err(SegmentFail::Attempt(AttemptError::new(RetryClass::Content, "任务已取消")));
+            return Err(SegmentFail::Attempt(AttemptError::cancelled()));
         }
         match segment_attempt(agent, job, item, url, range, file_path, counted) {
             Ok(()) => return Ok(()),
             Err(SegmentFail::Unsupported) => return Err(SegmentFail::Unsupported),
             Err(SegmentFail::Attempt(err)) => {
+                record_attempt_failure(diagnostics, &err, url, attempt + 1, "attempt");
                 if attempt >= err.class.budget() {
                     return Err(SegmentFail::Attempt(err));
                 }
                 attempt += 1;
+                record_retry(diagnostics, &err, url, attempt);
                 sleep_backoff(err.class, attempt, err.retry_after);
             }
         }
@@ -2496,6 +2964,7 @@ fn fetch_segment(
 #[cfg(test)]
 mod tests {
     use super::*;
+    include!("downloads/fix1_tests.rs");
 
     fn plan_job(source: &str) -> Arc<Job> {
         Job::new(
@@ -2532,6 +3001,8 @@ mod tests {
             capability_map.insert(url.to_string(), known);
         }
         LiveFile {
+            diagnostics: None,
+            diagnostic_failure_recorded: false,
             id,
             item,
             urls: vec![url.to_string()],
@@ -2677,6 +3148,7 @@ mod tests {
             &plan_item(28 * 1024 * 1024),
             &cache,
             &limits,
+            true,
         );
         assert_eq!(
             urls,
@@ -2695,6 +3167,7 @@ mod tests {
             &plan_item(28 * 1024 * 1024),
             &cache,
             &limits,
+            true,
         );
         assert_eq!(
             urls,
@@ -2716,6 +3189,7 @@ mod tests {
             &plan_item(4096),
             &cache,
             &limits,
+            true,
         );
         assert_eq!(
             urls,
@@ -2736,6 +3210,7 @@ mod tests {
             &plan_item(28 * 1024 * 1024),
             &cache,
             &limits,
+            true,
         );
         assert_eq!(
             urls,
@@ -2763,6 +3238,7 @@ mod tests {
             &plan_item(28 * 1024 * 1024),
             &cache,
             &limits,
+            true,
         );
         assert_eq!(
             urls.first().map(String::as_str),
@@ -2771,51 +3247,327 @@ mod tests {
         );
     }
 
+    /// 一个装依赖库的文件：镜像地址在主站的 `/maven/` 下（校园镜像也同步了这一部分）。
+    fn maven_item(size: u64) -> DownloadItem {
+        DownloadItem {
+            label: "log4j-api".into(),
+            phase: "libraries".into(),
+            official_url: Some(
+                "https://libraries.minecraft.net/org/apache/logging/log4j/log4j-api/2.17.0/log4j-api-2.17.0.jar"
+                    .into(),
+            ),
+            mirror_url: Some(
+                "https://bmclapi2.bangbang93.com/maven/org/apache/logging/log4j/log4j-api/2.17.0/log4j-api-2.17.0.jar"
+                    .into(),
+            ),
+            fallback_url: None,
+            prefer_mirror: false,
+            dest: PathBuf::from("log4j-api.jar"),
+            size,
+            sha1: None,
+        }
+    }
+
+    /// 镜像侧是一整组：主站失败之后按顺序轮到八家校园镜像，官方排在整组外面。
+    #[test]
+    fn campus_mirrors_follow_the_primary_on_the_mirror_side() {
+        let limits = HostLimits::for_concurrency(8);
+        let cache = UrlCache::in_memory();
+        let urls = plan_urls(
+            &plan_job(kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST),
+            &maven_item(4096),
+            &cache,
+            &limits,
+            true,
+        );
+        assert_eq!(
+            urls[0],
+            "https://bmclapi2.bangbang93.com/maven/org/apache/logging/log4j/log4j-api/2.17.0/log4j-api-2.17.0.jar"
+        );
+        assert_eq!(
+            urls[1],
+            "https://mirrors.hit.edu.cn/bmclapi/org/apache/logging/log4j/log4j-api/2.17.0/log4j-api-2.17.0.jar",
+            "主站之后紧跟校园镜像，路径要剥掉 /maven"
+        );
+        assert_eq!(urls.len(), 1 + 8 + 1, "主站 + 八家校园 + 官方兜底");
+        assert_eq!(
+            urls.last().map(String::as_str),
+            Some(
+                "https://libraries.minecraft.net/org/apache/logging/log4j/log4j-api/2.17.0/log4j-api-2.17.0.jar"
+            ),
+            "官方排在整组镜像后面"
+        );
+        assert!(urls[1..9]
+            .iter()
+            .all(|url| !url.contains("/bmclapi/maven/")));
+    }
+
+    /// 「仅官方」下校园镜像一个都不许出现，哪怕它们只是兜底。
+    #[test]
+    fn official_only_never_reaches_campus_mirrors() {
+        let limits = HostLimits::for_concurrency(8);
+        let cache = UrlCache::in_memory();
+        let urls = plan_urls(
+            &plan_job(kaleid_api::DOWNLOAD_SOURCE_OFFICIAL_ONLY),
+            &maven_item(4096),
+            &cache,
+            &limits,
+            true,
+        );
+        assert_eq!(urls.len(), 1, "只留官方地址：{:?}", urls);
+        assert!(mirrors::is_bmclapi_url(&urls[0]) == false);
+        assert!(!urls.iter().any(|url| mirrors::is_campus_host(&host_of(url))));
+    }
+
+    /// 「仅镜像」保住整组镜像，一个官方地址都不碰。
+    #[test]
+    fn mirror_only_keeps_the_campus_fallbacks() {
+        let limits = HostLimits::for_concurrency(8);
+        let cache = UrlCache::in_memory();
+        let urls = plan_urls(
+            &plan_job(kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY),
+            &maven_item(4096),
+            &cache,
+            &limits,
+            true,
+        );
+        assert_eq!(urls.len(), 1 + 8, "主站 + 八家校园：{:?}", urls);
+        assert!(!urls.iter().any(|url| url.contains("libraries.minecraft.net")));
+    }
+
+    /// 「仅镜像」遇到 BMCLAPI 根本没镜像的文件（日志配置 XML）时，官方是唯一出路。
+    #[test]
+    fn mirror_only_falls_back_to_official_when_no_mirror_exists() {
+        let official = "https://piston-data.mojang.com/v1/objects/abc/client.xml";
+        let urls = ordered_urls(
+            Some(official),
+            &[],
+            None,
+            "",
+            kaleid_api::DOWNLOAD_SOURCE_MIRROR_ONLY,
+            false,
+        );
+        assert_eq!(urls, vec![official.to_string()]);
+    }
+
+    /// 关掉设置项就回到原来的行为：镜像侧只有一个主站地址。
+    #[test]
+    fn campus_mirrors_can_be_switched_off() {
+        let limits = HostLimits::for_concurrency(8);
+        let cache = UrlCache::in_memory();
+        let urls = plan_urls(
+            &plan_job(kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST),
+            &maven_item(4096),
+            &cache,
+            &limits,
+            false,
+        );
+        assert_eq!(urls.len(), 2, "主站 + 官方：{:?}", urls);
+        assert_eq!(
+            urls[0],
+            "https://bmclapi2.bangbang93.com/maven/org/apache/logging/log4j/log4j-api/2.17.0/log4j-api-2.17.0.jar"
+        );
+    }
+
+    /// 派活前要跳过"刚被限流的主站"和"被记过缺文件的校园镜像"，但队尾永远保留。
+    #[test]
+    fn dead_or_cooling_hosts_are_skipped_before_any_byte_is_downloaded() {
+        let limits = HostLimits::for_concurrency(8);
+        let urls = vec![
+            "https://bmclapi2.bangbang93.com/maven/x.jar".to_string(),
+            "https://mirrors.hit.edu.cn/bmclapi/x.jar".to_string(),
+            "https://mirror.nju.edu.cn/bmclapi/x.jar".to_string(),
+        ];
+        let mut file = LiveFile {
+            urls: urls.clone(),
+            ..segmented_file(1, 1024, &urls[0], None)
+        };
+
+        // 干净状态、主站可用：一个都不跳。
+        skip_dead_hosts(&mut file, &limits);
+        assert_eq!(file.url_index, 0);
+
+        // 主站刚被限流（进了冷却）：这批文件先去 nju，别一个个都去等冷却。
+        limits.note_throttled("bmclapi2.bangbang93.com", Some(60_000));
+        limits.note_unusable("mirrors.hit.edu.cn");
+        skip_dead_hosts(&mut file, &limits);
+        assert_eq!(
+            file.url_index, 2,
+            "主站在冷却、hit 被记过 → 直接用 nju：{:?}",
+            file.current_url()
+        );
+
+        // 已经开始下过的文件不动它：换地址要丢字节，那笔账由 `switch_url` 负责。
+        let mut started = LiveFile {
+            urls,
+            ..segmented_file(2, 1024, "https://bmclapi2.bangbang93.com/maven/x.jar", None)
+        };
+        started.single_started = true;
+        skip_dead_hosts(&mut started, &limits);
+        assert_eq!(started.url_index, 0, "已经开过请求的文件不该被悄悄换源");
+    }
+
+    /// 换地址时跳过刚被证明"给不出内容"的主机，但队尾那个永远保留。
+    #[test]
+    fn switch_url_skips_a_dead_campus_host() {
+        let limits = HostLimits::for_concurrency(8);
+        let job = plan_job(kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST);
+        let mut file = LiveFile {
+            urls: vec![
+                "https://bmclapi2.bangbang93.com/maven/x.jar".to_string(),
+                "https://mirrors.hit.edu.cn/bmclapi/x.jar".to_string(),
+                "https://mirror.nju.edu.cn/bmclapi/x.jar".to_string(),
+            ],
+            ..segmented_file(
+                1,
+                4 * 1024 * 1024,
+                "https://bmclapi2.bangbang93.com/maven/x.jar",
+                Some(true),
+            )
+        };
+        limits.note_unusable("mirrors.hit.edu.cn");
+
+        switch_url(&job, &mut file, &limits);
+        assert_eq!(
+            file.url_index, 2,
+            "hit 刚被记过，应当直接跳到 nju：{:?}",
+            file.current_url()
+        );
+
+        // 只剩最后一个地址时不再跳过——否则全灭之后连错误原因都没了。
+        let mut tail = LiveFile {
+            urls: vec![
+                "https://bmclapi2.bangbang93.com/maven/x.jar".to_string(),
+                "https://mirrors.hit.edu.cn/bmclapi/x.jar".to_string(),
+            ],
+            ..segmented_file(
+                2,
+                4 * 1024 * 1024,
+                "https://bmclapi2.bangbang93.com/maven/x.jar",
+                Some(true),
+            )
+        };
+        switch_url(&job, &mut tail, &limits);
+        assert_eq!(tail.url_index, 1, "队尾地址必须留着");
+    }
+
+    /// 只有校园镜像会被记"别选它"；主站是唯一有全套文件的来源，绝不能拉黑。
+    #[test]
+    fn only_campus_hosts_get_blacklisted() {
+        let limits = HostLimits::for_concurrency(8);
+        let mut input_error = None;
+        let job = plan_job(kaleid_api::DOWNLOAD_SOURCE_MIRROR_FIRST);
+
+        let mut campus = LiveFile {
+            urls: vec![
+                "https://mirrors.hit.edu.cn/bmclapi/x.jar".to_string(),
+                "https://mirrors.hit.edu.cn/bmclapi/x.jar?retry=1".to_string(),
+            ],
+            ..segmented_file(1, 1024, "https://mirrors.hit.edu.cn/bmclapi/x.jar", None)
+        };
+        note_transfer_failure(&job, &mut campus, &mut input_error, "404".into(), &limits);
+        assert!(!limits.usable("mirrors.hit.edu.cn"));
+
+        let mut main = LiveFile {
+            urls: vec![
+                "https://bmclapi2.bangbang93.com/maven/x.jar".to_string(),
+                "https://libraries.minecraft.net/x.jar".to_string(),
+            ],
+            ..segmented_file(2, 1024, "https://bmclapi2.bangbang93.com/maven/x.jar", None)
+        };
+        note_transfer_failure(&job, &mut main, &mut input_error, "404".into(), &limits);
+        assert!(
+            limits.usable("bmclapi2.bangbang93.com"),
+            "主站是唯一有全套文件的来源，不能因为一次 404 就十分钟不选它"
+        );
+    }
+
+    /// 镜像侧地址组：主站一个（校园镜像在 [`mirror_group`] 里才有）。
+    fn group(urls: &[&str]) -> Vec<String> {
+        urls.iter().map(|url| url.to_string()).collect()
+    }
+
     #[test]
     fn url_order_follows_source_and_policy() {
         let official = Some("https://cdn.example/mod.jar");
-        let mirror = Some("https://mirror.example/mod.jar");
         let official_s = "https://cdn.example/mod.jar".to_string();
         let mirror_s = "https://mirror.example/mod.jar".to_string();
+        let one_mirror = group(&["https://mirror.example/mod.jar"]);
 
         // 官方优先：官方先试，失败再镜像。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "official-first", false),
+            ordered_urls(official, &one_mirror, None, "mojang", "official-first", false),
             vec![official_s.clone(), mirror_s.clone()]
         );
         // 模组任务带 `mod-` 前缀，排序规则相同（只是不会被慢速监控切源）。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "mod-official-first", false),
+            ordered_urls(official, &one_mirror, None, "mojang", "mod-official-first", false),
             vec![official_s.clone(), mirror_s.clone()]
         );
         // 镜像优先：镜像先试，官方兜底。
         assert_eq!(
-            ordered_urls(official, mirror, None, "bmclapi", "mirror-first", false),
+            ordered_urls(official, &one_mirror, None, "bmclapi", "mirror-first", false),
             vec![mirror_s.clone(), official_s.clone()]
         );
         // 仅官方：不碰镜像。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "official-only", false),
+            ordered_urls(official, &one_mirror, None, "mojang", "official-only", false),
             vec![official_s.clone()]
         );
         // 仅镜像：不碰官方；没有官方直链（CurseForge）时行为一致。
         assert_eq!(
-            ordered_urls(official, mirror, None, "bmclapi", "mirror-only", false),
+            ordered_urls(official, &one_mirror, None, "bmclapi", "mirror-only", false),
             vec![mirror_s.clone()]
         );
         assert_eq!(
-            ordered_urls(None, mirror, None, "bmclapi", "mirror-first", false),
+            ordered_urls(None, &one_mirror, None, "bmclapi", "mirror-first", false),
             vec![mirror_s.clone()]
         );
         // 「仅官方」但压根没有官方地址：镜像就是唯一选择。
         assert_eq!(
-            ordered_urls(None, mirror, None, "mojang", "official-only", false),
+            ordered_urls(None, &one_mirror, None, "mojang", "official-only", false),
             vec![mirror_s.clone()]
         );
         // 官方优先被慢速监控切到镜像后，镜像排前面；fallback 最后且不重复。
         assert_eq!(
-            ordered_urls(official, mirror, official, "bmclapi", "official-first", false),
+            ordered_urls(official, &one_mirror, official, "bmclapi", "official-first", false),
             vec![mirror_s.clone(), official_s.clone()]
+        );
+    }
+
+    /// 镜像侧是一整组（主站 + 校园兜底）时，组内顺序原样保留，官方只排在整组外面。
+    #[test]
+    fn a_mirror_group_keeps_its_internal_order() {
+        let group_of_three = group(&[
+            "https://bmclapi2.bangbang93.com/maven/x.jar",
+            "https://mirrors.hit.edu.cn/bmclapi/x.jar",
+            "https://mirror.nju.edu.cn/bmclapi/x.jar",
+        ]);
+        let official = Some("https://maven.example/x.jar");
+
+        // 官方优先：整组镜像排在官方后面。
+        assert_eq!(
+            ordered_urls(official, &group_of_three, None, "mojang", "official-first", false),
+            vec![
+                "https://maven.example/x.jar".to_string(),
+                "https://bmclapi2.bangbang93.com/maven/x.jar".to_string(),
+                "https://mirrors.hit.edu.cn/bmclapi/x.jar".to_string(),
+                "https://mirror.nju.edu.cn/bmclapi/x.jar".to_string(),
+            ]
+        );
+        // 镜像优先 / 仅镜像：官方要么最后，要么不在。
+        assert_eq!(
+            ordered_urls(official, &group_of_three, None, "bmclapi", "mirror-first", false)
+                .first()
+                .map(String::as_str),
+            Some("https://bmclapi2.bangbang93.com/maven/x.jar")
+        );
+        let mirror_only = ordered_urls(official, &group_of_three, None, "bmclapi", "mirror-only", false);
+        assert_eq!(mirror_only, group_of_three, "「仅镜像」下整组都在，官方一个都不在");
+        // 「仅官方」：整组一个都不许出现。
+        assert_eq!(
+            ordered_urls(official, &group_of_three, None, "mojang", "official-only", false),
+            vec!["https://maven.example/x.jar".to_string()]
         );
     }
 
@@ -2829,25 +3581,26 @@ mod tests {
             Some("https://bmclapi2.bangbang93.com/maven/net/neoforged/neoforge/26.3.0.99/neoforge-26.3.0.99-installer.jar");
         let official_s = official.unwrap().to_string();
         let mirror_s = mirror.unwrap().to_string();
+        let one_mirror = group(&[mirror.unwrap()]);
 
         // 默认策略是「官方优先」，但这条文件先试镜像。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "official-first", true),
+            ordered_urls(official, &one_mirror, None, "mojang", "official-first", true),
             vec![mirror_s.clone(), official_s.clone()]
         );
         // 「仅镜像」不变。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "mirror-only", true),
+            ordered_urls(official, &one_mirror, None, "mojang", "mirror-only", true),
             vec![mirror_s.clone()]
         );
         // 「仅官方」压过 prefer_mirror：镜像连排都不该排进去。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "official-only", true),
+            ordered_urls(official, &one_mirror, None, "mojang", "official-only", true),
             vec![official_s.clone()]
         );
         // 没标 prefer_mirror 的文件，顺序一个字都不变。
         assert_eq!(
-            ordered_urls(official, mirror, None, "mojang", "official-first", false),
+            ordered_urls(official, &one_mirror, None, "mojang", "official-first", false),
             vec![official_s.clone(), mirror_s.clone()]
         );
     }
@@ -3095,5 +3848,70 @@ mod tests {
         assert!(!content_range_matches(Some("bytes 0-2047/4096"), 4096, (0, 1023)));
         assert!(!content_range_matches(Some("items 0-1023/4096"), 4096, (0, 1023)));
         assert!(!content_range_matches(None, 4096, (0, 1023)));
+    }
+
+    /// 把测速窗口往前拨，模拟"连续两个慢窗口"。
+    fn force_slow_windows(job: &Job, n: usize) {
+        for _ in 0..n {
+            {
+                let mut s = job.state.lock().unwrap();
+                s.window_start = Instant::now() - Duration::from_secs(4);
+                s.window_bytes = 0;
+            }
+            job.tick();
+        }
+    }
+
+    #[test]
+    fn auto_starts_on_the_mirror_side() {
+        assert_eq!(plan_job("auto").source(), "bmclapi");
+        assert_eq!(plan_job("official-first").source(), "mojang");
+    }
+
+    #[test]
+    fn auto_flips_to_official_when_the_mirror_is_slow_and_caps_flips() {
+        let job = plan_job("auto");
+        let g0 = job.source_generation();
+        force_slow_windows(&job, 2);
+        assert_eq!(job.source(), "mojang");
+        assert_eq!(job.source_generation(), g0 + 1);
+        force_slow_windows(&job, 2);
+        assert_eq!(job.source(), "bmclapi");
+        // 封顶：第三次不再换边。
+        force_slow_windows(&job, 4);
+        assert_eq!(job.source(), "bmclapi");
+        assert_eq!(job.source_generation(), g0 + 2);
+    }
+
+    #[test]
+    fn explicit_mirror_policies_never_flip() {
+        for policy in ["mirror-first", "mirror-only", "official-only"] {
+            let job = plan_job(policy);
+            let before = job.source();
+            force_slow_windows(&job, 4);
+            assert_eq!(job.source(), before, "{policy}");
+        }
+    }
+
+    #[test]
+    fn untouched_files_are_replanned_after_the_source_flips() {
+        let job = plan_job("official-first");
+        let cache = UrlCache::in_memory();
+        let limits = HostLimits::for_concurrency(8);
+        let mut item = plan_item(1024);
+        item.official_url = Some("https://resources.download.minecraft.net/ab/abc".into());
+        item.mirror_url = Some("https://bmclapi2.bangbang93.com/assets/ab/abc".into());
+        let mut fresh = accept_file(&job, item.clone(), 1, 8, &cache, &limits, false, None);
+        assert!(fresh.urls[0].contains("minecraft.net"));
+        let mut busy = accept_file(&job, item, 2, 8, &cache, &limits, false, None);
+        busy.inflight = 1;
+        busy.single_started = true;
+        let mut files = vec![fresh, busy];
+        let mut seen = job.source_generation();
+        force_slow_windows(&job, 2);
+        replan_untouched(&job, &mut files, &cache, &limits, false, &mut seen);
+        fresh = files.remove(0);
+        assert!(fresh.urls[0].contains("bmclapi2"), "{:?}", fresh.urls);
+        assert!(files[0].urls[0].contains("minecraft.net"), "在途文件不能被改地址");
     }
 }

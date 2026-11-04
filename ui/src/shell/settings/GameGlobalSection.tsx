@@ -326,7 +326,7 @@ export function GameGlobalSection() {
           label="下载源"
           hint={
             global.downloadSource === 'auto'
-              ? '自动：逐个文件探测镜像的去向——镜像只是把文件转回官方的（比如客户端 jar）就直连官方，真的跳到国内节点的就走镜像。'
+              ? '自动：从 BMCLAPI 起步，镜像只是把文件转回官方的（比如客户端 jar）直接走官方；整体速度连续偏慢时会在镜像与官方之间自动换边（最多两次），尚未开始的文件立即改走新的一侧。'
               : global.downloadSource === 'mirror-first'
                 ? '镜像优先：先走 BMCLAPI，失败再回官方源。'
                 : global.downloadSource === 'mirror-only'
@@ -341,6 +341,24 @@ export function GameGlobalSection() {
             value={global.downloadSource}
             options={SOURCE_OPTIONS}
             onChange={(value) => patch({ downloadSource: value })}
+          />
+        </Row>
+      ) : null}
+
+      {/* 校园镜像只在「镜像那一侧失败」时才出场，所以单独一行，别混进下载源选项 */}
+      {versionManagerEnabled && global.downloadSource !== 'official-only' ? (
+        <Row
+          label="校园镜像兜底"
+          hint={
+            global.downloadCampusMirrors
+              ? 'BMCLAPI 主站下不动某个文件时，按顺序轮询八家教育网镜像（hit / nju / zju / ha / qlu / nyist / sjtu / ustc）的同一份文件，全都失败才回官方源。它们只同步了依赖库和资源文件，没有版本清单，所以不会拖慢正常下载。'
+              : '已关闭：镜像侧只用 BMCLAPI 主站。主站限流或抽风时会直接回退官方源，教育网镜像不会被访问。'
+          }
+        >
+          <Switch
+            checked={global.downloadCampusMirrors}
+            onChange={(checked) => patch({ downloadCampusMirrors: checked })}
+            ariaLabel="校园镜像兜底"
           />
         </Row>
       ) : null}

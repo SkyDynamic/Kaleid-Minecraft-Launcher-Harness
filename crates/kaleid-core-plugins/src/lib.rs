@@ -28,6 +28,7 @@ pub mod launch;
 pub mod loaders;
 pub mod logger;
 pub mod manifests;
+pub mod mirrors;
 pub mod modnames;
 pub mod mods;
 pub mod msa;

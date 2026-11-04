@@ -107,8 +107,12 @@ pub enum LoaderKind {
     Vanilla,
     Fabric,
     Forge,
+    /// 注意：`snake_case` 会把 NeoForge 写成 `neo_forge`，而界面/安装器统一用
+    /// `neoforge`。这里显式钉住契约，别让侧栏分组漏掉整个 NeoForge。
+    #[serde(rename = "neoforge")]
     NeoForge,
     /// 1.8.9 / 1.12.2 这类低版本单独装 OptiFine：没有别的加载器，靠 tweaker 起。
+    #[serde(rename = "optifine")]
     OptiFine,
     /// Quilt / 结构损坏等：v1 只允许「打开目录」。
     Unrecognized,
@@ -346,6 +350,15 @@ pub struct GlobalSettings {
     /// 下载源（游戏文件）：`official-first` / `mirror-first` / `official-only` / `mirror-only`。
     #[serde(default = "default_source")]
     pub download_source: String,
+    /// 镜像失败后要不要按顺序轮询教育网的 BMCLAPI 校园镜像。
+    ///
+    /// BMCLAPI 主站对每个文件都 302 到某个节点，而一批 `.edu.cn` 镜像站同步了它的
+    /// 静态文件树（依赖库 / 资源对象）。开着时：主站失败 → 依次试八家校园镜像 →
+    /// 再轮到官方。关掉时行为与以前完全一致（镜像侧只有一个主站地址）。
+    ///
+    /// 缺省开着：这些镜像不会拖慢成功路径（永远排在主站后面），只会在失败时兜底。
+    #[serde(default = "default_true")]
+    pub download_campus_mirrors: bool,
     /// 模组数据源：`official-first` / `mirror-first` / `official-only`。
     ///
     /// CurseForge 的官方接口必须带 API Key，所以三种取值下 CurseForge 都走 MCIM 镜像。
@@ -1001,6 +1014,15 @@ mod tests {
         );
         assert!(is_valid_download_source(DOWNLOAD_SOURCE_MIRROR_FIRST));
         assert!(is_valid_download_source(DOWNLOAD_SOURCE_AUTO));
+    }
+
+    #[test]
+    fn loader_kind_serializes_ui_contract() {
+        // 侧栏分组 / 图标表按这些值查表，`snake_case` 自动生成会把它们拆错。
+        assert_eq!(serde_json::to_string(&LoaderKind::NeoForge).unwrap(), "\"neoforge\"");
+        assert_eq!(serde_json::to_string(&LoaderKind::OptiFine).unwrap(), "\"optifine\"");
+        assert_eq!(serde_json::to_string(&LoaderKind::Fabric).unwrap(), "\"fabric\"");
+        assert_eq!(serde_json::to_string(&LoaderKind::Vanilla).unwrap(), "\"vanilla\"");
     }
 
     #[test]
