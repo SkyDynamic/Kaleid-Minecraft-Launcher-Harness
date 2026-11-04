@@ -12,13 +12,15 @@ cargo test --workspace
 
 | crate | 测试数 |
 |---|---|
-| `kaleid-kernel` | 29 |
-| `kaleid-api` | 20 |
-| `kaleid-core-plugins` | 334（309 单元 + 25 集成；其中 11 个手动真机 / 联网用例标了 `#[ignore]`，默认跳过） |
-| `kaleid-host` | 23 |
-| `kaleid-cli`（`tests/flow.rs` 集成） | 7 |
+| `kaleid-kernel` | 49 |
+| `kaleid-api` | 21 |
+| `kaleid-core-plugins` | 456（410 单元 + 46 集成；其中 15 个手动真机 / 联网用例标了 `#[ignore]`，默认跳过） |
+| `kaleid-host` | 38 |
+| `kaleid-cli`（`tests/flow.rs` 集成） | 9 |
 
-> `kaleid-core-plugins` 的 305 个单元里，几块值得单独记一笔：4 个 NBT、7 个 Java 运行时、
+当前默认工作区套件为 **558 通过、15 跳过**；浏览器 mock 另有 2 条 Node 回归测试。
+
+> `kaleid-core-plugins` 的 410 个单元里，几块值得单独记一笔：4 个 NBT、7 个 Java 运行时、
 > 21 个本地内容、24 个微软登录（响应解析、XErr 翻译、DPAPI 令牌存储、续期时"先落盘
 > 再打通 XBL"的顺序）、6 个下载重试/分段/阶段，以及两个「校验只看 `.minecraft` 根目录」
 > 的回归用例。
@@ -105,9 +107,17 @@ cargo test --workspace
 > 落到不认 `Range` 的节点上（能力中途翻转）不能把任务卡死**。
 > **不联网**，所以留在默认套件里。
 >
-> `tests/remote_metadata.rs` 有 4 个：镜像返回「200 + HTML 错误页」时必须换地址并
-> 报出"谁回的不是 JSON"（而不是一句 `expected value at line 1 column 1`）、每个地址
-> 试两轮才放弃、超过 16 MiB 的响应直接拒收、正常 JSON 照常解析。
+> `tests/remote_metadata.rs` 有 7 个（6 个离线、1 个联网默认跳过）：镜像返回「200 + HTML」
+> 或语法损坏的 JSON 时换源，全部损坏时列出各地址的错误；内容错误每个地址只试一次，
+> 超过上限的响应直接拒收，正常 JSON 照常解析。联网用例单独验证 26.3 的索引路径。
+>
+> 26.3 资源索引 / 安装事务这一轮新增 5 条：
+> - `mirrors.rs`：`piston-meta.../v1/packages/<sha>/34.json` 映射到 BMCLAPI 的
+>   `/v1/packages/...`，不再走 `/version/<id>/assetIndex`；`files.minecraftforge.net/maven`
+>   与 `maven.neoforged.net/releases` 也按 PCL2 规则映射；
+> - `install.rs`：安装失败/取消后版本目录消失、安装标记目录可同名接管、有存档时不接管、
+>   `.sha1` 只接受 40 位十六进制、26.3 索引走 packages 路径；
+> - `versions.rs`：带 `.kaleid-incomplete` 的目录不进入版本列表。
 >
 > 这一轮新钉住的两处后端行为：
 > - `install.rs` 4 条：安装失败后 `versions/<名字>/` 整个消失、已存在的版本目录一个
@@ -117,8 +127,123 @@ cargo test --workspace
 > - `msa.rs` 4 条：访问令牌过期不等于掉登录（能续就算有效）、`invalid_grant` 与网络
 >   故障分开、续期时新刷新令牌**先落盘**再打通 XBL、微软拒绝时只标记不删记录。
 
+> 校园镜像兜底（2026-11-02）这一轮新增 19 条，另有 1 条联网用例标了 `#[ignore]`：
+> - `mirrors.rs` 8 条（1 条联网）：内置 BMCLAPI 地址都挂在主站常量下、八个校园镜像
+>   互不重复且都是 https + `/bmclapi`、`/maven/` 要剥掉前缀而 `/assets/` 保留命名空间、
+>   只有静态文件树（`/maven/`、`/assets/`）才展开出校园地址、第三方镜像一个都不碰、
+>   主机与路径小工具（带端口的 `:443` 也算主站）、官方地址能映射到 BMCLAPI 等价地址；
+>   联网那条 `real_campus_mirrors_serve_maven_files` 打到 8 家校园镜像的同一个 jar，
+>   要求**至少 3 家**回的是真正的 jar 头 `PK\x03\x04`（校园网外 ustc 会 403，所以不要求全绿）。
+> - `downloads.rs` 8 条：校园镜像跟在主站后面且官方排在整组外面、「仅官方」下校园镜像
+>   一个都不出现、「仅镜像」保住整组、关掉设置项只剩主站一个地址、换源时跳过刚被记过
+>   的校园主机但**队尾地址永远保留**、派活前跳过"主站冷却中 / 镜像被记过"的地址、
+>   整组镜像的内部顺序一个字都不改、只有校园主机进"十分钟别选它"名单。
+> - `hostlimit.rs` 1 条：被记过的校园主机不会被选源器挑中，10 分钟后自己恢复。
+> - `repair.rs` 1 条：启动前补全的资源对象与依赖库都带 BMCLAPI 地址（旧实现里
+>   `mirror_url_for` 只认 Modrinth / CurseForge，游戏文件一条镜像都匹配不上）。
+> - `settings.rs` 1 条：`downloadCampusMirrors` 缺省开、关掉能落盘、重开能读回来。
+>
+> 只有校园镜像会被写进"十分钟别选它"的名单（`only_campus_hosts_get_blacklisted`）：
+> 主站是唯一有全套文件的来源，把它拉黑等于放弃安装。
+
 > `src-tauri` 故意不在 workspace 里（它要拉整套 Tauri 依赖），
 > 所以上面这条命令始终是秒级，可以在改代码时反复跑。
+
+### 启动器日志回归
+
+```powershell
+cargo test -p kaleid-kernel
+cargo test -p kaleid-core-plugins logger
+cargo test -p kaleid-host
+cargo test -p kaleid-cli --test flow
+node --test ui/tests/required-plugins.test.mjs
+```
+
+浏览器 mock 的必需插件开关使用 Node 24 内置测试运行器直接验证（不增加前端测试框架）；
+确认拒绝停用后没有状态修改或事件广播，同时普通新闻插件仍可正常切换。
+
+启动器日志由必需插件 `launcher-logger` 提供，和游戏自己的 `console.log` / `latest.log`
+分开。测试使用临时数据目录、本地 HTTP fixture 与可控的小轮转阈值，不依赖外网，
+不需要真实 Minecraft 安装，也不需要把真实磁盘写满。
+观察者 / 写入器的 panic 测试在 debug unwind 构建中运行，只验证 `catch_unwind` 能处理
+可展开的 panic。根项目和桌面端的 release 配置仍为 `panic = 'abort'`，这类 panic 会
+终止进程，测试不承诺从任意 release panic 恢复；可预期的 I/O 失败仍按 fail-open 处理。
+
+验收重点：
+- 标准 / minimal 组合都有该插件；界面开关不可点，运行时、清单与补丁停用均拒绝，
+  不能用移除或条件过滤绕过必需标记。
+- 真实 CLI 退出后即可读取 `<数据目录>/logs/launcher/<运行 ID>/launcher.log`；
+  并发桌面 / CLI 的目录独立，同一内核重复初始化不重复订阅或写入。
+- JSON Lines 有运行、操作、会话 / 任务 / 批次关联，后台开始之后仍能记录真正的结果；
+  下载批次完成不被误写成整个安装完成，取消请求不冒充已经终止。
+- 轮转保留当前文件与四份归档；七天清理跳过仍加锁的活跃会话、未知条目与游戏日志。
+  此项按启动器管理可信目录、仅协作实例且清理期间无外部并发运行目录 / 祖先重命名或符号链接 /
+  目录联接替换的模型验证，不承诺抵御任意同用户文件系统替换。
+- 队列满、关闭、文件不可写或写入失败时，原来的启动 / 下载结果不变，退出不无限等待；
+  恢复时有丢失计数，正常退出会限时排空。
+- 用哨兵令牌、登录码、JVM 参数、URL 凭据 / 查询串、响应片段与控制字符验证不泄密、
+  不伪造新日志行；Unicode 截断后仍是有效 JSON，单条不超过 8 KiB。
+
+手工烟雾检查：用 `KALEID_DATA_DIR` 或 `--data-dir` 指向临时目录，启动一次游戏、
+安装 / 取消一次版本，再同时运行一次 CLI 命令。检查插件页的「必需」说明、各运行的
+日志目录、真正的退出 / 安装结果和原有游戏控制台文件。不要把真实账号令牌贴进测试报告。
+
+### 提交前安全回归
+
+本轮新增 16 条离线回归：14 条安装器测试和 2 条元数据集成测试。使用临时目录与本地 HTTP
+服务，不访问真实游戏或账号目录：
+
+```powershell
+cargo test -p kaleid-core-plugins --lib correction_
+cargo test -p kaleid-core-plugins --test remote_metadata
+```
+
+覆盖的边界：
+- 只有本启动器标记且布局明确的半成品可以自动回收；不同名称的 JSON、mods/config、未知条目
+  和未标记目录都保留。安装预检与启动清理使用同一判断。
+- 每个候选先通过 JSON、资源索引大小和 SHA-1 校验再被接受；坏内容直接换源，成功响应只取一次。
+- 必需模组发布失败不能报告完成；不同内容的已有文件不覆盖，相同文件复用，后续失败只回滚
+  本次新建的共享文件。正常错误可回滚，不承诺多路径操作在崩溃或 abort 时原子完成。
+
+### Forge 跨版本依赖回归
+
+`install_forge_tests.rs` 的默认离线测试覆盖四种真实安装器布局：
+
+| Minecraft / Forge | 验证点 |
+|---|---|
+| 1.12.2 / 14.23.5.2860 | 两份元数据重复列出的内置 Forge JAR 不进入网络队列 |
+| 1.16.5 / 36.2.42 | 内置 main / universal JAR 的空 URL 不触发镜像请求或 `RelativeUrlWithoutBase` |
+| 1.20.1 / 47.2.0 | 正常远程 Forge 依赖仍预下载，保留 URL、校验、大小与目的路径 |
+| 1.21.4 / 54.1.22 | 安装器生成的 client JAR 不预下载 |
+
+规则看元数据而不看版本号：**显式空字符串 / 纯空白的 artifact URL** 代表交给官方安装器提取或生成。
+缺少 URL / `null` 不等同于此标记，仍保留仓库基址和坐标镜像兜底。另有 synthetic JAR
+用例走真实 `prefetch_installer_libraries` 边界，确认纯本地依赖不启动下载批次。
+
+```powershell
+cargo test -p kaleid-core-plugins --lib install::tests
+
+# 联网 + Java：两次完整安装（含资源），各自使用独立临时数据 / 游戏目录，不启动游戏。
+cargo test -p kaleid-core-plugins --lib install::tests::real_forge_ -- --ignored --nocapture --test-threads=1
+
+# 也可分别验证；默认自动发现 Java 8 / 17。需要指定运行时时，设置 KALEID_JAVA。
+cargo test -p kaleid-core-plugins --lib install::tests::real_forge_1_16_5_installs_with_bundled_libraries -- --ignored --nocapture
+cargo test -p kaleid-core-plugins --lib install::tests::real_forge_1_20_1_installs_with_remote_libraries -- --ignored --nocapture
+```
+
+完整安装用例验证成功状态、自包含版本画像、Forge/FML 运行时文件大小 / SHA-1，以及 1.16.5
+两份内置 JAR 和 1.20.1 远程 universal JAR 的独立已知校验值。1.20.1 的 universal 仅在
+安装器 profile 中列出，不能要求它出现在最终运行时画像里。用例每 30 秒报告下载进度，十分钟
+后请求取消（不是硬杀 Java，安装器仍受原有超时约束）。网络或 Java 条件不满足时用例**失败并报原因**，
+不悄悄跳过或算通过。这些用例默认 `#[ignore]`，不会给离线工作区测试引入外网请求；
+临时目录自动清理，不读取现有账号。
+
+2026-11-04 验证记录：Forge 修复阶段工作区 **542 通过、15 跳过**；提交前安全修正后
+为 **558 通过、15 跳过**，四种 Forge 布局的离线回归均通过。下面的联网结果未因此重算为通过。
+两条完整联网安装均在资源仍未下完时触发十分钟预算并取消，**不算完整安装通过**。
+其中 1.20.1 / 47.2.0 的官方安装器阶段已成功，迁入版本目录的 universal JAR 实测为
+2,672,123 字节、SHA-1 `ac078f159add92ef9dce7a8259508c9d78470d3a`，与官方元数据一致。
+1.16.5 的完整联网安装未完成验收，不能用离线回归替代该结果。
 
 ### 1.1 真机用例（`#[ignore]`，手动跑）
 
@@ -161,6 +286,15 @@ cargo test -p kaleid-core-plugins --lib real_neoforge_installer_downloads_via_bm
 ```
 
 这两条打印的是真实字节数，用来确认「官网抓不动、镜像有同样的文件」这个前提还成立。
+
+八家校园 BMCLAPI 镜像还同不同步、有没有抽风，用这条探一遍（同一个 jar 打到全部镜像
+上，逐个打印头四个字节并检查是不是 `PK\x03\x04`；要求至少 3 家给出真 jar）。
+2026-11-02 实测：七家通过，ustc 从校园网外 403，而**主站当天把请求 302 到
+`chinanet.mirrors.ustc.edu.cn` 后也被 403**——正好说明这层兜底的必要性。
+
+```powershell
+cargo test -p kaleid-core-plugins --lib real_campus_mirrors_serve_maven_files -- --ignored --nocapture
+```
 
 ## 2. 只跑一部分
 
@@ -297,9 +431,14 @@ cd src-tauri; npx --yes @tauri-apps/cli@^2 build
 | 服务器不支持分段 | 遇到忽略 `Range` 的地址装大文件：先试分段，发现回的是 200 就退回单流并成功，不会卡住，也不留 `.part` 残留 |
 | 解析版本不再卡官方源 | 下载源选「镜像优先 / 仅镜像」后安装：队列很快离开「读取版本 JSON…」，不会先干等官方源超时；读 JSON 与读资源索引分成两步，客户端与依赖库在资源索引读完前就已经开始下载 |
 | 下载源「自动（推荐）」 | 设置 · 游戏全局 → 下载源第一项是「自动（推荐）」，hint 说明"镜像只是把文件转回官方的就直连官方"；安装向导摘要显示「自动选源」 |
-| 镜像被限流失效 | 把 `bmclapi2.bangbang93.com` 指到一个会回 200 + HTML 的地址（或用 `hosts` 指向本机静态服务）：安装不再报 `expected value at line 1 column 1`，而是「… 返回的不是 JSON（Content-Type: text/html）：<…>（已尝试 2 轮，地址：…）」，并自动换到官方源继续 |
+| 校园镜像兜底 | 设置 · 游戏全局 → 下载源下面一行「校园镜像兜底」，开关默认开；hint 列出 hit / nju / zju / ha / qlu / nyist / sjtu / ustc。下载源选「仅官方」时这一行消失（校园镜像属于镜像侧）；重新打开后 `settings.json` 里是 `"downloadCampusMirrors": true` |
+| 校园镜像兜底 → 真的会换 | 把 `bmclapi2.bangbang93.com` 指向一个只会 404 的地址（`hosts` 到本机静态服务），装一个原版：队列当前行先显示「<文件名>：改用校园镜像 mirrors.hit.edu.cn」，文件能下完并校验通过；装的过程中不会卡在同一个 404 上 |
+| 校园镜像兜底 → 队尾兜底 | 把主站和八家校园镜像一起指到 404：最终错误里带上真实的 HTTP 状态（不是「下载线程卡住了」），且任务可以重试 |
+| 校园镜像不动第三方 | 装带 Fabric API 的 Fabric：Modrinth / CurseForge 的文件地址（`cdn.modrinth.com`、MCIM 镜像）不会出现在校园镜像主机上，只有 `/maven/` 与 `/assets/` 两类地址会被展开成校园地址 |
+| `kaleid sources` 列出校园镜像 | 命令行跑 `kaleid sources`：先是 `mojang` / `bmclapi` 两个下载源（第三方清单插件装了才有第三个），末尾多一段「BMCLAPI 校园镜像兜底（文件下载失败时按顺序轮询，不提供清单）」，八行主机与基地址齐全 |
+| 镜像被限流失效 | 把 `bmclapi2.bangbang93.com` 指到一个会回 200 + HTML 的地址（或用 `hosts` 指向本机静态服务）：应换到健康的官方源继续；全部候选都失败时，错误列出各地址及「返回的不是 JSON」原因。坏内容每个地址只请求一次，不反复撞错误页 |
 | 安装失败不留垃圾 | 装到一半断网：报错后 `versions/<版本名>/` 不再出现在版本列表里（目录已被删干净）；`<数据目录>/staging/` 里也不留这次的 `forge-<job>` / `neoforge-<job>` |
-| 正版登录状态 | 登录后把系统时间往后再调一天（或等够 24 小时）重启启动器：头像下仍是「正版账号 · 登录有效 · 自动续期」，不是「登录已过期」；点启动能正常进服 |
+| 正版登录状态 | 登录后把系统时间往后再调一天（或等够 24 小时）重启启动器：有效账号头像下显示「正版登录」，不是「登录已过期」；确实需要重新授权时显示「正版登录 · 需要重新登录」。有效会话点启动能正常进服 |
 | 正版需要重新登录 | 在别处让这个账号的刷新令牌失效（改密码后等一会儿）：头像下变成「正版账号 · 需要重新登录」，出现「重新登录」按钮，点它走一遍设备码流程后恢复正常 |
 | 版本列表自动刷新 | 安装跑完后不重开窗口、不手动点刷新，侧栏直接出现新版本并落在对应加载器分组；任务失败或取消也会重扫一次 |
 | 版本列表手动刷新 | 版本区标题右侧的刷新按钮会重新调用 `versions_scan`，扫描期间按钮置灰并转圈，连点不会叠两次扫描 |
