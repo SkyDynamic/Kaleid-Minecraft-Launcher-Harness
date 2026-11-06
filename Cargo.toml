@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/kaleid-kernel",
     "crates/kaleid-api",
+    "crates/kaleid-plugin-runtime",
     "crates/kaleid-core-plugins",
     "crates/kaleid-host",
     "crates/kaleid-cli",
@@ -20,6 +21,7 @@ authors = ["Sky_Dynamic"]
 [workspace.dependencies]
 kaleid-kernel = { path = "crates/kaleid-kernel" }
 kaleid-api = { path = "crates/kaleid-api" }
+kaleid-plugin-runtime = { path = "crates/kaleid-plugin-runtime" }
 kaleid-core-plugins = { path = "crates/kaleid-core-plugins" }
 kaleid-host = { path = "crates/kaleid-host" }
 

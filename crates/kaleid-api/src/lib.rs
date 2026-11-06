@@ -13,6 +13,7 @@ pub mod launch;
 pub mod model;
 pub mod mods;
 pub mod msa;
+pub mod plugins;
 pub mod services;
 
 pub use admin::{DataPack, LoaderUpdateStatus, SaveDeleteOutcome, VersionDeleteOutcome};
@@ -57,6 +58,13 @@ pub use mods::{
     MOD_SOURCE_OFFICIAL_FIRST, MOD_SOURCE_OFFICIAL_ONLY,
 };
 pub use msa::{DeviceCodeInfo, MsaAccountState, MsaAuthApi, MsaConfig, MsaPoll};
+pub use plugins::{
+    decode_manifest, parse_manifest, validate_manifest, validate_manifest_structure,
+    validate_relative_entry, BackendEntry, BackendRuntime, CommandContribution, ConflictDeclaration,
+    ConflictDetail, ManifestStep, ManifestV1, ManifestV2, PluginContributions, PluginEntrypoints,
+    PluginError, PluginErrorCode, PluginManifest, PluginPermissions, PluginPlatform,
+    ServiceContribution, UiContribution, UiMode, APP_VERSION,
+};
 pub use services::{
     AccountServiceApi, InstallSourceApi, LaunchPlannerApi, RootRegistryService, SettingsServiceApi,
     VersionStoreService,

@@ -19,7 +19,6 @@ use kaleid_kernel::{merge_json, PluginSpec};
 /// 宿主 API 主版本。清单里的 `api` 与之不符就拒绝装载。
 pub const MANIFEST_API: &str = "1";
 pub const MAX_ID_LEN: usize = 48;
-const MAX_MANIFEST_BYTES: u64 = 256 * 1024;
 
 /// 一份通过校验的清单。
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -177,19 +176,16 @@ pub fn parse(text: &str) -> Result<Manifest, String> {
     Ok(manifest)
 }
 
-/// 把 `<source>` 解析成清单文件路径：可以给目录，也可以直接给 `manifest.json`。
-fn manifest_file(source: &Path) -> Result<PathBuf, String> {
-    if source.is_dir() {
-        let file = source.join("manifest.json");
-        if !file.is_file() {
-            return Err(format!("{} 里没有 manifest.json", source.display()));
-        }
-        return Ok(file);
-    }
-    if source.is_file() {
-        return Ok(source.to_path_buf());
-    }
-    Err(format!("找不到清单：{}", source.display()))
+// Only the legacy install/remove adapters use the central package manager.
+// Parsing, declarative loading, sources, slots and settings retain the legacy API.
+fn legacy_package_manager(data_root: &Path, reserved: Vec<String>) -> kaleid_plugin_runtime::PackageManager {
+    let platform = match (std::env::consts::OS, std::env::consts::ARCH) {
+        ("windows", "x86") => "windows-x86".to_string(),
+        (os, arch) => format!("{os}-{arch}"),
+    };
+    kaleid_plugin_runtime::PackageManager::new(
+        data_root.to_path_buf(), reserved, kaleid_api::APP_VERSION.into(), platform,
+    )
 }
 
 /// 安装一份清单。返回装好的那份，路径是它在数据目录里的落点。
@@ -202,42 +198,20 @@ pub fn install(
     allow_unsigned: bool,
     reserved: &[String],
 ) -> Result<(Manifest, PathBuf), String> {
-    let file = manifest_file(source)?;
-    let size = std::fs::metadata(&file)
-        .map(|m| m.len())
-        .map_err(|e| format!("{}: {e}", file.display()))?;
-    if size > MAX_MANIFEST_BYTES {
-        return Err(format!(
-            "清单过大（{size} 字节，上限 {MAX_MANIFEST_BYTES}）"
-        ));
+    let manager = legacy_package_manager(data_root, reserved.to_vec());
+    let preview = manager.preview(source).map_err(|error| error.to_string())?;
+    if !matches!(preview.manifest, kaleid_api::PluginManifest::V1(_)) {
+        return Err("API 2 包请使用类型化 PackageManager 接口；旧清单接口只安装 API 1".into());
     }
-    let text = std::fs::read_to_string(&file).map_err(|e| format!("{}: {e}", file.display()))?;
-    let manifest = parse(&text)?;
-    if reserved.iter().any(|id| id == &manifest.id) {
-        return Err(format!(
-            "id `{}` 与内置插件重名，第三方清单不能覆盖内置插件",
-            manifest.id
-        ));
-    }
-    if manifest.signature.is_some() {
-        return Err(
-            "这份清单带 signature，但当前构建没有 ed25519 校验后端，无法验证。\
-             请让作者提供未签名版本，或在本机确认来源后用 --allow-unsigned 安装。"
-                .into(),
-        );
-    }
-    if !allow_unsigned {
-        return Err(
-            "清单没有 signature，默认拒绝安装。确认来源可信后加 --allow-unsigned。".into(),
-        );
-    }
-    let target_dir = plugins_dir(data_root).join(&manifest.id);
-    std::fs::create_dir_all(&target_dir)
-        .map_err(|e| format!("{}: {e}", target_dir.display()))?;
-    let target = target_dir.join("manifest.json");
-    std::fs::write(&target, serde_json::to_string_pretty(&manifest).unwrap_or(text))
-        .map_err(|e| format!("{}: {e}", target.display()))?;
-    Ok((manifest, target))
+    // Recheck the captured manifest API inside the central mutation path: a caller/source
+    // change after this advisory preview cannot publish API2 and then fail conversion.
+    let installed = manager.install_api1(source, allow_unsigned).map_err(|error| error.to_string())?;
+    let kaleid_api::PluginManifest::V1(manifest) = installed.manifest else {
+        unreachable!("central install_api1 guarantees V1 before publication")
+    };
+    let manifest = serde_json::from_value(serde_json::to_value(manifest).map_err(|error| error.to_string())?)
+        .map_err(|error| error.to_string())?;
+    Ok((manifest, installed.installed_path.join("manifest.json")))
 }
 
 /// 列出已安装清单。解析失败的也列出来，带上原因。
@@ -301,14 +275,9 @@ pub fn load_ready(data_root: &Path) -> Vec<Manifest> {
 
 /// 卸载：只删 `<数据目录>/plugins/<id>`，内置插件不受影响。
 pub fn remove(data_root: &Path, id: &str) -> Result<(), String> {
-    if !is_valid_id(id) {
-        return Err(format!("插件 id `{id}` 不合法"));
-    }
-    let dir = plugins_dir(data_root).join(id);
-    if !dir.is_dir() {
-        return Err(format!("没有安装 `{id}`"));
-    }
-    std::fs::remove_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))
+    let mut reserved: Vec<String> = crate::standard_preset().into_iter().map(|spec| spec.id).collect();
+    reserved.extend(["kernel", "plugin-manager", "launcher-logger", "process-broker", "app-identity", "native-permissions", "recovery"].into_iter().map(str::to_string));
+    legacy_package_manager(data_root, reserved).remove(id).map_err(|error| error.to_string())
 }
 
 /// 配置类动作必须在 `kernel.load` 之前作用到规格表上。
@@ -559,6 +528,24 @@ mod tests {
         assert_eq!(list(dir.path()).len(), 1);
         remove(dir.path(), "example-mirror").unwrap();
         assert!(list(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn legacy_install_refuses_default_overwrite_and_never_publishes_api2() {
+        let root=tempfile::tempdir().unwrap();let source=tempfile::tempdir().unwrap();let path=source.path().join("manifest.json");
+        let first=sample("panel",vec![Step::EnablePlugin{target:"news".into()}]);
+        std::fs::write(&path,serde_json::to_vec(&first).unwrap()).unwrap();install(root.path(),&path,true,&[]).unwrap();
+        let before=std::fs::read(root.path().join("plugins/panel/manifest.json")).unwrap();
+        let mut changed=first;changed.version="changed".into();std::fs::write(&path,serde_json::to_vec(&changed).unwrap()).unwrap();
+        assert!(install(root.path(),&path,true,&[]).is_err(),"legacy wrapper silently overwrote an installed package");
+        assert_eq!(std::fs::read(root.path().join("plugins/panel/manifest.json")).unwrap(),before);
+        std::fs::write(&path,json!({"id":"api-two","name":"API2","version":"1.0.0","api":"2","appVersion":"*","conflicts":[],"steps":[{"op":"enable-plugin","target":"news"}]}).to_string()).unwrap();
+        let error=install(root.path(),&path,true,&[]).unwrap_err();assert!(error.contains("PackageManager"),"API2 should instruct the typed manager: {error}");assert!(!root.path().join("plugins/api-two").exists());
+    }
+    #[test]
+    fn legacy_remove_cannot_delete_known_builtin_folders() {
+        let root=tempfile::tempdir().unwrap();let path=root.path().join("plugins/news");std::fs::create_dir_all(&path).unwrap();std::fs::write(path.join("manifest.json"),b"broken builtin sentinel").unwrap();
+        assert!(remove(root.path(),"news").is_err());assert_eq!(std::fs::read(path.join("manifest.json")).unwrap(),b"broken builtin sentinel");
     }
 
     #[test]
